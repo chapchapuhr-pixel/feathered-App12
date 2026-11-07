@@ -1,0 +1,20 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Magnifying glass circle with bold white stroke -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.3"
+        android:strokeLineCap="round"
+        android:pathData="M11,18 C14.866,18 18,14.866 18,11 C18,7.134 14.866,4 11,4 C7.134,4 4,7.134 4,11 C4,14.866 7.134,18 11,18 Z" />
+    <!-- Magnifying glass handle with bold white stroke -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.4"
+        android:strokeLineCap="round"
+        android:pathData="M16.2,16.2 L20.5,20.5" />
+</vector>

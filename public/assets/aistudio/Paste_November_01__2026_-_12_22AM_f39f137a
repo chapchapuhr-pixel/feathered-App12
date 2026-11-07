@@ -1,0 +1,1642 @@
+// ============================================================================
+// FULL POST PREVIEW (opens when Discuss is clicked)
+// Source: Feeds.tsx -> CommentsSheet  (+ wiring from App.tsx, + CSS)
+// ============================================================================
+
+
+// ============================================================================
+// PART 1 — Feeds.tsx : CommentsSheet component
+// ============================================================================
+
+// ==================== COMMENTS CACHE ====================
+const commentsCache = new Map<number, { data: any[]; timestamp: number; postId: number }>();
+
+
+/**
+ * =========================
+ * ✅ COMMENTS SHEET - WITH IMAGE SUPPORT
+ * =========================
+ */
+ 
+export const CommentsSheet = memo(
+({
+  post,
+  currentUser,
+  users,
+  onClose,
+  onComment,
+  onCommentAdded,
+  onLikeComment,
+  getCommentAuthor,
+  onProfileClick,
+  onHashtagClick,
+  onFollow,
+  checkIsFollowing,
+  onViewProductFromPost,
+  onOpenAudio,
+  onReact,
+  onShare,
+  onVideoClick,
+  groups = [],
+  brands = [],
+  chats = [],
+  onOpenGroup,
+  onRSVP,
+  onEventClick,
+  onOpenReactions,
+  onViewImage,
+}: {
+  post: PostType;
+  currentUser: User;
+  users: User[];
+  onClose: () => void;
+  onComment?: (postId: any, text: string, parentCommentId?: number | null, imageFile?: File, imageUrl?: string | null) => void;
+  onCommentAdded?: () => void;
+  onLikeComment?: (commentId: number) => void;
+  getCommentAuthor?: (id: number) => User | undefined;
+  onProfileClick: (id: number) => void;
+  onHashtagClick?: (tag: string) => void;
+  onFollow?: (id: number) => void;
+  checkIsFollowing?: (id: number) => boolean;
+  onViewProductFromPost?: (productId: number) => void;
+  onOpenAudio?: (item: any) => void;
+  onReact: (post: PostType, type: ReactionType) => void;
+  onShare: (id: number, newShareCount: number) => void;
+  onVideoClick: (post: PostType) => void;
+  groups?: Group[];
+  brands?: Brand[];
+  chats?: any[];
+  onOpenGroup?: (groupId: number) => void;
+  onRSVP?: (eventId: number, status: 'going' | 'interested' | 'not_going') => Promise<void>;
+  onEventClick?: (eventId: number) => void;
+  onOpenReactions?: (post: PostType) => void;
+  onViewImage?: (url: string) => void;
+}) => {
+  const p: any = post as any;
+  const postId = getFeedItemId(p);
+
+  const discussionsTopRef = useRef<HTMLDivElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  
+  // Image picker states
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [selectedImage, setSelectedImage] = useState<File | null>(null);
+  const [imagePreview, setImagePreview] = useState<string | null>(null);
+  const [uploadingImage, setUploadingImage] = useState(false);
+
+  const itemType = getFeedItemType(p);
+  const [text, setText] = useState('');
+  const [comments, setComments] = useState<any[]>(() => {
+    const cached = getCachedComments(itemType, postId);
+    if (cached?.data?.length) return cached.data;
+    const postComments = Array.isArray(p.comments) ? p.comments : [];
+    return postComments;
+  });
+  const [replyTo, setReplyTo] = useState<any | null>(null);
+  const [showEmojiPicker, setShowEmojiPicker] = useState(false);
+  const [expandedThreads, setExpandedThreads] = useState<Record<string, boolean>>({});
+
+  // Cleanup image preview on unmount
+  useEffect(() => {
+    return () => {
+      if (imagePreview) URL.revokeObjectURL(imagePreview);
+    };
+  }, [imagePreview]);
+
+  // Helper: Get comments endpoint based on item type
+  const getCommentEndpoint = () => {
+    const viewerId = safeUserId(currentUser);
+    const itemType = getFeedItemType(p);
+
+    switch (itemType) {
+      case 'story': {
+        const storyId = p.story_id || p.id || postId;
+        return `/api/stories/${storyId}/comments?viewerId=${viewerId}`;
+      }
+      case 'event':
+        const eventId = p.event_id || p.id;
+        return `/api/events/${eventId}/comments?viewerId=${viewerId}`;
+      case 'group_post':
+        const groupPostId = p?.id || p?.post_id || postId;
+        return `/api/group-post-comments?post_id=${groupPostId}&viewerId=${viewerId}`;
+      case 'product':
+        const productId = p.product_id || p.id;
+        return `/api/products/${productId}/reviews?viewerId=${viewerId}`;
+      case 'song':
+      case 'music': {
+        const songId = Number(
+          p?.song_id2 ||
+          p?.song_id ||
+          (p?.meta as any)?.song?.id ||
+          (p?.meta as any)?.original_song_id ||
+          (p?.shared_song as any)?.id ||
+          postId ||
+          p?.id ||
+          0
+        );
+        return `/api/songs/${songId}/comments?viewerId=${viewerId}`;
+      }
+      case 'sponsored':
+      case 'reel':
+      case 'video':
+      case 'post':
+      default: {
+        const id = p.post_id || p.reel_id || postId || p.id;
+        return `/api/posts/${id}/comments?viewerId=${viewerId}`;
+      }
+    }
+  };
+
+  // Helper: Get add comment endpoint
+  const getAddCommentEndpoint = () => {
+    const itemType = getFeedItemType(p);
+
+    switch (itemType) {
+      case 'story': {
+        const storyId = p.story_id || p.id || postId;
+        return `/api/stories/${storyId}/comments`;
+      }
+      case 'event':
+        const eventId = p.event_id || p.id;
+        return `/api/events/${eventId}/comment`;
+      case 'group_post':
+        return `/api/group-post-comments`;
+      case 'product':
+        const productId = p.product_id || p.id;
+        return `/api/products/${productId}/review`;
+      case 'song':
+      case 'music': {
+        const songId = Number(
+          p?.song_id2 ||
+          p?.song_id ||
+          (p?.meta as any)?.song?.id ||
+          (p?.meta as any)?.original_song_id ||
+          (p?.shared_song as any)?.id ||
+          postId ||
+          p?.id ||
+          0
+        );
+        return `/api/songs/${songId}/comment`;
+      }
+      case 'sponsored':
+      case 'reel':
+      case 'video':
+      case 'post':
+      default: {
+        const id = p.post_id || p.reel_id || postId || p.id;
+        return `/api/posts/${id}/comments`;
+      }
+    }
+  };
+
+  // Helper: Get reply endpoint
+  const getReplyEndpoint = (commentId: number) => {
+    const itemType = getFeedItemType(p);
+
+    switch (itemType) {
+      case 'event':
+        return `/api/event-comments/${commentId}/reply`;
+      case 'group_post':
+        return `/api/group-post-comments`;
+      case 'product':
+        return `/api/product-reviews/${commentId}/reply`;
+      case 'song':
+      case 'music': {
+        const songId = Number(
+          p?.song_id2 ||
+          p?.song_id ||
+          (p?.meta as any)?.song?.id ||
+          (p?.meta as any)?.original_song_id ||
+          (p?.shared_song as any)?.id ||
+          postId ||
+          p?.id ||
+          0
+        );
+        return `/api/songs/${songId}/comment`;
+      }
+      case 'sponsored':
+      case 'reel':
+      case 'video':
+      case 'post':
+      default: {
+        const id = p.post_id || p.reel_id || postId || p.id;
+        return `/api/posts/${id}/comments`;
+      }
+    }
+  };
+
+  // Helper: Get like endpoint
+  const getLikeEndpoint = (commentId: number) => {
+    const itemType = getFeedItemType(p);
+
+    switch (itemType) {
+      case 'event':
+        return `/api/event-comments/${commentId}/like`;
+      case 'group_post':
+        return `/api/group-post-comment-likes`;
+      case 'product':
+        return `/api/product-reviews/${commentId}/like`;
+      case 'song':
+      case 'music':
+        return `/api/song-comments/${commentId}/like`;
+      case 'reel':
+      case 'video':
+      case 'post':
+      default:
+        return `/api/post-comments/${commentId}/like`;
+    }
+  };
+
+  // Helper: Upload image to server
+  const uploadCommentImage = async (file: File): Promise<string | null> => {
+    const formData = new FormData();
+    formData.append('image', file);
+    formData.append('user_id', String(safeUserId(currentUser)));
+
+    try {
+      const response = await fetch('/api/comments/upload-image', {
+        method: 'POST',
+        headers: {
+          ...authHeaders(),
+        },
+        body: formData,
+      });
+      const data = await response.json();
+      if (data.success && data.image_url) {
+        return data.image_url;
+      }
+      return null;
+    } catch (error) {
+      console.error('Failed to upload comment image:', error);
+      return null;
+    }
+  };
+
+  // Scroll to top when post changes
+  useEffect(() => {
+    const t = setTimeout(() => {
+      discussionsTopRef.current?.scrollIntoView({
+        behavior: 'auto',
+        block: 'start',
+      });
+    }, 0);
+    return () => clearTimeout(t);
+  }, [postId]);
+
+  // Handle image selection
+  const handleImageSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    
+    if (!file.type.startsWith('image/')) {
+      alert('Please select an image file');
+      return;
+    }
+    
+    if (file.size > 10 * 1024 * 1024) {
+      alert('Image must be less than 10MB');
+      return;
+    }
+    
+    if (imagePreview) URL.revokeObjectURL(imagePreview);
+    setSelectedImage(file);
+    setImagePreview(URL.createObjectURL(file));
+  };
+
+  // Resolve comment author
+  const resolveAuthor = (c: any) => {
+    const uid = Number(
+      c?.user_id ?? c?.userId ?? c?.author_id ?? c?.authorId ?? 0
+    );
+
+    const u =
+      (Number.isFinite(uid) ? users.find((x: any) => Number(x?.id) === uid) : null) ||
+      (getCommentAuthor ? getCommentAuthor(uid) : null) ||
+      null;
+
+    const name =
+      String(c?.author_name ?? c?.authorName ?? '').trim() ||
+      String(u?.name ?? '').trim() ||
+      String(u?.username ?? '').trim() ||
+      'User';
+
+    const image = avatarFrom({
+      profile_image_url: c?.author_image ?? c?.authorImage ?? u?.profile_image_url,
+      name,
+      username: u?.username ?? c?.author_username ?? c?.username,
+    });
+
+    return { uid, name, image };
+  };
+
+  // Get reply label for comment
+  const getReplyLabel = (comment: any) => {
+    const a = resolveAuthor(comment);
+    const uid = a.uid;
+
+    const user = users.find((x: any) => Number(x?.id) === uid);
+    const username = String(
+      comment?.author_username ?? user?.username ?? comment?.username ?? ''
+    ).trim();
+
+    const display = username ? `@${username}` : a.name;
+    return { ...a, username, display };
+  };
+
+  // Format count helper
+  const formatCount = (count: number): string => {
+    if (count >= 1000000) return `${(count / 1000000).toFixed(1)}M`;
+    if (count >= 1000) return `${(count / 1000).toFixed(1)}k`;
+    return count.toString();
+  };
+
+  // Handle like comment
+  const handleLikeComment = async (comment: any) => {
+    if (!currentUser) return;
+
+    const optimisticLiked = !comment.liked_by_me;
+    const optimisticCount = comment.liked_by_me
+      ? Math.max(0, (comment.likes_count || 0) - 1)
+      : (comment.likes_count || 0) + 1;
+
+    setComments((prev) =>
+      prev.map((c) =>
+        c.id === comment.id
+          ? { ...c, liked_by_me: optimisticLiked, likes_count: optimisticCount }
+          : c
+      )
+    );
+
+    updateCachedComment(itemType, postId, comment.id, (c) => ({
+      ...c,
+      liked_by_me: optimisticLiked,
+      likes_count: optimisticCount,
+    }));
+
+    try {
+      if (onLikeComment) {
+        await onLikeComment(comment.id);
+      } else {
+        const endpoint = getLikeEndpoint(comment.id);
+        await apiFetch(endpoint, {
+          method: 'POST',
+          body: JSON.stringify({
+            user_id: safeUserId(currentUser),
+            comment_id: comment.id,
+            id: comment.id,
+          }),
+        });
+      }
+    } catch (error) {
+      console.error('Failed to like comment:', error);
+      updateCachedComment(itemType, postId, comment.id, (c) => ({
+        ...c,
+        liked_by_me: !optimisticLiked,
+        likes_count: comment.likes_count || 0,
+      }));
+      setComments((prev) =>
+        prev.map((c) =>
+          c.id === comment.id
+            ? { ...c, liked_by_me: !optimisticLiked, likes_count: comment.likes_count || 0 }
+            : c
+        )
+      );
+    }
+  };
+
+  // Handle follow click
+  const handleFollowClick = (e: React.MouseEvent, userId: number) => {
+    e.stopPropagation();
+    e.preventDefault();
+    if (onFollow && userId && userId !== safeUserId(currentUser)) {
+      onFollow(userId);
+    }
+  };
+
+  // Discussion Hold / Actions State & Handlers
+  const [actionModalComment, setActionModalComment] = useState<any | null>(null);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  const showToast = (msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => {
+      setToastMessage((curr) => (curr === msg ? null : curr));
+    }, 2500);
+  };
+
+  const { getHandlers: getCommentPressHandlers } = useCommentLongPress((comment: any) => {
+    setActionModalComment(comment);
+  });
+
+  const isCommentHidden = (comment: any): boolean => {
+    return Boolean(
+      comment?.is_hidden ||
+      comment?.hidden ||
+      comment?.hidden_scope ||
+      comment?.hidden_by ||
+      comment?.hidden_label
+    );
+  };
+
+  const isCommentAuthor = (comment: any): boolean => {
+    const cUid = safeUserId(currentUser);
+    const aUid = Number(comment?.user_id ?? comment?.userId ?? comment?.author_id ?? 0);
+    return Boolean(cUid && aUid && cUid === aUid);
+  };
+
+  const isEntityOwner = (): boolean => {
+    const cUid = safeUserId(currentUser);
+    if (!cUid) return false;
+    const ownerId = Number(
+      p?.user_id ??
+      p?.userId ??
+      p?.author_id ??
+      p?.authorId ??
+      p?.seller_id ??
+      p?.artist_id ??
+      p?.song_owner_id ??
+      0
+    );
+    return Boolean(ownerId && ownerId === cUid);
+  };
+
+  const isPlatformAdmin = (): boolean => {
+    const role = String((currentUser as any)?.role || '').toLowerCase();
+    return ['admin', 'superadmin', 'moderator', 'owner'].includes(role);
+  };
+
+  const canHideComment = (comment: any): boolean => {
+    return isCommentAuthor(comment) || isEntityOwner() || isPlatformAdmin();
+  };
+
+  const canDeleteComment = (comment: any): boolean => {
+    return isCommentAuthor(comment) || isEntityOwner() || isPlatformAdmin();
+  };
+
+  const handleToggleHide = async (comment: any) => {
+    if (!currentUser || !comment) return;
+    const userId = safeUserId(currentUser);
+    const commentId = comment.id;
+    const currentlyHidden = isCommentHidden(comment);
+    const nextAction: 'hide' | 'unhide' = currentlyHidden ? 'unhide' : 'hide';
+
+    // Optimistic UI state & cache
+    setComments((prev) =>
+      prev.map((c) =>
+        c.id === commentId
+          ? {
+              ...c,
+              is_hidden: !currentlyHidden,
+              hidden_by: !currentlyHidden ? userId : null,
+              hidden_scope: !currentlyHidden ? 'user' : null,
+            }
+          : c
+      )
+    );
+
+    updateCachedComment(itemType, postId, commentId, (c: any) => ({
+      ...c,
+      is_hidden: !currentlyHidden,
+      hidden_by: !currentlyHidden ? userId : null,
+      hidden_scope: !currentlyHidden ? 'user' : null,
+    }));
+
+    showToast(nextAction === 'hide' ? 'Discussion hidden' : 'Discussion unhidden');
+
+    try {
+      switch (itemType) {
+        case 'song':
+        case 'music': {
+          const songId = Number(
+            p.song_id2 ||
+            p.song_id ||
+            (p?.meta as any)?.song?.id ||
+            (p?.meta as any)?.original_song_id ||
+            (p?.shared_song as any)?.id ||
+            postId ||
+            p.id ||
+            0
+          );
+          await fetch(`/api/songs/${songId}/comments`, {
+            method: 'PATCH',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-user-id': String(userId),
+            },
+            body: JSON.stringify({
+              user_id: userId,
+              comment_id: commentId,
+              action: nextAction, // "hide" or "unhide"
+            }),
+          });
+          break;
+        }
+        case 'product': {
+          const productId = p.product_id || p.id;
+          await apiFetch(`/api/products/${productId}/reviews`, {
+            method: 'PATCH',
+            body: JSON.stringify({
+              user_id: userId,
+              comment_id: commentId,
+              action: nextAction,
+            }),
+          });
+          break;
+        }
+        case 'group_post': {
+          await apiFetch(`/api/post-comments/${commentId}/hide`, {
+            method: 'POST',
+            body: JSON.stringify({
+              user_id: userId,
+              action: nextAction,
+            }),
+          });
+          break;
+        }
+        case 'story': {
+          const storyId = p.story_id || p.id;
+          await apiFetch(`/api/stories/${storyId}/comments`, {
+            method: 'PATCH',
+            body: JSON.stringify({
+              user_id: userId,
+              comment_id: commentId,
+              action: nextAction,
+            }),
+          });
+          break;
+        }
+        case 'reel':
+        case 'video':
+        case 'post':
+        default: {
+          // Normal posts and videos
+          await apiFetch(`/api/post-comments/${commentId}/hide`, {
+            method: 'POST',
+            body: JSON.stringify({
+              user_id: userId,
+              action: nextAction,
+            }),
+          });
+          break;
+        }
+      }
+    } catch (error) {
+      console.error(`Failed to ${nextAction} discussion:`, error);
+      showToast(`Failed to ${nextAction} discussion`);
+      // Revert optimistic update
+      setComments((prev) =>
+        prev.map((c) =>
+          c.id === commentId
+            ? {
+                ...c,
+                is_hidden: currentlyHidden,
+                hidden_by: currentlyHidden ? userId : null,
+                hidden_scope: currentlyHidden ? 'user' : null,
+              }
+            : c
+        )
+      );
+    }
+  };
+
+  const handleDelete = async (comment: any) => {
+    if (!currentUser || !comment) return;
+    const userId = safeUserId(currentUser);
+    const commentId = comment.id;
+
+    // Optimistic removal from state and cache
+    setComments((prev) =>
+      prev.filter((c) => c.id !== commentId && c.parent_comment_id !== commentId)
+    );
+
+    removeCachedComment(itemType, postId, commentId);
+    showToast('Discussion deleted');
+
+    try {
+      switch (itemType) {
+        case 'song':
+        case 'music': {
+          const songId = Number(
+            p.song_id2 ||
+            p.song_id ||
+            (p?.meta as any)?.song?.id ||
+            (p?.meta as any)?.original_song_id ||
+            (p?.shared_song as any)?.id ||
+            postId ||
+            p.id ||
+            0
+          );
+          await fetch(`/api/songs/${songId}/comments?comment_id=${commentId}&user_id=${userId}`, {
+            method: 'DELETE',
+            headers: { 'x-user-id': String(userId) },
+          });
+          break;
+        }
+        case 'product': {
+          const productId = p.product_id || p.id;
+          await apiFetch(`/api/products/${productId}/reviews?comment_id=${commentId}&user_id=${userId}`, {
+            method: 'DELETE',
+          });
+          break;
+        }
+        case 'group_post': {
+          await apiFetch(`/api/post-comments/${commentId}/delete?user_id=${userId}`, {
+            method: 'DELETE',
+          });
+          break;
+        }
+        case 'story': {
+          const storyId = p.story_id || p.id;
+          await apiFetch(`/api/stories/${storyId}/comments?comment_id=${commentId}&user_id=${userId}`, {
+            method: 'DELETE',
+          });
+          break;
+        }
+        case 'reel':
+        case 'video':
+        case 'post':
+        default: {
+          // Normal posts and videos
+          await apiFetch(`/api/post-comments/${commentId}/delete?user_id=${userId}`, {
+            method: 'DELETE',
+          });
+          break;
+        }
+      }
+
+      if (onCommentAdded) {
+        onCommentAdded();
+      }
+    } catch (error) {
+      console.error('Failed to delete discussion:', error);
+      showToast('Failed to delete discussion');
+      fetchCommentsSilently();
+    }
+  };
+
+
+  // Fetch comments silently (background refresh)
+  const fetchCommentsSilently = async () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+
+    abortControllerRef.current = new AbortController();
+
+    try {
+      const endpoint = getCommentEndpoint();
+      const viewerId = safeUserId(currentUser);
+      let arr: any[] = [];
+
+      if (itemType === 'story') {
+        const storyId = p?.story_id || p?.id || postId;
+        const res = await fetch(`/api/stories/${storyId}/comments?viewerId=${viewerId}`, {
+          method: 'GET',
+          headers: { 'x-user-id': String(viewerId) },
+          signal: abortControllerRef.current.signal,
+        });
+        const data = await res.json().catch(() => null);
+        arr = Array.isArray(data?.comments) ? data.comments : (Array.isArray(data) ? data : []);
+      } else if (itemType === 'song' || itemType === 'music') {
+        const res = await fetch(endpoint, {
+          method: 'GET',
+          headers: { 'x-user-id': String(viewerId) },
+          signal: abortControllerRef.current.signal,
+        });
+        const data = await res.json().catch(() => null);
+        arr = Array.isArray(data) ? data : data?.comments || [];
+      } else {
+        const data = await apiFetch(endpoint);
+        arr = Array.isArray(data) ? data : data?.comments || [];
+      }
+
+      if (arr.length > 0) {
+        setComments((prev) => {
+          // Keep pending optimistic comments that haven't landed on server yet
+          const pending = prev.filter(
+            (c) =>
+              String(c.id).startsWith('tmp-') &&
+              !arr.some(
+                (s: any) =>
+                  s.text === c.text && Number(s.user_id) === Number(c.user_id)
+              )
+          );
+          const combined = [...arr, ...pending];
+          const seen = new Set<string>();
+          return combined.filter((c) => {
+            const key = String(c.id);
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          });
+        });
+        setCachedComments(itemType, postId, arr);
+      }
+    } catch (error: any) {
+      if (error.name === 'AbortError') {
+        return;
+      }
+      console.debug('Silent comment fetch failed:', error);
+    }
+  };
+
+  // Initialize comments
+  useEffect(() => {
+    const initializeComments = async () => {
+      const cached = getCachedComments(itemType, postId);
+      if (cached && cached.data.length > 0) {
+        setComments(cached.data);
+      }
+
+      const postComments = Array.isArray(p.comments) ? p.comments : [];
+      if (postComments.length > 0 && (!cached || postComments.length > cached.data.length)) {
+        const seen = new Set<string>();
+        const unique = postComments.filter((c: any) => {
+          const key = String(c?.id || '');
+          if (!key || seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+        setComments(unique);
+        setCachedComments(itemType, postId, unique);
+      }
+
+      // Only fetch if stale (> 5 mins) or no cache
+      if (!cached || !cached.isFresh || cached.data.length === 0) {
+        fetchCommentsSilently();
+      }
+    };
+
+    initializeComments();
+
+    return () => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+    };
+  }, [postId, p.comments, itemType]);
+
+  // Build comment threads
+  const idKey = (v: any) => String(v ?? '').trim();
+
+  // Helper: find root comment ID for any nested reply or replyer
+  const findRootCommentId = (c: any, list: any[]): string => {
+    if (!c || !c.parent_comment_id) return idKey(c?.id);
+    const commentMap = new Map<string, any>();
+    list.forEach((item) => commentMap.set(idKey(item.id), item));
+
+    let curr = c;
+    const visited = new Set<string>();
+    while (curr && curr.parent_comment_id && !visited.has(idKey(curr.id))) {
+      visited.add(idKey(curr.id));
+      const parent = commentMap.get(idKey(curr.parent_comment_id));
+      if (parent) {
+        curr = parent;
+      } else {
+        return idKey(curr.parent_comment_id);
+      }
+    }
+    return idKey(curr?.id);
+  };
+
+  const buildThreads = (list: any[]) => {
+    const commentMap = new Map<string, any>();
+    const seen = new Set<string>();
+    const uniqueList: any[] = [];
+
+    (list || []).forEach((c) => {
+      if (!c) return;
+      const key = idKey(c.id);
+      if (key && seen.has(key)) return;
+      if (key) seen.add(key);
+      uniqueList.push(c);
+      commentMap.set(key, c);
+    });
+
+    const findRootId = (c: any): string => {
+      let curr = c;
+      const visited = new Set<string>();
+      while (curr && curr.parent_comment_id && !visited.has(idKey(curr.id))) {
+        visited.add(idKey(curr.id));
+        const parent = commentMap.get(idKey(curr.parent_comment_id));
+        if (parent) {
+          curr = parent;
+        } else {
+          return idKey(curr.parent_comment_id);
+        }
+      }
+      return idKey(curr?.id);
+    };
+
+    const roots: any[] = [];
+    const repliesByRoot = new Map<string, any[]>();
+
+    uniqueList.forEach((c) => {
+      if (!c.parent_comment_id) {
+        roots.push(c);
+      } else {
+        const rootId = findRootId(c);
+        if (!repliesByRoot.has(rootId)) {
+          repliesByRoot.set(rootId, []);
+        }
+        repliesByRoot.get(rootId)!.push(c);
+      }
+    });
+
+    repliesByRoot.forEach((arr) => {
+      arr.sort((a, b) => {
+        const timeA = new Date(a.created_at || a.createdAt || a.timestamp || 0).getTime();
+        const timeB = new Date(b.created_at || b.createdAt || b.timestamp || 0).getTime();
+        return timeA - timeB;
+      });
+    });
+
+    return roots.map((root) => ({
+      root,
+      replies: repliesByRoot.get(idKey(root.id)) || [],
+    }));
+  };
+
+  const toggleThread = (rootId: any, open: boolean) => {
+    const key = String(rootId);
+    setExpandedThreads((prev) => ({ ...prev, [key]: open }));
+  };
+
+  const threads = useMemo(() => buildThreads(comments), [comments]);
+
+  // Initiate reply to a comment or a replyer
+  const handleInitiateReply = (comment: any) => {
+    const target = getReplyLabel(comment);
+    const rootId = findRootCommentId(comment, comments);
+    setReplyTo({
+      ...comment,
+      _reply_author: target,
+      _root_id: rootId,
+    });
+    if (rootId) {
+      toggleThread(rootId, true);
+    }
+    inputRef.current?.focus();
+    setShowEmojiPicker(false);
+  };
+
+  // Handle comment submission with image support
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    
+    const t = text.trim();
+    if (!t && !selectedImage) return;
+
+    setUploadingImage(true);
+
+    let uploadedImageUrl: string | null = null;
+    
+    // Upload image if present
+    if (selectedImage) {
+      uploadedImageUrl = await uploadCommentImage(selectedImage);
+      if (!uploadedImageUrl && selectedImage) {
+        console.error('Failed to upload image');
+        setUploadingImage(false);
+        alert('Failed to upload image. Please try again.');
+        return;
+      }
+    }
+
+    const replyDisplay = replyTo?._reply_author?.display;
+    const prefix = replyDisplay ? `${replyDisplay} ` : '';
+    const finalText = replyTo && !t.startsWith(prefix) ? prefix + t : t;
+    const rootId = replyTo?._root_id || (replyTo ? findRootCommentId(replyTo, comments) : null);
+    const parentCommentId = replyTo?.id || null;
+
+    // Optimistic comment
+    const optimisticComment = {
+      id: `tmp-${Date.now()}`,
+      post_id: postId,
+      user_id: safeUserId(currentUser),
+      text: finalText,
+      image_url: uploadedImageUrl,
+      parent_comment_id: parentCommentId,
+      created_at: new Date().toISOString(),
+      replies_count: 0,
+      likes_count: 0,
+      liked_by_me: false,
+    };
+
+    // Clear form
+    setText('');
+    setReplyTo(null);
+    setShowEmojiPicker(false);
+    if (imagePreview) URL.revokeObjectURL(imagePreview);
+    setSelectedImage(null);
+    setImagePreview(null);
+
+    setComments((prev) => {
+      const next = [...prev, optimisticComment];
+      addCachedComment(itemType, postId, optimisticComment);
+      return next;
+    });
+
+    if (rootId) {
+      toggleThread(rootId, true);
+    }
+
+    // Actual API call: If onComment is provided, it handles the backend insertion and state sync.
+    // Otherwise fallback to direct endpoint POST.
+    try {
+      if (itemType === 'story') {
+        const storyId = p?.story_id || p?.id || postId;
+        await fetch(`/api/stories/${storyId}/comments`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-user-id': String(safeUserId(currentUser)),
+          },
+          body: JSON.stringify({
+            user_id: safeUserId(currentUser),
+            content: finalText,
+            image_url: uploadedImageUrl || null,
+            parent_id: parentCommentId ?? null,
+          }),
+        });
+      } else if (itemType === 'song' || itemType === 'music') {
+        const songId = Number(
+          p?.song_id2 ||
+          p?.song_id ||
+          (p?.meta as any)?.song?.id ||
+          (p?.meta as any)?.original_song_id ||
+          (p?.shared_song as any)?.id ||
+          postId ||
+          p?.id ||
+          0
+        );
+        await fetch(`/api/songs/${songId}/comment`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-user-id': String(safeUserId(currentUser)),
+          },
+          body: JSON.stringify({
+            user_id: safeUserId(currentUser),
+            text: finalText,
+            image_url: uploadedImageUrl || null,
+            parent_comment_id: parentCommentId ?? null,
+          }),
+        });
+      } else if (onComment) {
+        await onComment(post || postId, finalText, parentCommentId, selectedImage || undefined, uploadedImageUrl);
+      } else {
+        let endpoint = '';
+        let body: any = {
+          text: finalText,
+          user_id: safeUserId(currentUser),
+          parent_comment_id: parentCommentId,
+          post_id: postId || p?.id,
+          comment_id: replyTo?.id,
+        };
+        
+        if (uploadedImageUrl) {
+          body.image_url = uploadedImageUrl;
+        }
+
+        if (replyTo) {
+          endpoint = getReplyEndpoint(replyTo.id);
+        } else {
+          endpoint = getAddCommentEndpoint();
+        }
+
+        await apiFetch(endpoint, {
+          method: 'POST',
+          body: JSON.stringify(body),
+        });
+      }
+
+      if (onCommentAdded) {
+        onCommentAdded();
+      }
+
+      fetchCommentsSilently();
+    } catch (err: any) {
+      console.error('Failed to post comment:', err);
+      alert('Failed to post comment. Please try again.');
+    } finally {
+      setUploadingImage(false);
+    }
+  };
+
+  // Add emoji to input
+  const addEmoji = (emoji: string) => {
+    setText((prev) => prev + emoji);
+    setShowEmojiPicker(false);
+    inputRef.current?.focus();
+  };
+
+  // Refresh comments on window focus
+  useEffect(() => {
+    const handleFocus = () => {
+      const cached = getCachedComments(itemType, postId);
+      if (!cached || !cached.isFresh) {
+        fetchCommentsSilently();
+      }
+    };
+
+    window.addEventListener('focus', handleFocus);
+    return () => window.removeEventListener('focus', handleFocus);
+  }, [postId, itemType]);
+
+  // Render single comment (Facebook style)
+  const renderOneComment = (comment: any, isReply: boolean = false) => {
+    const a = resolveAuthor(comment);
+    const isCurrentUserComment = a.uid === safeUserId(currentUser);
+    const isFollowing = checkIsFollowing ? checkIsFollowing(a.uid) : false;
+    const authorUser = users.find((x: any) => Number(x?.id) === a.uid);
+    const isHidden = isCommentHidden(comment);
+    const pressHandlers = getCommentPressHandlers(comment);
+
+    return (
+      <div className={`flex gap-2.5 sm:gap-3 ${isReply ? 'mt-2.5' : ''}`}>
+        <img
+          src={a.image}
+          className={`${
+            isReply ? 'w-8 h-8' : 'w-9 h-9'
+          } rounded-full object-cover cursor-pointer shrink-0 mt-0.5 hover:opacity-90 transition-opacity`}
+          alt=""
+          onClick={() => a.uid && onProfileClick(a.uid)}
+        />
+        <div className="flex-1 min-w-0">
+          <div
+            {...pressHandlers}
+            className={`group/comment relative inline-block max-w-full sm:max-w-[92%] rounded-[18px] px-3.5 py-2.5 sm:px-4 sm:py-3 border shadow-sm transition-all select-none cursor-pointer ${
+              isHidden
+                ? 'bg-[#162137]/35 hover:bg-[#1E293B]/45 border-amber-500/30 opacity-75'
+                : 'bg-[#162137]/65 hover:bg-[#1E293B]/70 border-[#1E293B]/60'
+            }`}
+            title="Hold for discussion options"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <div
+                className="text-[#F8FAFC] font-bold text-[21px] leading-tight cursor-pointer hover:underline inline-flex items-center gap-1.5"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (a.uid) onProfileClick(a.uid);
+                }}
+              >
+                <span className="truncate">{a.name}</span>
+                {(comment?.is_verified || authorUser?.is_verified) && (
+                  <VerifiedBadge size={21} className="shrink-0" />
+                )}
+              </div>
+              <div className="flex items-center gap-1.5 shrink-0">
+                {isHidden && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-semibold border border-amber-500/30">
+                    Hidden
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setActionModalComment(comment);
+                  }}
+                  className="opacity-0 group-hover/comment:opacity-100 p-1 text-[#94A3B8] hover:text-[#F8FAFC] rounded-full hover:bg-[#1E293B] transition-opacity"
+                  title="More options"
+                >
+                  <i className="fas fa-ellipsis-h text-xs" />
+                </button>
+              </div>
+            </div>
+            <div className={`text-[#CBD5E1] ${isReply ? 'text-[19.5px]' : 'text-[20.5px]'} leading-[1.38] font-normal whitespace-pre-wrap break-words mt-1`}>
+              <RichText
+                text={String(comment.text || '')}
+                users={users}
+                onProfileClick={onProfileClick}
+                onHashtagClick={onHashtagClick}
+              />
+            </div>
+            {comment.image_url && (
+              <div className="mt-2 rounded-xl overflow-hidden">
+                <img
+                  src={comment.image_url}
+                  alt="Comment attachment"
+                  className="max-w-full max-h-[220px] object-cover rounded-xl cursor-pointer hover:opacity-95 transition-opacity"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    window.open(comment.image_url, '_blank');
+                  }}
+                />
+              </div>
+            )}
+          </div>
+          <div className="mt-1 ml-3 flex items-center gap-3 sm:gap-4 text-[12px]">
+            <span className="text-[#B0B3B8] font-normal">
+              {formatRelativeTime(comment.created_at || comment.createdAt || comment.timestamp)}
+            </span>
+            <button
+              type="button"
+              onClick={() => handleLikeComment(comment)}
+              className={`font-bold hover:underline transition-colors inline-flex items-center gap-1 ${
+                comment.liked_by_me
+                  ? 'text-[#F43F5E]'
+                  : 'text-[#B0B3B8] hover:text-[#E4E6EB]'
+              }`}
+            >
+              <span className="text-[13px]">{comment.liked_by_me ? '❤️' : '🤍'}</span>
+              <span>{comment.liked_by_me ? 'Liked' : 'Like'}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => handleInitiateReply(comment)}
+              className="font-bold text-[#B0B3B8] hover:text-[#E4E6EB] hover:underline transition-colors"
+            >
+              Reply
+            </button>
+            {isHidden && (
+              <span className="text-amber-400/90 font-medium text-[11px] inline-flex items-center gap-1">
+                <i className="far fa-eye-slash text-[10px]" />
+                <span>Hidden</span>
+              </span>
+            )}
+            {comment.likes_count > 0 && (
+              <span className="inline-flex items-center gap-1 bg-[#F43F5E]/15 text-[#F43F5E] px-1.5 py-0.5 rounded-full text-[11px] font-bold">
+                <span className="text-[10px]">❤️</span>
+                <span>{formatCount(comment.likes_count)}</span>
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="comments-sheet-root flex flex-col bg-[#0B1120]">
+      {/* Header */}
+      <div className="p-4 border-b border-[#1E293B] flex items-center justify-between bg-[#0B1120] sticky top-0 z-30">
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            className="w-10 h-10 rounded-full hover:bg-[#1E293B] flex items-center justify-center transition-colors"
+            onClick={onClose}
+            aria-label="Back"
+          >
+            <i className="fas fa-arrow-left text-[#E4E6EB] text-xl"></i>
+          </button>
+          <div className="text-[#E4E6EB] font-bold text-[22px]">
+            {post?.type === 'event'
+              ? 'Event Discussion'
+              : (String(post?.type) === 'reel' || post?.media_type === 'video' || (post as any)?.post_type === 'reel')
+              ? 'Video Discussion'
+              : 'Post'}
+          </div>
+        </div>
+
+        <div className="flex items-center gap-4">
+          <div className="text-[#CBD5E1] text-[20.5px] font-semibold">
+            {formatCount(comments.length)} discussions
+          </div>
+          <button
+            type="button"
+            className="text-[#1877F2] font-bold text-[17px] hover:underline"
+            onClick={onClose}
+          >
+            See less
+          </button>
+        </div>
+      </div>
+
+      {/* Scrollable Content */}
+      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto scroll-smooth bg-[#0B1120]">
+        {/* Original Post Card */}
+        <div className="border-b border-[#1E293B] bg-[#0B1120]">
+          {post && (
+            <Post
+              hideCommentPreview={true}
+              post={post}
+              author={
+                (post as any).author || {
+                  id: (post as any).user_id || (post as any).author_id || 0,
+                  name: (post as any).name || (post as any).username || 'User',
+                  username: (post as any).username || '',
+                  profile_image_url: (post as any).profile_image_url || '',
+                }
+              }
+              currentUser={currentUser}
+              users={users}
+              onProfileClick={onProfileClick}
+              onReact={onReact}
+              onShare={onShare}
+              onViewImage={onViewImage || (() => {})}
+              onOpenComments={() => {}}
+              onVideoClick={onVideoClick}
+              onPlayAudioTrack={onOpenAudio}
+              onHashtagClick={onHashtagClick}
+              onViewProductFromPost={onViewProductFromPost}
+              onOpenGroup={onOpenGroup}
+              onOpenAudio={onOpenAudio}
+              onRSVP={onRSVP}
+              groups={groups}
+              brands={brands}
+              chats={chats}
+              onFollow={onFollow}
+              onEventClick={onEventClick}
+              onOpenReactions={onOpenReactions}
+            />
+          )}
+        </div>
+
+        {/* Comments Section */}
+        <div className="p-4">
+          <div ref={discussionsTopRef} />
+
+          {/* Reply To Indicator */}
+          {replyTo && (
+            <div className="mb-2 flex items-center gap-2 bg-[#0B1120] px-3 py-2 rounded-2xl border border-[#1E293B]">
+              <span className="text-xs text-[#94A3B8]">Replying to</span>
+              <span className="text-xs text-[#1877F2] font-black">
+                {replyTo?._reply_author?.display || replyTo?._reply_author?.name || 'User'}
+              </span>
+              <button
+                onClick={() => setReplyTo(null)}
+                className="ml-auto text-[#94A3B8] hover:text-white"
+              >
+                <i className="fas fa-times text-xs" />
+              </button>
+            </div>
+          )}
+
+          {/* Image Preview for new comment */}
+          {imagePreview && (
+            <div className="mb-2 relative inline-block">
+              <img
+                src={imagePreview}
+                className="h-20 rounded-xl border border-white/10 object-cover"
+                alt="Preview"
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  if (imagePreview) URL.revokeObjectURL(imagePreview);
+                  setSelectedImage(null);
+                  setImagePreview(null);
+                }}
+                className="absolute -top-2 -right-2 w-6 h-6 bg-red-500 rounded-full flex items-center justify-center"
+              >
+                <i className="fas fa-times text-white text-xs" />
+              </button>
+            </div>
+          )}
+
+          {/* Emoji Picker */}
+          {showEmojiPicker && (
+            <div className="mb-3 flex flex-wrap gap-2 bg-[#0B1120] border border-[#1E293B] rounded-2xl p-3">
+              {QUICK_EMOJIS.map((emoji) => (
+                <button
+                  key={emoji}
+                  type="button"
+                  onClick={() => addEmoji(emoji)}
+                  className="text-2xl leading-none active:scale-90 transition-transform hover:bg-white/10 p-1 rounded-lg"
+                >
+                  {emoji}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Empty State */}
+          {comments.length === 0 ? (
+            <div className="text-center py-10">
+              <div className="text-[#B0B3B8] text-[19px] mb-2">No discussions yet</div>
+              <p className="text-[#B0B3B8] text-[15px]">Be the first to start a discussion!</p>
+            </div>
+          ) : (
+            <div className="space-y-6">
+              {threads.map(({ root, replies }) => {
+                const rootId = String(root.id);
+                const isExpanded = !!expandedThreads[rootId];
+                const MAX_PREVIEW = 1;
+                const hiddenCount = Math.max(0, replies.length - MAX_PREVIEW);
+                const visibleReplies = isExpanded ? replies : replies.slice(-MAX_PREVIEW);
+
+                return (
+                  <div key={rootId} className="space-y-2">
+                    {renderOneComment(root, false)}
+
+                    {!isExpanded && hiddenCount > 0 && (
+                      <button
+                        type="button"
+                        className="ml-11 sm:ml-12 text-[#1877F2] font-semibold text-[13px] sm:text-[14px] hover:underline flex items-center gap-1.5 py-1"
+                        onClick={() => toggleThread(rootId, true)}
+                      >
+                        <i className="fas fa-reply fa-rotate-180 text-[11px]" />
+                        <span>
+                          View previous {hiddenCount} repl{hiddenCount === 1 ? 'y' : 'ies'}
+                        </span>
+                      </button>
+                    )}
+
+                    {visibleReplies.map((reply) => (
+                      <div key={String(reply.id)} className="ml-10 sm:ml-12 relative">
+                        <div className="absolute -left-5 sm:-left-6 top-0 bottom-0 w-[2px] bg-[#334155]/60 rounded-full" />
+                        {renderOneComment(reply, true)}
+                      </div>
+                    ))}
+
+                    {isExpanded && replies.length > MAX_PREVIEW && (
+                      <button
+                        type="button"
+                        className="ml-11 sm:ml-12 text-[#B0B3B8] text-[13px] hover:text-[#E4E6EB] hover:underline py-1"
+                        onClick={() => toggleThread(rootId, false)}
+                      >
+                        Hide replies
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Comment Input Footer - solid dark, non-transparent */}
+      <div className="p-3 pb-5 border-t border-[#1E293B] bg-[#0B1120] sticky bottom-0">
+        {replyTo && (
+          <div className="mb-2 flex items-center gap-2 bg-[#162137]/65 border border-[#1E293B]/60 px-3 py-2 rounded-2xl">
+            <span className="text-xs text-[#B0B3B8]">Replying to</span>
+            <span className="text-xs text-[#1877F2] font-black">
+              {replyTo?._reply_author?.display || replyTo?._reply_author?.name || 'User'}
+            </span>
+            <button
+              onClick={() => setReplyTo(null)}
+              className="ml-auto text-[#B0B3B8] hover:text-white"
+            >
+              <i className="fas fa-times text-xs" />
+            </button>
+          </div>
+        )}
+
+        {imagePreview && (
+          <div className="mb-2 relative inline-block">
+            <img
+              src={imagePreview}
+              className="h-20 rounded-xl border border-[#1E293B] object-cover"
+              alt=""
+            />
+            <button
+              type="button"
+              onClick={() => {
+                if (imagePreview) URL.revokeObjectURL(imagePreview);
+                setSelectedImage(null);
+                setImagePreview(null);
+              }}
+              className="absolute -top-2 -right-2 w-6 h-6 bg-red-500 rounded-full flex items-center justify-center"
+            >
+              <i className="fas fa-times text-white text-xs" />
+            </button>
+          </div>
+        )}
+
+        {showEmojiPicker && (
+          <div className="mb-3 flex flex-wrap gap-2 bg-[#0F172A] border border-[#1E293B] rounded-2xl p-3">
+            {QUICK_EMOJIS.map((emoji) => (
+              <button
+                key={emoji}
+                type="button"
+                onClick={() => addEmoji(emoji)}
+                className="text-2xl leading-none active:scale-90 transition-transform hover:bg-[#1E293B] p-1 rounded-lg"
+              >
+                {emoji}
+              </button>
+            ))}
+          </div>
+        )}
+
+        <form className="flex items-center gap-2" onSubmit={handleSubmit}>
+          <input
+            type="file"
+            ref={fileInputRef}
+            className="hidden"
+            accept="image/*"
+            onChange={handleImageSelect}
+          />
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            className="w-10 h-10 rounded-full flex items-center justify-center text-[#94A3B8] hover:bg-[#1E293B] active:scale-95"
+          >
+            <i className="far fa-image text-[25px]" />
+          </button>
+
+          <div className="flex-1 flex items-center bg-[#0F172A] border border-[#1E293B] rounded-full px-4 py-2">
+            <input
+              ref={inputRef}
+              type="text"
+              className="flex-1 bg-transparent text-[#F8FAFC] outline-none text-[16px] placeholder:text-[#64748B]"
+              placeholder={
+                replyTo
+                  ? `Reply to ${replyTo?._reply_author?.display || replyTo?._reply_author?.name || 'user'}`
+                  : `Comment as ${currentUser?.name || 'User'}`
+              }
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+            />
+
+            <button
+              type="button"
+              className="w-8 h-8 rounded-full flex items-center justify-center text-[#94A3B8] hover:bg-[#1E293B]"
+              title="Sticker"
+            >
+              <i className="far fa-sticky-note text-[21px]" />
+            </button>
+
+            <button
+              type="button"
+              className="w-8 h-8 rounded-full flex items-center justify-center text-[#94A3B8] hover:bg-[#1E293B]"
+              title="GIF"
+            >
+              <span className="text-[12px] font-black border border-[#64748B] text-[#94A3B8] rounded-md px-1 leading-[16px]">
+                GIF
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setShowEmojiPicker((prev) => !prev)}
+              className={`w-8 h-8 rounded-full flex items-center justify-center hover:bg-[#1E293B] ${
+                showEmojiPicker ? 'text-[#1877F2]' : 'text-[#94A3B8]'
+              }`}
+              title="Emoji"
+            >
+              <i className="far fa-smile text-[23px]" />
+            </button>
+          </div>
+
+          <button
+            type="submit"
+            disabled={(!text.trim() && !selectedImage) || uploadingImage}
+            className="w-10 h-10 rounded-full bg-[#1877F2] hover:bg-[#166FE5] disabled:bg-[#1E293B] disabled:text-[#64748B] text-white flex items-center justify-center shadow-[0_8px_20px_rgba(24,119,242,0.35)] active:scale-95 transition-all"
+          >
+            {uploadingImage ? (
+              <i className="fas fa-spinner fa-spin text-[14px]" />
+            ) : (
+              <i className="fas fa-arrow-up text-[16px]" />
+            )}
+          </button>
+        </form>
+      </div>
+
+      {/* Discussion Long-Press / Hold Action Modal */}
+      {actionModalComment && (
+        <CommentActionModal
+          isOpen={Boolean(actionModalComment)}
+          onClose={() => setActionModalComment(null)}
+          comment={actionModalComment}
+          authorName={resolveAuthor(actionModalComment).name}
+          authorAvatar={resolveAuthor(actionModalComment).image}
+          commentText={String(actionModalComment.text || '')}
+          isHidden={isCommentHidden(actionModalComment)}
+          canHide={canHideComment(actionModalComment)}
+          canDelete={canDeleteComment(actionModalComment)}
+          onToggleHide={handleToggleHide}
+          onDelete={handleDelete}
+          onReply={(c) => handleInitiateReply(c)}
+        />
+      )}
+
+      {/* Floating Action Feedback Toast */}
+      {toastMessage && (
+        <div className="fixed bottom-24 left-1/2 -translate-x-1/2 z-[100000] px-4 py-2 rounded-full bg-[#1E293B] border border-[#334155] text-white text-xs font-semibold shadow-2xl flex items-center gap-2 animate-in fade-in zoom-in-95 duration-150">
+          <span>{toastMessage}</span>
+        </div>
+      )}
+    </div>
+  );
+},
+(prev, next) => isSameFeedItem(prev.post, next.post) && prev.currentUser?.id === next.currentUser?.id);
+
+
+// ============================================================================
+// PART 2 — Feeds.tsx : CSS that makes the sheet full-screen
+// (this is inside injectGlobalStyles -> style.textContent)
+// ============================================================================
+
+/*
+      /* Comments Sheet Fix - prevents blank screen */
+      .comments-sheet-root {
+        position: fixed !important;
+        inset: 0 !important;
+        z-index: 99999 !important;
+        width: 100vw !important;
+        height: 100dvh !important;
+        background: #050B18 !important;
+        overflow: hidden !important;
+      }
+*/
+
+
+// ============================================================================
+// PART 3 — App.tsx : how the preview is opened / closed / rendered
+// ============================================================================
+
+// ---- state (inside App) ----
+//   type ActiveCommentsIdentity = {
+//     type: 'feed_post' | 'group_post' | 'marketplace_post' | 'event_post' | 'reel_post' | 'music_post';
+//     id: string | number;
+//   };
+//
+//   const [activeCommentsIdentity, setActiveCommentsIdentity] = useState<ActiveCommentsIdentity | null>(null);
+//   const [commentPostSnapshot, setCommentPostSnapshot] = useState<PostType | null>(null);
+
+// ---- open handler (inside App) ----
+const handleOpenComments = useCallback((post: PostType) => {
+  if (!requireAuth('Viewing comments')) return;
+  if (!post) return;
+  
+  let postType: 'feed_post' | 'group_post' | 'marketplace_post' | 'event_post' | 'reel_post' | 'music_post' = 'feed_post';
+  
+  if ((post as any).group_id || (post as any).group) {
+    postType = 'group_post';
+  } else if ((post as any).product_id || (post as any).marketplace || (post as any).type === 'product') {
+    postType = 'marketplace_post';
+  } else if ((post as any).event_id || (post as any).type === 'event' || (post as any).item_type === 'event') {
+    postType = 'event_post';
+  } else if ((post as any).reel_id || (post as any).type === 'reel') {
+    postType = 'reel_post';
+  } else if (
+    (post as any).song_id ||
+    (post as any).song_id2 ||
+    (post as any).type === 'music' ||
+    (post as any).type === 'song' ||
+    (post as any).item_type === 'music' ||
+    (post as any).item_type === 'song' ||
+    (post as any).source === 'song' ||
+    (post as any).source === 'music' ||
+    (post as any).song_title ||
+    ((post as any).audio_url && !(post as any).podcast_id)
+  ) {
+    postType = 'music_post';
+  }
+  
+  setCommentPostSnapshot(post);
+  setActiveCommentsIdentity({ type: postType, id: post.id });
+}, [requireAuth]);
+
+// ---- close handler (inside App) ----
+const handleCloseComments = useCallback(() => {
+  setActiveCommentsIdentity(null);
+  setCommentPostSnapshot(null);
+}, []);
+
+// ---- which post is shown (inside App) ----
+  const activePost = useMemo(() => {
+    if (!activeCommentsIdentity) return null;
+    const targetId = String(activeCommentsIdentity.id);
+    return (
+      commentPostSnapshot || 
+      posts.find((p) => String(p.id) === targetId || String((p as any).event_id) === targetId) ||
+      profilePosts.find((p) => String(p.id) === targetId || String((p as any).event_id) === targetId) ||
+      null
+    );
+  }, [activeCommentsIdentity, commentPostSnapshot, posts, profilePosts]);        
+
+// ---- render (inside App's return JSX) ----
+ {activePost && currentUser && (
+  <CommentsSheet
+    post={activePost}
+    currentUser={currentUser}
+    users={users}
+    onClose={() => {
+      setActiveCommentsIdentity(null);
+      setCommentPostSnapshot(null);
+    }}
+    onComment={createComment}  // Use createComment, not createGroupPostComment
+    onLikeComment={likeComment}  // Use likeComment, not handleLikeComment
+    getCommentAuthor={(id) => users.find((u) => u.id === id)}
+    onProfileClick={(id) => openProfile(id)}
+    onHashtagClick={handleHashtagClick}
+    onFollow={followUser}
+    checkIsFollowing={checkIsFollowing}
+    onReact={(post, type) => reactToFeedItem(post, type)}
+    onShare={(id, newShareCount) => {
+      setPosts(prev => prev.map(p => 
+        (Number(p.id) === id || Number((p as any).event_id) === id) ? { ...p, shares: newShareCount, shares_count: newShareCount } as any : p
+      ));
+    }}
+    onVideoClick={handleVideoClick}
+    onOpenAudio={onPlayTrack}
+    groups={groups}
+    brands={brands}
+    chats={chats}
+    onOpenGroup={(groupId) => {
+      setActiveCommentsIdentity(null);
+      setCommentPostSnapshot(null);
+      openGroup(groupId);
+    }}
+    onRSVP={onRSVPEvent}
+    onEventClick={(eventId) => {
+      setActiveEventId(eventId);
+      navigateTo('events');
+    }}
+  />
+)}

@@ -1,0 +1,1319 @@
+I'll provide you the complete Image Grid and Products/Marketplace Grid implementations exactly as they appear in Feeds.tsx.
+
+1. Complete Image Grid (MediaGrid component)
+
+```tsx
+// ==================== MEDIA GRID ====================
+const MediaGrid = memo(
+  ({
+    media,
+    onOpen,
+  }: {
+    media: {
+      url: string;
+      thumb?: string;
+      feed?: string;
+      full?: string;
+      width?: number;
+      height?: number;
+    }[];
+    onOpen: (url: string, index: number) => void;
+  }) => {
+    const total = Array.isArray(media) ? media.length : 0;
+
+    const visible =
+      total <= 4
+        ? media
+        : total === 5
+        ? media.slice(0, 5)
+        : media.slice(0, 6);
+
+    const extra = total <= 5 ? 0 : total === 6 ? 0 : total - 6;
+
+    const orientations = classifyOrientations(visible);
+
+    const Tile = ({
+      item,
+      index,
+      className,
+      showOverlay = false,
+    }: {
+      item: { url: string; thumb?: string; feed?: string; full?: string };
+      index: number;
+      className: string;
+      showOverlay?: boolean;
+    }) => (
+      <button
+        type="button"
+        key={`${item.full || item.feed || item.thumb || item.url}-${index}`}
+        onClick={(e) => {
+          e.stopPropagation();
+          onOpen(item.full || item.feed || item.thumb || item.url, index);
+        }}
+        className={`relative overflow-hidden bg-[#162032] ${className}`}
+        style={{ borderRadius: 0 }}
+      >
+        <ProgressiveTileImage
+          item={item}
+          className="absolute inset-0 w-full h-full object-cover"
+        />
+
+        {showOverlay && extra > 0 && (
+          <div className="absolute inset-0 bg-black/55 flex items-center justify-center pointer-events-none">
+            <span className="text-white font-bold text-[34px] leading-none">
+              +{extra}
+            </span>
+          </div>
+        )}
+      </button>
+    );
+
+    if (total === 0) return null;
+
+    // Single image layout - edge-to-edge with natural aspect ratio container to prevent layout shifts
+    if (total === 1) {
+      const item = visible[0];
+      const hasDimensions = Boolean(item.width && item.height && item.width > 0 && item.height > 0);
+      const aspectStyle = hasDimensions
+        ? { aspectRatio: `${item.width} / ${item.height}` }
+        : undefined;
+
+      return (
+        <div className="w-full bg-[#050B18] overflow-hidden flex justify-center p-0 m-0">
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpen(
+                item.full || item.feed || item.thumb || item.url,
+                0
+              );
+            }}
+            className="w-full block focus:outline-none relative bg-[#162032] p-0 m-0 overflow-hidden"
+            style={aspectStyle}
+          >
+            <ProgressiveTileImage
+              item={item}
+              className="w-full h-auto object-contain mx-auto block p-0 m-0"
+            />
+          </button>
+        </div>
+      );
+    }
+
+    // 2 images layout
+    if (total === 2) {
+      return (
+        <div className="w-full grid grid-cols-2 gap-[2px] bg-black">
+          <Tile item={visible[0]} index={0} className="h-[320px] w-full" />
+          <Tile item={visible[1]} index={1} className="h-[320px] w-full" />
+        </div>
+      );
+    }
+
+    // 3 images layout
+    if (total === 3) {
+      return (
+        <div className="w-full grid grid-cols-2 gap-[2px] bg-black">
+          <Tile item={visible[0]} index={0} className="h-[420px] w-full" />
+          <div className="grid grid-rows-2 gap-[2px] h-[420px]">
+            <Tile item={visible[1]} index={1} className="w-full h-full" />
+            <Tile item={visible[2]} index={2} className="w-full h-full" />
+          </div>
+        </div>
+      );
+    }
+
+    // 4 images layout
+    if (total === 4) {
+      return (
+        <div className="w-full grid grid-cols-2 gap-[2px] bg-black">
+          <Tile item={visible[0]} index={0} className="h-[260px] w-full" />
+          <Tile item={visible[1]} index={1} className="h-[260px] w-full" />
+          <Tile item={visible[2]} index={2} className="h-[260px] w-full" />
+          <Tile item={visible[3]} index={3} className="h-[260px] w-full" />
+        </div>
+      );
+    }
+
+    // 5 images layout
+    if (total === 5) {
+      return (
+        <div className="w-full bg-black">
+          <div className="grid grid-cols-2 gap-[2px] mb-[2px]">
+            <Tile item={visible[0]} index={0} className="h-[250px] w-full" />
+            <Tile item={visible[1]} index={1} className="h-[250px] w-full" />
+          </div>
+
+          <div className="grid grid-cols-3 gap-[2px]">
+            <Tile item={visible[2]} index={2} className="h-[170px] w-full" />
+            <Tile item={visible[3]} index={3} className="h-[170px] w-full" />
+            <Tile
+              item={visible[4]}
+              index={4}
+              className="h-[170px] w-full"
+              showOverlay={extra > 0}
+            />
+          </div>
+        </div>
+      );
+    }
+
+    // Smart 6-image layout
+    if (total >= 6) {
+      const first = orientations[0];
+      const second = orientations[1];
+      const third = orientations[2];
+
+      const topPortraitPair = first === 'portrait' && second === 'portrait';
+      const firstLandscape = first === 'landscape' || second === 'landscape';
+      const tallLeft = third === 'portrait';
+
+      // Layout A
+      if (tallLeft) {
+        return (
+          <div className="w-full bg-black">
+            <div className="grid grid-cols-2 gap-[2px] mb-[2px]">
+              <Tile item={visible[0]} index={0} className="h-[250px] w-full" />
+              <Tile item={visible[1]} index={1} className="h-[250px] w-full" />
+            </div>
+
+            <div className="grid grid-cols-2 gap-[2px]">
+              <Tile item={visible[2]} index={2} className="h-[340px] w-full" />
+              <div className="grid grid-rows-3 gap-[2px] h-[340px]">
+                <Tile item={visible[3]} index={3} className="w-full h-full" />
+                <Tile item={visible[4]} index={4} className="w-full h-full" />
+                <Tile
+                  item={visible[5]}
+                  index={5}
+                  className="w-full h-full"
+                  showOverlay={extra > 0}
+                />
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      // Layout B
+      if (firstLandscape || !topPortraitPair) {
+        return (
+          <div className="w-full bg-black">
+            <div className="grid grid-cols-2 gap-[2px] mb-[2px]">
+              <Tile item={visible[0]} index={0} className="h-[230px] w-full" />
+              <Tile item={visible[1]} index={1} className="h-[230px] w-full" />
+            </div>
+
+            <div className="grid grid-cols-2 gap-[2px]">
+              <Tile item={visible[2]} index={2} className="h-[170px] w-full" />
+              <Tile item={visible[3]} index={3} className="h-[170px] w-full" />
+              <Tile item={visible[4]} index={4} className="h-[170px] w-full" />
+              <Tile
+                item={visible[5]}
+                index={5}
+                className="h-[170px] w-full"
+                showOverlay={extra > 0}
+              />
+            </div>
+          </div>
+        );
+      }
+
+      // Layout C
+      return (
+        <div className="w-full bg-black">
+          <div className="grid grid-cols-2 gap-[2px] mb-[2px]">
+            <Tile item={visible[0]} index={0} className="h-[320px] w-full" />
+            <div className="grid grid-rows-2 gap-[2px] h-[320px]">
+              <Tile item={visible[1]} index={1} className="w-full h-full" />
+              <Tile item={visible[2]} index={2} className="w-full h-full" />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-3 gap-[2px]">
+            <Tile item={visible[3]} index={3} className="h-[150px] w-full" />
+            <Tile item={visible[4]} index={4} className="h-[150px] w-full" />
+            <Tile
+              item={visible[5]}
+              index={5}
+              className="h-[150px] w-full"
+              showOverlay={extra > 0}
+            />
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div className="w-full grid grid-cols-3 gap-[2px] bg-black">
+        <Tile item={visible[0]} index={0} className="h-[180px] w-full" />
+        <Tile item={visible[1]} index={1} className="h-[180px] w-full" />
+        <Tile item={visible[2]} index={2} className="h-[180px] w-full" />
+        <Tile item={visible[3]} index={3} className="h-[180px] w-full" />
+        <Tile item={visible[4]} index={4} className="h-[180px] w-full" />
+        <Tile
+          item={visible[5]}
+          index={5}
+          className="h-[180px] w-full"
+          showOverlay={extra > 0}
+        />
+      </div>
+    );
+  },
+  (prev, next) => prev.media === next.media
+);
+```
+
+2. Helper Functions for Image Grid
+
+```tsx
+type MediaOrientation = 'portrait' | 'landscape' | 'square';
+
+const getOrientation = (item: {
+  width?: number;
+  height?: number;
+}): MediaOrientation => {
+  const w = Number(item?.width || 0);
+  const h = Number(item?.height || 0);
+
+  if (!w || !h) return 'square';
+
+  const ratio = w / h;
+
+  if (ratio > 1.15) return 'landscape';
+  if (ratio < 0.87) return 'portrait';
+  return 'square';
+};
+
+const classifyOrientations = (
+  media: { width?: number; height?: number }[]
+): MediaOrientation[] => media.map(getOrientation);
+```
+
+3. ProgressiveTileImage (used inside Image Grid)
+
+```tsx
+// ==================== PROGRESSIVE TILE IMAGE (PROFESSIONAL UNERA DATA SAVING) ====================
+// - Outside 3 posts: 0kb downloaded, stable background placeholder (no layout shift/shake)
+// - ~3 posts before screen: thumbnail downloaded
+// - ~1 post before screen: full feed image downloaded & smoothly applied
+// - Cached images: instant load, never redownload once downloaded
+const ProgressiveTileImage = memo(
+  ({
+    item,
+    className,
+  }: {
+    item: { url: string; thumb?: string; feed?: string; full?: string; width?: number; height?: number };
+    className: string;
+  }) => {
+    const thumbSrc = item.thumb || '';
+    const feedSrc = item.feed || item.full || item.url || '';
+    const fullSrc = item.full || item.feed || item.url || '';
+    const fallbackSrc = item.url || '';
+
+    // Check if feed image or thumbnail is already in local/memory cache
+    const feedCached = imageCache.isCached(feedSrc) || imageCache.isCached(fullSrc) || imageCache.isCached(fallbackSrc);
+    const thumbCached = imageCache.isCached(thumbSrc);
+
+    const [stage, setStage] = useState<'idle' | 'thumb' | 'feed'>(() => {
+      if (feedCached) return 'feed';
+      if (thumbCached) return 'thumb';
+      return 'idle';
+    });
+
+    const [activeSrc, setActiveSrc] = useState<string>(() => {
+      if (feedCached) return feedSrc || fullSrc || fallbackSrc;
+      if (thumbCached) return thumbSrc;
+      return '';
+    });
+
+    const [isLoaded, setIsLoaded] = useState<boolean>(() => feedCached);
+    const containerRef = useRef<HTMLDivElement | null>(null);
+
+    useEffect(() => {
+      // If already feed loaded and active, nothing to do
+      if (stage === 'feed' && isLoaded && activeSrc) return;
+
+      if (imageCache.isCached(feedSrc) || imageCache.isCached(fullSrc)) {
+        const resolved = feedSrc || fullSrc || fallbackSrc;
+        setStage('feed');
+        setActiveSrc(resolved);
+        setIsLoaded(true);
+        return;
+      }
+
+      const el = containerRef.current;
+      if (!el) return;
+
+      // STAGE 2 OBSERVER (~1 post ahead / on screen -> Download feed image)
+      const unobserveFeed = observeForFeed(el, () => {
+        setStage('feed');
+        const targetFeed = feedSrc || fullSrc || fallbackSrc;
+        if (targetFeed) {
+          const img = new Image();
+          img.src = targetFeed;
+          img.onload = () => {
+            imageCache.markCached(targetFeed);
+            setActiveSrc(targetFeed);
+            setIsLoaded(true);
+          };
+          img.onerror = () => {
+            setActiveSrc(targetFeed);
+            setIsLoaded(true);
+          };
+        }
+      });
+
+      // If already in thumb or feed stage, we only wait for feed observer
+      if (stage !== 'idle') {
+        return () => {
+          unobserveFeed();
+        };
+      }
+
+      // STAGE 1 OBSERVER (~3 posts ahead -> Download thumbnail)
+      const unobserveThumb = observeForThumbnail(el, () => {
+        setStage((prev) => (prev === 'idle' ? 'thumb' : prev));
+        const targetThumb = thumbSrc || feedSrc || fallbackSrc;
+        if (targetThumb) {
+          const img = new Image();
+          img.src = targetThumb;
+          img.onload = () => {
+            imageCache.markCached(targetThumb);
+            setActiveSrc((current) => current || targetThumb);
+          };
+          img.onerror = () => {
+            setActiveSrc((current) => current || targetThumb);
+          };
+        }
+      });
+
+      return () => {
+        unobserveThumb();
+        unobserveFeed();
+      };
+    }, [feedSrc, fullSrc, thumbSrc, fallbackSrc, stage, activeSrc, isLoaded]);
+
+    return (
+      <div
+        ref={containerRef}
+        className="w-full h-full relative overflow-hidden bg-[#162032]"
+      >
+        {/* Subtle placeholder icon while 0kb idle */}
+        {(!activeSrc || !isLoaded) && (
+          <div className="absolute inset-0 bg-[#162032] flex items-center justify-center pointer-events-none">
+            <div className="w-8 h-8 rounded-full bg-[#1E293B]/50 flex items-center justify-center">
+              <i className="fas fa-image text-[#334155] text-xs" />
+            </div>
+          </div>
+        )}
+
+        {/* The Image element: 0kb download when idle, thumbnail at 3 posts, feed at 1 post */}
+        {activeSrc && (
+          <img
+            src={activeSrc}
+            alt=""
+            loading="lazy"
+            decoding="async"
+            className={`${className} transition-opacity duration-300 ease-out ${
+              isLoaded ? 'opacity-100' : 'opacity-75'
+            }`}
+            onLoad={() => {
+              imageCache.markCached(activeSrc);
+              setIsLoaded(true);
+            }}
+            onError={(e) => {
+              const target = e.currentTarget as HTMLImageElement;
+              if (stage === 'thumb' && feedSrc && target.src !== feedSrc) {
+                target.src = feedSrc;
+                return;
+              }
+              if (fallbackSrc && target.src !== fallbackSrc) {
+                target.src = fallbackSrc;
+                return;
+              }
+              target.style.opacity = '0';
+            }}
+          />
+        )}
+      </div>
+    );
+  }
+);
+```
+
+4. Products/Marketplace Image Helpers
+
+```tsx
+const getMarketplaceImages = (p: any, productData?: any): string[] => {
+  const parseVariants = (value: any) => {
+    if (Array.isArray(value)) return value;
+    if (typeof value === 'string') {
+      try {
+        const parsed = JSON.parse(value);
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    }
+    return [];
+  };
+
+  // ✅ image_variants first
+  const directVariants = parseVariants((p as any)?.image_variants);
+  if (directVariants.length > 0) {
+    return directVariants.map((v: any) => v?.feed || v?.thumb || v?.full).filter(Boolean);
+  }
+
+  const productVariants = parseVariants(productData?.image_variants);
+  if (productVariants.length > 0) {
+    return productVariants.map((v: any) => v?.feed || v?.thumb || v?.full).filter(Boolean);
+  }
+
+  // fallback old fields
+  const pdImgs = safeJsonArray(productData?.images);
+  if (pdImgs.length) return pdImgs;
+  
+  const mediaUrls = safeJsonArray(p?.media_urls);
+  if (mediaUrls.length) return mediaUrls;
+  
+  const imgs = safeJsonArray(p?.images);
+  if (imgs.length) return imgs;
+  
+  const single = typeof p?.media_url === 'string' && p.media_url ? [p.media_url] : [];
+  return single;
+};
+
+const getMarketplaceImageVariants = (
+  p: any,
+  productData?: any
+): Array<{ thumb: string; feed: string; full: string; type: string }> => {
+  const parseVariants = (value: any) => {
+    if (Array.isArray(value)) return value;
+    if (typeof value === 'string') {
+      try {
+        const parsed = JSON.parse(value);
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    }
+    return [];
+  };
+
+  const normalize = (arr: any[]) =>
+    arr
+      .map((v: any) => ({
+        thumb: v?.thumb || v?.feed || v?.full || '',
+        feed: v?.feed || v?.full || v?.thumb || '',
+        full: v?.feed || v?.full || v?.thumb || '',
+        type: v?.type || 'image',
+      }))
+      .filter((v) => v.feed);
+
+  const direct = normalize(parseVariants((p as any)?.image_variants));
+  if (direct.length > 0) return direct;
+
+  const fromProduct = normalize(parseVariants(productData?.image_variants));
+  if (fromProduct.length > 0) return fromProduct;
+
+  const fromMeta = normalize(parseVariants(p?.meta?.marketplace?.image_variants));
+  if (fromMeta.length > 0) return fromMeta;
+
+  return [];
+};
+
+const getMarketplacePriceLine = (productData?: any, p?: any) => {
+  const meta = p?.meta;
+  const priceRaw =
+    productData?.price ??
+    productData?.main_price ??
+    productData?.discount_price ??
+    meta?.marketplace?.price ??
+    meta?.marketplace?.discount_price ??
+    meta?.marketplace?.main_price ??
+    meta?.price ??
+    meta?.discount_price ??
+    meta?.main_price ??
+    p?.price ??
+    p?.main_price ??
+    p?.discount_price ??
+    null;
+  const currency =
+    productData?.currency ||
+    meta?.marketplace?.currency ||
+    meta?.currency ||
+    p?.currency ||
+    'TZS';
+  const loc =
+    (typeof productData?.location === 'string' &&
+      productData.location.split(',')[0]) ||
+    (typeof productData?.address === 'string' &&
+      productData.address.split(',')[0]) ||
+    (typeof meta?.marketplace?.location === 'string' &&
+      meta.marketplace.location.split(',')[0]) ||
+    (typeof meta?.marketplace?.address === 'string' &&
+      meta.marketplace.address.split(',')[0]) ||
+    (typeof meta?.location === 'string' &&
+      meta.location.split(',')[0]) ||
+    (typeof meta?.address === 'string' &&
+      meta.address.split(',')[0]) ||
+    (typeof p?.location === 'string' &&
+      p.location.split(',')[0]) ||
+    (typeof p?.address === 'string' &&
+      p.address.split(',')[0]) ||
+    'MarketPoint';
+  const priceNum = priceRaw != null ? Number(priceRaw) : NaN;
+  const price = Number.isFinite(priceNum) ? priceNum.toFixed(0) : null;
+  return { price, currency, loc };
+};
+```
+
+5. Marketplace Grid Data Builder (inside Post component)
+
+```tsx
+// Inside Post component, after all the useMemo declarations, before the return
+const marketplaceGridData = useMemo(() => {
+  if (!isMarketplace) {
+    return {
+      mediaForGrid: [] as Array<{ url: string; thumb?: string; feed?: string; full?: string; }>,
+      galleryUrls: [] as string[],
+    };
+  }
+  
+  const variants = getMarketplaceImageVariants(p, productData);
+  const hasVariants = variants.length > 0;
+  
+  const mediaForGrid = hasVariants
+    ? variants.map((v) => ({
+        url: v.feed || v.thumb || v.full || '',
+        thumb: v.thumb || v.feed || v.full || '',
+        feed: v.feed || v.full || v.thumb || '',
+        full: v.full || v.feed || v.thumb || '',
+      }))
+    : mpImages.map((url) => ({
+        url,
+        thumb: url,
+        feed: url,
+        full: url,
+      }));
+  
+  const galleryUrls = hasVariants
+    ? variants.map((v) => v.full || v.feed || v.thumb || '').filter(Boolean)
+    : mpImages.filter(Boolean);
+  
+  return { mediaForGrid, galleryUrls };
+}, [isMarketplace, p, productData, mpImages]);
+```
+
+6. Marketplace Grid Rendering (inside Post component, JSX)
+
+```tsx
+{isMarketplace ? (
+  <>
+    {marketplaceGridData.mediaForGrid.length > 0 && (
+      <div className="w-full">
+        <div className="w-full bg-black">
+          <MediaGrid
+            media={marketplaceGridData.mediaForGrid}
+            onOpen={(url, index) => {
+              openGallery(marketplaceGridData.galleryUrls, index, url);
+            }}
+          />
+        </div>
+      </div>
+    )}
+
+    {(price || productId) && (
+      <div
+        className="px-4 py-2 flex items-center justify-between border-t border-[#1E293B] mt-1 cursor-pointer hover:bg-slate-800/30 transition-colors"
+        onClick={() => {
+          if (productId) {
+            if (onViewProduct) onViewProduct(productId);
+            else if (onViewProductFromPost) onViewProductFromPost(productId);
+          }
+        }}
+      >
+        <div className="flex items-center gap-1">
+          {price ? (
+            <>
+              <span className="text-[#F8FAFC] text-[19px] font-bold">
+                {currency}
+              </span>
+              <span className="text-[#F8FAFC] text-[22px] font-bold">
+                {price}
+              </span>
+            </>
+          ) : (
+            <span className="text-[#94A3B8] text-sm font-medium">
+              {loc || 'Marketplace'}
+            </span>
+          )}
+        </div>
+
+        <button
+          type="button"
+          className="bg-[#1877F2] hover:bg-[#166FE5] text-white px-4 py-1.5 rounded-full font-bold text-[15px] transition-colors shadow-sm cursor-pointer shrink-0 flex items-center gap-1.5"
+          onClick={(e) => {
+            e.stopPropagation();
+            if (productId) {
+              if (onViewProduct) onViewProduct(productId);
+              else if (onViewProductFromPost) onViewProductFromPost(productId);
+            }
+          }}
+        >
+          <i className="fas fa-shopping-bag text-xs" />
+          <span>View Product</span>
+        </button>
+      </div>
+    )}
+
+    {shouldShowSponsoredButton && (
+      <div className="px-3 pt-2 pb-1">
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            handleSponsoredClick();
+          }}
+          className="w-full bg-[#1877F2] hover:bg-[#166FE5] active:scale-[0.99] text-white font-semibold py-2 px-4 text-[14.5px] rounded-lg shadow-sm transition-all flex items-center justify-center gap-2"
+        >
+          <span>{sponsoredCtaText}</span>
+          <i className="fas fa-chevron-right text-[11px] opacity-80"></i>
+        </button>
+      </div>
+    )}
+
+    <div className="px-3 md:px-4 py-2.5 flex items-center justify-between text-[#94A3B8] text-[15px] border-t border-[#1E293B]">
+      <div className="flex items-center gap-2 min-h-[24px]">
+        {finalReactionCount > 0 && (
+          <div
+            className="flex items-center gap-2 cursor-pointer hover:opacity-80 transition-opacity"
+            onClick={(e) => {
+              e.stopPropagation();
+              handleOpenReactionsSheet();
+            }}
+          >
+            <div className="flex -space-x-2">
+              {emojiList.slice(0, 2).map((e, i) => (
+                <span
+                  key={i}
+                  className="w-[24px] h-[24px] rounded-full bg-[#1E293B] border border-[#0B1120] flex items-center justify-center text-[16px]"
+                  style={{ zIndex: 10 - i }}
+                >
+                  {e}
+                </span>
+              ))}
+            </div>
+
+            {reactionText && (
+              <span className="text-[15px] md:text-[16px] text-[#F8FAFC] font-bold">
+                {reactionText}
+              </span>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="flex items-center gap-4">
+        <span
+          className="hover:underline cursor-pointer text-[#CBD5E1] hover:text-[#F8FAFC] text-[15px] md:text-[16px] font-semibold transition-colors"
+          onClick={() => handleOpenComments()}
+        >
+          {formatCount(commentCount)} {commentCount === 1 ? 'Discussion' : 'Discussions'}
+        </span>
+        {shareCount > 0 && (
+          <span
+            className="hover:underline cursor-pointer text-[15px] md:text-[16px] text-[#94A3B8] hover:text-[#CBD5E1] transition-colors"
+            onClick={(e) => {
+              e.stopPropagation();
+              if (!currentUser) {
+                alert('Please login to share posts.');
+                return;
+              }
+              setShowShareSheet(true);
+            }}
+          >
+            {formatCount(shareCount)} {shareCount === 1 ? 'Share' : 'Shares'}
+          </span>
+        )}
+      </div>
+    </div>
+
+    <div className="px-3.5 py-2.5 border-t border-[#1E293B] flex items-center justify-between">
+      <div className="flex items-center gap-4">
+        <ReactionButton
+          currentUserReactions={finalMyReaction || undefined}
+          reactionCount={finalReactionCount}
+          onReact={handleReactClick}
+          isGuest={!currentUser}
+          postId={productId}
+        />
+        <button
+          type="button"
+          className="flex items-center gap-1.5 text-[#F8FAFC] hover:text-[#38BDF8] transition-colors focus:outline-none p-1 rounded-lg hover:bg-[#1E293B]/60"
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            handleOpenComments(e);
+          }}
+          aria-label="Discuss & Comments"
+          title="Discuss"
+        >
+          <i className="far fa-comment text-[22px]"></i>
+          {commentCount > 0 && (
+            <span className="text-[14px] font-semibold text-[#F8FAFC]">
+              {formatCount(commentCount)}
+            </span>
+          )}
+        </button>
+        <button
+          type="button"
+          className="flex items-center gap-1.5 text-[#F8FAFC] hover:text-[#38BDF8] transition-transform active:scale-110 focus:outline-none p-1 rounded-lg hover:bg-[#1E293B]/60"
+          onClick={() => {
+            if (!currentUser) {
+              alert('Please login to share posts.');
+              return;
+            }
+            setShowShareSheet(true);
+          }}
+          aria-label="Share post"
+          title="Share"
+        >
+          <i className="far fa-paper-plane text-[21px]"></i>
+          {shareCount > 0 && (
+            <span className="text-[14px] font-semibold text-[#F8FAFC]">
+              {formatCount(shareCount)}
+            </span>
+          )}
+        </button>
+      </div>
+      <div className="flex items-center gap-1.5">
+        <SavePostButton post={p} />
+        {pushButton && <div className="ml-1">{pushButton}</div>}
+      </div>
+    </div>
+  </>
+) : (
+  // ... non-marketplace rendering
+)}
+```
+
+7. Regular Post Image Grid Rendering (inside Post component)
+
+```tsx
+{!isSharedPost && !p.background && imageMedia.length > 0 && (
+  <MediaGrid
+    media={imageMedia.map((m) => ({
+      url: m.feed || m.url,
+      thumb: m.thumb || m.url,
+      feed: m.feed || m.url,
+      full: m.full || m.feed || m.url,
+    }))}
+    onOpen={(url, index) => {
+      const urls = imageMedia.map((m) => m.full || m.feed || m.url);
+      openGallery(urls, index, url);
+    }}
+  />
+)}
+```
+
+8. Suggested Products Widget (Marketplace Grid)
+
+```tsx
+export const SuggestedProductsWidget = memo(
+  ({
+    products,
+    currentUser,
+    onViewProduct,
+    onSeeAll,
+  }: {
+    products: Product[];
+    currentUser: User;
+    onViewProduct: (product: Product) => void;
+    onSeeAll: () => void;
+  }) => {
+    const suggested = (products || [])
+      .filter((p: any) => p.seller_id !== safeUserId(currentUser))
+      .slice(0, 4);
+
+    if (suggested.length === 0) return null;
+
+    return (
+      <div className="w-full">
+        <div className="bg-[#0B1120] w-full p-4">
+          <div className="flex justify-between items-center mb-3">
+            <h3 className="text-[#F8FAFC] font-bold text-[21px]">MarketPoint for you</h3>
+            <button
+              onClick={onSeeAll}
+              className="text-[#1877F2] font-bold text-[17px] hover:bg-[#1E293B] px-2 py-1 rounded transition-colors"
+            >
+              See all
+            </button>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2">
+            {suggested.map((product: any) => {
+              const countryData = MARKETPLACE_COUNTRIES.find((c) =>
+                String(product.address || '').toLowerCase().includes(c.name.toLowerCase())
+              );
+              const symbol = countryData ? countryData.symbol : '$';
+
+              return (
+                <div
+                  key={String(product.id)}
+                  className="cursor-pointer group"
+                  onClick={() => onViewProduct(product)}
+                >
+                  <div className="aspect-square rounded-lg overflow-hidden relative mb-1.5 shadow-sm border border-[#1E293B]">
+                    <img
+                      src={product.images?.[0]}
+                      alt={product.title}
+                      className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-500"
+                    />
+                    <div className="absolute bottom-2 left-2 bg-black/70 backdrop-blur-md px-2 py-0.5 rounded text-[13px] font-bold text-white">
+                      {symbol}
+                      {product.main_price}
+                    </div>
+                    {Boolean(product.is_sponsored || product.sponsored || product.is_ad || product.ad_id) && (
+                      <div className="absolute top-2 left-2 bg-[#F97316] text-white text-[10px] font-bold px-1.5 py-0.5 rounded shadow z-10">
+                        Ad
+                      </div>
+                    )}
+                  </div>
+                  <h4 className="text-[#F8FAFC] text-[15px] font-bold truncate px-0.5 leading-tight">
+                    {product.title}
+                  </h4>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="h-[10px] bg-[#050B18] border-t border-white/10" />
+      </div>
+    );
+  },
+  (prev, next) => {
+    return prev.products === next.products && prev.currentUser?.id === next.currentUser?.id;
+  }
+);
+```
+
+9. SponsoredProductCard (Marketplace Ad Card)
+
+```tsx
+export interface SponsoredProductCardProps {
+  product?: any;
+  ad?: any;
+  currentUser?: User | null;
+  users?: User[];
+  onProfileClick?: (id: number) => void;
+  onViewProduct?: (productId: number) => void;
+  onReact?: (post: any, type: ReactionType) => void;
+  onOpenComments?: (post: any) => void;
+  onShare?: (id: number, newCount: number, data?: any, source?: any) => void;
+  onDelete?: (id: number) => void;
+  onEdit?: (id: number, content: string) => void;
+}
+
+export const SponsoredProductCard: React.FC<SponsoredProductCardProps> = ({
+  product = {} as any,
+  ad = {} as any,
+  currentUser,
+  users = [],
+  onProfileClick = () => {},
+  onViewProduct,
+  onReact = () => {},
+  onOpenComments = () => {},
+  onShare = () => {},
+  onDelete,
+  onEdit,
+}) => {
+  const prod: any = product || {};
+  const a: any = ad || {};
+  const prodId = Number(prod?.id || prod?.product_id || a?.product_id || a?.source_id || 0);
+  const rawImages = prod?.images || (a?.media_url ? [a.media_url] : []);
+  const imgList = Array.isArray(rawImages) ? rawImages : [];
+  const mainPrice = prod?.main_price ?? a?.main_price;
+  const discountPrice = prod?.discount_price ?? a?.discount_price;
+  const priceVal = discountPrice || mainPrice;
+
+  const sponsoredProductPost = useMemo(() => ({
+    ...prod,
+    id: prodId || `sp-prod-${a?.id || Date.now()}`,
+    product_id: prodId,
+    user_id: prod?.seller_id || a?.advertiser_id || a?.user_id,
+    seller_id: prod?.seller_id || a?.advertiser_id || a?.user_id,
+    name: prod?.seller_name || prod?.seller?.name || a?.advertiser_name || a?.name || 'Seller',
+    username: prod?.seller_username || a?.username || 'seller',
+    profile_image_url: prod?.seller_avatar || a?.profile_image_url,
+    is_verified: Boolean(prod?.seller?.is_verified || a?.is_verified),
+    title: prod?.title || a?.headline || a?.title || '',
+    description: prod?.description || a?.description || '',
+    main_price: mainPrice,
+    discount_price: discountPrice,
+    price: priceVal,
+    currency: prod?.currency || 'TZS',
+    location: prod?.address || prod?.location || a?.target_location || '',
+    address: prod?.address || a?.target_location || '',
+    images: imgList,
+    image_variants: prod?.image_variants || [],
+    is_sponsored: true,
+    sponsored: true,
+    is_ad: true,
+    ad_id: Number(a?.id || 0),
+    type: 'product',
+    item_type: 'product',
+    post_type: 'product',
+    source: 'product',
+    sponsored_meta: {
+      ad_id: Number(a?.id || 0),
+      advertiser_id: Number(a?.advertiser_id || prod?.seller_id || 0),
+      campaign_name: a?.campaign_name || a?.title || prod?.title || 'Sponsored Product',
+      headline: a?.headline || a?.title || prod?.title || '',
+      cta_text: a?.cta_button || a?.cta_text || 'Shop Now',
+      cta_url: a?.destination_url || a?.cta_url || '',
+      contact_type: a?.contact_type || 'link',
+      phone_number: a?.phone_number || prod?.phone_number || '',
+      email_address: a?.email_address || '',
+    },
+  }), [prod, a, prodId, mainPrice, discountPrice, priceVal, imgList]);
+
+  return (
+    <Post
+      post={sponsoredProductPost as any}
+      author={
+        prod?.seller || {
+          id: sponsoredProductPost.user_id,
+          name: sponsoredProductPost.name,
+          username: sponsoredProductPost.username,
+          profile_image_url: sponsoredProductPost.profile_image_url,
+          is_verified: sponsoredProductPost.is_verified,
+        }
+      }
+      currentUser={currentUser || null}
+      users={users}
+      onProfileClick={onProfileClick}
+      onViewProductFromPost={onViewProduct}
+      onReact={onReact}
+      onOpenComments={onOpenComments}
+      onShare={onShare}
+      onDelete={onDelete}
+      onEdit={onEdit}
+      onViewImage={() => {}}
+      onVideoClick={() => {}}
+    />
+  );
+};
+
+// ==================== EXPORTED HELPERS ====================
+export {
+  SponsoredProductCard as SponsoredProductPostCard,
+  getMediaTypeInfo,
+  getMarketplaceImages,
+  getMarketplacePriceLine,
+  normalizeEventFromFeed,
+  topReactionEmojis,
+  pickStableReactorName,
+  safeArray,
+  safeNumber,
+  safeString,
+  safePostId,
+  safeUserId,
+  formatReelCount,
+  getReelAuthorName,
+  getFeedItemType,
+  getFeedItemId,
+  getFeedKey,
+  isSameFeedItem,
+};
+```
+
+10. Media Helpers used by Image Grid
+
+```tsx
+const safeJsonArray = (v: any): string[] => {
+  if (!v) return [];
+  const extractUrl = (item: any): string => {
+    if (!item) return '';
+    if (typeof item === 'object') {
+      return String(item.url || item.feed || item.full || item.thumb || '');
+    }
+    return String(item ?? '');
+  };
+
+  if (Array.isArray(v)) {
+    return v.map(extractUrl).filter((s) => s.length > 0 && s !== '[object Object]');
+  }
+  if (typeof v === 'string') {
+    const s = v.trim();
+    if (!s || s === 'null' || s === 'undefined') return [];
+    if (s.startsWith('[') || s.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(s);
+        if (Array.isArray(parsed)) {
+          return parsed.map(extractUrl).filter((url) => url.length > 0 && url !== '[object Object]');
+        }
+        if (parsed && typeof parsed === 'object') {
+          const u = extractUrl(parsed);
+          return u && u !== '[object Object]' ? [u] : [];
+        }
+        return [];
+      } catch {
+        return [];
+      }
+    }
+    return [s];
+  }
+  return [];
+};
+
+const getPostMediaList = (p: any) => {
+  const out: Array<{
+    url: string;
+    thumb?: string;
+    feed?: string;
+    full?: string;
+    kind: 'image' | 'video' | 'audio';
+  }> = [];
+
+  const guessKind = (url: string, explicitType?: string) => {
+    const t = String(explicitType || '').toLowerCase();
+    const u = String(url || '').toLowerCase();
+    if (t.includes('video') || /\.(mp4|webm|mov|m4v)(\?|$)/i.test(u)) return 'video';
+    if (t.includes('audio') || /\.(mp3|wav|m4a|ogg|aac)(\?|$)/i.test(u)) return 'audio';
+    return 'image';
+  };
+
+  const safeParseArray = (value: any) => {
+    if (Array.isArray(value)) return value;
+    if (typeof value !== 'string') return [];
+    try {
+      const parsed = JSON.parse(value || '[]');
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  };
+
+  try {
+    // ✅ STEP 1: Check media_meta first
+    const metaItems = safeParseArray(p?.media_meta);
+
+    if (metaItems.length > 0) {
+      metaItems.forEach((item: any) => {
+        let parsedItem = item;
+        if (typeof item === 'string') {
+          try {
+            parsedItem = JSON.parse(item);
+          } catch {
+            parsedItem = null;
+          }
+        }
+
+        if (parsedItem && typeof parsedItem === 'object') {
+          const thumbUrl = String(parsedItem.thumb || parsedItem.thumbnail_url || parsedItem.thumbnail || '').trim();
+          const feedUrl = String(parsedItem.feed || parsedItem.feed_url || '').trim();
+          const fullUrl = String(parsedItem.full || parsedItem.full_url || '').trim();
+          const urlField = String(parsedItem.url || '').trim();
+
+          const displayUrl = feedUrl || fullUrl || thumbUrl || urlField;
+          if (displayUrl) {
+            out.push({
+              url: displayUrl,
+              thumb: thumbUrl || feedUrl || fullUrl || urlField,
+              feed: feedUrl || fullUrl || thumbUrl || urlField,
+              full: fullUrl || feedUrl || thumbUrl || urlField,
+              kind: guessKind(displayUrl, parsedItem.type),
+            });
+          }
+        }
+      });
+
+      if (out.length > 0) return out;
+    }
+
+    // ✅ STEP 2: Fallback to media_urls
+    const rawUrls = safeParseArray(p?.media_urls);
+    const rawTypes = safeParseArray(p?.media_types);
+
+    if (rawUrls.length > 0) {
+      if (rawUrls.length === 2) {
+        const k0 = guessKind(rawUrls[0], rawTypes[0]);
+        const k1 = guessKind(rawUrls[1], rawTypes[1]);
+        if (k0 === 'video' && (k1 === 'image' || rawTypes[1] === 'image' || !rawUrls[1].match(/\.(mp4|webm|mov|m4v)/i))) {
+          out.push({
+            url: rawUrls[0],
+            thumb: rawUrls[1],
+            feed: rawUrls[0],
+            full: rawUrls[0],
+            kind: 'video',
+          });
+          return out;
+        }
+      }
+
+      rawUrls.forEach((url: string, i: number) => {
+        const cleanUrl = String(url || '').trim();
+        if (cleanUrl) {
+          out.push({
+            url: cleanUrl,
+            thumb: cleanUrl,
+            feed: cleanUrl,
+            full: cleanUrl,
+            kind: guessKind(cleanUrl, rawTypes[i]),
+          });
+        }
+      });
+    }
+
+    // ✅ STEP 2.5: Fallback to images array
+    if (!out.length) {
+      const rawImages = safeParseArray(p?.images);
+      if (rawImages.length > 0) {
+        rawImages.forEach((img: any) => {
+          const u =
+            typeof img === 'string'
+              ? img.trim()
+              : String(img?.feed || img?.full || img?.url || img?.thumb || '').trim();
+          if (u && u !== '[object Object]' && u !== 'null' && u !== 'undefined') {
+            out.push({
+              url: u,
+              thumb: u,
+              feed: u,
+              full: u,
+              kind: guessKind(u),
+            });
+          }
+        });
+      }
+    }
+
+    // ✅ STEP 3: Fallback to media array or video_url/feed_url
+    if (!out.length && Array.isArray(p?.media) && p.media.length > 0) {
+      p.media.forEach((item: any) => {
+        const u = String(item?.feed || item?.full || item?.url || item?.thumb || '').trim();
+        if (u) {
+          out.push({
+            url: u,
+            thumb: String(item?.thumb || u),
+            feed: String(item?.feed || u),
+            full: String(item?.full || u),
+            kind: guessKind(u, item?.type || p?.media_type),
+          });
+        }
+      });
+    }
+
+    if (!out.length && p?.video_url) {
+      const v = String(p.video_url).trim();
+      if (v) {
+        out.push({
+          url: v,
+          thumb: p?.thumb_url || v,
+          feed: v,
+          full: v,
+          kind: 'video',
+        });
+      }
+    }
+
+    if (!out.length && p?.feed_url) {
+      const f = String(p.feed_url).trim();
+      if (f) {
+        out.push({
+          url: f,
+          thumb: p?.thumb_url || f,
+          feed: f,
+          full: f,
+          kind: guessKind(f, p?.media_type),
+        });
+      }
+    }
+
+    // ✅ STEP 4: Fallback to single media_url
+    if (!out.length && p?.media_url) {
+      const single = String(p.media_url).trim();
+      if (single) {
+        out.push({
+          url: single,
+          thumb: single,
+          feed: single,
+          full: single,
+          kind: guessKind(single, p?.media_type),
+        });
+      }
+    }
+  } catch (error) {
+    console.warn('Failed to parse post media:', error);
+    if (p?.media_url) {
+      const single = String(p.media_url).trim();
+      if (single) {
+        out.push({
+          url: single,
+          thumb: single,
+          feed: single,
+          full: single,
+          kind: guessKind(single, p?.media_type),
+        });
+      }
+    }
+  }
+
+  return out;
+};
+
+const getMediaTypeInfo = (post: any) => {
+  const rawUrl = String(post?.media_url || '').trim();
+  const mediaUrl = rawUrl === 'null' || rawUrl === 'undefined' ? '' : rawUrl;
+  const mediaTypeRaw = String(post?.media_type || '').toLowerCase();
+  const typeRaw = String(post?.type || '').toLowerCase();
+
+  const cleanUrl = mediaUrl.split('?')[0].split('#')[0];
+  const ext = cleanUrl.split('.').pop()?.toLowerCase() || '';
+
+  const isImage =
+    typeRaw === 'image' ||
+    mediaTypeRaw === 'image' ||
+    mediaTypeRaw.startsWith('image/') ||
+    ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'avif', 'heic'].includes(ext);
+
+  const isVideo =
+    typeRaw === 'video' ||
+    mediaTypeRaw === 'video' ||
+    mediaTypeRaw.startsWith('video/') ||
+    ['mp4', 'webm', 'mov', 'm4v', 'avi', 'mkv', 'flv', 'wmv', '3gp'].includes(ext);
+
+  const isAudio =
+    typeRaw === 'audio' ||
+    mediaTypeRaw.startsWith('audio/') ||
+    ['mp3', 'wav', 'ogg', 'm4a', 'flac', 'aac'].includes(ext);
+
+  return {
+    mediaUrl,
+    isImage,
+    isVideo,
+    isAudio,
+    extension: ext,
+    mimeType: mediaTypeRaw,
+  };
+};
+```
+
+---
+
+Summary of what's included
+
+Component / Function Purpose
+MediaGrid Complete image grid with 1–6+ images, smart orientation-aware layouts for 6 images, +N overlay for extras
+ProgressiveTileImage Data-saving progressive image loader (idle → thumb at ~3 posts ahead → feed at ~1 post ahead)
+getOrientation / classifyOrientations Portrait/landscape/square detection for smart layout selection
+getMarketplaceImages / getMarketplaceImageVariants Priority chain: image_variants → productData.image_variants → meta.marketplace.image_variants → images → media_urls → media_url
+getMarketplacePriceLine Price/currency/location resolution for marketplace cards
+marketplaceGridData Builds media + gallery arrays for marketplace posts
+Marketplace grid rendering JSX Uses <MediaGrid> + price line + View Product button
+Regular post grid rendering JSX Uses <MediaGrid> with imageMedia list
+SuggestedProductsWidget 2-column product grid for sidebar/feed suggestions
+SponsoredProductCard Wraps a sponsored product in the standard Post card
+getPostMediaList Parses media_meta, media_urls, images, media, video_url, feed_url, media_url into normalized media array
+getMediaTypeInfo Detects image/video/audio from URL, mime type, and type field

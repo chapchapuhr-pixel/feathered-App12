@@ -1,0 +1,5362 @@
+
+import React, { useState, useRef, useMemo, useEffect, useCallback } from 'react';
+import { User, Group, Event, Post as PostType, ReactionType } from '../types';
+import { 
+  Post, 
+  CommentsSheet,
+  formatRelativeTime,
+  ReactionButton,
+  ShareBottomSheet,
+  RichText,
+  getMediaTypeInfo,
+  avatarFrom,
+  topReactionEmojis,
+  MediaGrid
+} from './Feed';
+import { PostUploadProgressBanner, PostUploadState } from './PostUploadProgress';
+import { CreateEventModal } from './Events';
+import { SavePostButton } from './SavePostButton';
+import { VerifiedBadge } from './VerifiedBadge';
+import { apiFetch } from '../utils/api';
+import { buildCompressedImageFile } from '../utils/imageCompression';
+import { getCachedComments, setCachedComments, updateCachedComment } from '../utils/dataCache';
+import { imageCache, observeForThumbnail, observeForFeed } from '../utils/imageCache';
+
+
+// ==================== NATIVE APP DETECTION ====================
+
+const isUneraNativeApp = (): boolean => {
+  return Boolean(
+    (window as any).UneraNative || 
+    (window as any).UNERA_IS_NATIVE_APP
+  );
+};
+
+const openNativeImagePicker = (): boolean => {
+  if ((window as any).UneraNative?.postMessage) {
+    (window as any).UneraNative.postMessage(
+      JSON.stringify({ action: 'pick_image' })
+    );
+    return true;
+  }
+  return false;
+};
+
+// ✅ Spark icon (React) - orange/coral gradient
+const SparkReactIcon: React.FC<{ size?: number }> = ({ size = 26 }) => (
+  <svg width={size} height={size} viewBox="0 0 64 64" aria-hidden="true">
+    <defs>
+      <linearGradient id="uneraSparkGrad" x1="12" y1="52" x2="52" y2="12">
+        <stop offset="0%" stopColor="#FF7A45" />
+        <stop offset="55%" stopColor="#FF5A6A" />
+        <stop offset="100%" stopColor="#FF8A3D" />
+      </linearGradient>
+      <filter id="uneraSparkGlow" x="-40%" y="-40%" width="180%" height="180%">
+        <feGaussianBlur stdDeviation="2.2" result="blur" />
+        <feMerge>
+          <feMergeNode in="blur" />
+          <feMergeNode in="SourceGraphic" />
+        </feMerge>
+      </filter>
+    </defs>
+    <circle cx="32" cy="32" r="18" fill="url(#uneraSparkGrad)" opacity="0.14" />
+    <g stroke="url(#uneraSparkGrad)" strokeWidth="5.2" strokeLinecap="round" filter="url(#uneraSparkGlow)">
+      <line x1="32" y1="10" x2="32" y2="18" />
+      <line x1="32" y1="46" x2="32" y2="54" />
+      <line x1="10" y1="32" x2="18" y2="32" />
+      <line x1="46" y1="32" x2="54" y2="32" />
+      <line x1="17" y1="17" x2="22.8" y2="22.8" />
+      <line x1="41.2" y1="41.2" x2="47" y2="47" />
+      <line x1="47" y1="17" x2="41.2" y2="22.8" />
+      <line x1="22.8" y1="41.2" x2="17" y2="47" />
+    </g>
+    <circle cx="32" cy="32" r="6.2" fill="url(#uneraSparkGrad)" />
+  </svg>
+);
+
+// ✅ Discuss icon - chat + signal style
+const DiscussSignalIcon: React.FC<{ size?: number; color?: string }> = ({ size = 26, color = "#1877F2" }) => (
+  <svg width={size} height={size} viewBox="0 0 64 64" aria-hidden="true">
+    <g fill="none" stroke={color} strokeWidth="4.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M14 20c0-5 4-9 9-9h18c7 0 13 6 13 13v6c0 7-6 13-13 13H30l-9 7v-7h-1c-6 0-10-4-10-10V20z" />
+      <circle cx="27" cy="30" r="2.2" />
+      <circle cx="33" cy="30" r="2.2" />
+      <circle cx="39" cy="30" r="2.2" />
+      <path d="M48 18c3 2 5 5 6 9" />
+      <path d="M44 22c2 1 3 3 4 6" />
+    </g>
+  </svg>
+);
+
+const fmtCount = (n: number) => {
+  const num = Number(n || 0);
+  if (num >= 1_000_000) return (num / 1_000_000).toFixed(num % 1_000_000 === 0 ? 0 : 1) + "M";
+  if (num >= 1_000) return (num / 1_000).toFixed(num % 1_000 === 0 ? 0 : 1) + "K";
+  return String(num);
+};
+
+const safeArray = <T,>(v: any): T[] => (Array.isArray(v) ? v : []);
+const safeNumber = (v: any, fallback = 0) => {
+  const n = typeof v === 'number' ? v : Number(v);
+  return Number.isFinite(n) ? n : fallback;
+};
+const safeString = (v: any, fallback = '') => (typeof v === 'string' ? v : String(v || ''));
+const safeBoolean = (v: any, fallback = false) => (typeof v === 'boolean' ? v : !!v);
+
+type GroupCategory = 'general' | 'recruitment' | 'buy_sell';
+
+interface CategoryOption {
+  id: GroupCategory;
+  label: string;
+  description: string;
+  icon: string;
+  previewIcon: string;
+  color: string;
+  features: string[];
+}
+
+const GROUP_CATEGORIES: CategoryOption[] = [
+  {
+    id: 'general',
+    label: 'General',
+    description: 'Standard group for discussions and community',
+    icon: 'fas fa-users',
+    previewIcon: 'fas fa-comments',
+    color: '#1877F2',
+    features: ['Discussions', 'Media sharing', 'Member posts']
+  },
+  {
+    id: 'recruitment',
+    label: 'Careers & Recruitment',
+    description: 'Find talent, job opportunities, and professional networking',
+    icon: 'fas fa-briefcase',
+    previewIcon: 'fas fa-user-plus',
+    color: '#45BD62',
+    features: ['Job postings', 'Talent search', 'Professional networking']
+  },
+  {
+    id: 'buy_sell',
+    label: 'Buy and Sell',
+    description: 'Marketplace for buying, selling, and trading items',
+    icon: 'fas fa-store',
+    previewIcon: 'fas fa-tag',
+    color: '#F7B928',
+    features: ['Item listings', 'Price tags', 'Location filtering', 'Sold/Pending status']
+  }
+];
+
+export const isCareerCategory = (cat?: string, name?: string) => {
+  const c = String(cat || '').toLowerCase();
+  const n = String(name || '').toLowerCase();
+  return c === 'recruitment' || c === 'career' || c === 'careers' || c === 'job' || c === 'jobs' ||
+    n.includes('career') || n.includes('job') || n.includes('recruitment') || n.includes('hiring') || n.includes('employment');
+};
+
+const CURRENCY_OPTIONS = [
+  { code: 'TSh', symbol: 'TSh', name: 'Tanzanian Shilling' },
+  { code: 'KES', symbol: 'KSh', name: 'Kenyan Shilling' },
+  { code: 'UGX', symbol: 'USh', name: 'Ugandan Shilling' },
+  { code: 'USD', symbol: '$', name: 'US Dollar' },
+  { code: 'EUR', symbol: '€', name: 'Euro' },
+  { code: 'GBP', symbol: '£', name: 'British Pound' },
+  { code: 'ZAR', symbol: 'R', name: 'South African Rand' },
+  { code: 'NGN', symbol: '₦', name: 'Nigerian Naira' },
+  { code: 'GHS', symbol: 'GH₵', name: 'Ghanaian Cedi' },
+];
+
+type NormalizedMedia = {
+  url: string;
+  thumb?: string;
+  feed?: string;
+  full?: string;
+  kind: 'image' | 'video';
+  width?: number;
+  height?: number;
+};
+
+const getPostMediaList = (post: any): NormalizedMedia[] => {
+  const out: NormalizedMedia[] = [];
+
+  const guessKind = (url: string, explicitType?: string): 'image' | 'video' => {
+    const t = String(explicitType || '').toLowerCase();
+    const u = String(url || '').toLowerCase();
+    if (t.includes('video') || /\.(mp4|webm|mov|m4v|avi|mkv|3gp)(\?|$)/i.test(u)) return 'video';
+    return 'image';
+  };
+
+  const safeParseArray = (value: any): any[] => {
+    if (Array.isArray(value)) return value;
+    if (typeof value !== 'string') return [];
+    try {
+      const parsed = JSON.parse(value || '[]');
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  };
+
+  try {
+    // 1. Check media_meta first (contains webp thumbnail and feed URLs from image bundle)
+    const metaItems = safeParseArray(post?.media_meta);
+    if (metaItems.length > 0) {
+      metaItems.forEach((item: any) => {
+        let parsedItem = item;
+        if (typeof item === 'string') {
+          try {
+            parsedItem = JSON.parse(item);
+          } catch {
+            parsedItem = null;
+          }
+        }
+
+        if (parsedItem && typeof parsedItem === 'object') {
+          const thumbUrl = String(parsedItem.thumb || parsedItem.thumbnail_url || parsedItem.thumbnail || '').trim();
+          const feedUrl = String(parsedItem.feed || parsedItem.feed_url || '').trim();
+          const fullUrl = String(parsedItem.full || parsedItem.full_url || '').trim();
+          const urlField = String(parsedItem.url || '').trim();
+
+          const displayUrl = feedUrl || fullUrl || thumbUrl || urlField;
+          if (displayUrl) {
+            out.push({
+              url: displayUrl,
+              thumb: thumbUrl || feedUrl || fullUrl || urlField,
+              feed: feedUrl || fullUrl || thumbUrl || urlField,
+              full: fullUrl || feedUrl || thumbUrl || urlField,
+              kind: guessKind(displayUrl, parsedItem.type),
+            });
+          }
+        }
+      });
+
+      if (out.length > 0) return out;
+    }
+
+    // 2. Fallback to media_urls
+    const rawUrls = safeParseArray(post?.media_urls);
+    const rawTypes = safeParseArray(post?.media_types);
+    if (rawUrls.length > 0) {
+      rawUrls.forEach((u: string, i: number) => {
+        const url = String(u || '').trim();
+        if (url) {
+          out.push({
+            url,
+            thumb: url,
+            feed: url,
+            full: url,
+            kind: guessKind(url, rawTypes[i]),
+          });
+        }
+      });
+      if (out.length > 0) return out;
+    }
+
+    // 3. Fallback to images array
+    const rawImages = safeParseArray(post?.images);
+    if (rawImages.length > 0) {
+      rawImages.forEach((img: any) => {
+        const u =
+          typeof img === 'string'
+            ? img.trim()
+            : String(img?.feed || img?.full || img?.url || img?.thumb || '').trim();
+        if (u && u !== '[object Object]' && u !== 'null' && u !== 'undefined') {
+          out.push({
+            url: u,
+            thumb: String(img?.thumb || u),
+            feed: String(img?.feed || u),
+            full: String(img?.full || u),
+            kind: guessKind(u),
+          });
+        }
+      });
+      if (out.length > 0) return out;
+    }
+
+    // 4. Fallback to media array
+    const arrMedia: any[] = Array.isArray(post?.media) ? post.media : [];
+    if (arrMedia.length > 0) {
+      for (const m of arrMedia) {
+        const url = String(m?.feed || m?.full || m?.url || m?.media_url || m?.thumb || '').trim();
+        if (!url) continue;
+        const type = String(m?.type || m?.media_type || '').toLowerCase();
+        out.push({
+          url,
+          thumb: String(m?.thumb || url),
+          feed: String(m?.feed || url),
+          full: String(m?.full || url),
+          kind: guessKind(url, type),
+        });
+      }
+      if (out.length > 0) return out;
+    }
+
+    // 5. Fallback to single media_url
+    const single = String(post?.media_url || '').trim();
+    if (single) {
+      const mediaTypeRaw = String(post?.media_type || '').toLowerCase();
+      out.push({
+        url: single,
+        thumb: single,
+        feed: single,
+        full: single,
+        kind: guessKind(single, mediaTypeRaw),
+      });
+    }
+  } catch (e) {
+    console.warn('Error parsing group post media:', e);
+  }
+
+  return out.filter((x) => x.url);
+};
+
+const ExpandableRichText: React.FC<{
+  text: string;
+  users?: User[];
+  onProfileClick: (id: number) => void;
+  onHashtagClick?: (tag: string) => void;
+  maxWords?: number;
+  fontSizePx?: number;
+  onSeeMore?: () => void;
+  forceExpanded?: boolean;
+}> = ({ text = '', users = [], onProfileClick, onHashtagClick, maxWords = 25, fontSizePx = 21, onSeeMore, forceExpanded = false }) => {
+  const [expanded, setExpanded] = useState(false);
+  const safeText = safeString(text);
+  const words = safeText.trim().split(/\s+/).filter(Boolean);
+  const isLong = words.length > maxWords;
+  const showAll = forceExpanded || expanded || !isLong;
+  const shownText = showAll ? safeText : words.slice(0, maxWords).join(' ') + '…';
+  return (
+    <div style={{ fontSize: `${fontSizePx}px` }} className="text-[#F8FAFC] leading-relaxed whitespace-pre-wrap">
+      <RichText text={shownText} users={users} onProfileClick={onProfileClick} onHashtagClick={onHashtagClick} />
+      {isLong && !forceExpanded && (
+        <button
+          type="button"
+          onClick={(e) => { e.stopPropagation(); setExpanded((v) => !v); }}
+          className="ml-2 font-bold text-[#1877F2] hover:text-[#38BDF8] hover:underline text-[19px] transition-colors inline-flex items-center cursor-pointer"
+          style={{ fontSize: '19px' }}
+        >
+          {expanded ? 'See Less' : 'See More'}
+        </button>
+      )}
+    </div>
+  );
+};
+
+const GalleryViewer: React.FC<{
+  isOpen: boolean;
+  urls: string[];
+  startIndex: number;
+  onClose: () => void;
+  postId: number;
+  currentUser: User | null;
+  reactionCount: number;
+  commentCount: number;
+  shareCount: number;
+  myReaction?: ReactionType;
+  onReact: (type: ReactionType) => void;
+  onOpenComments: () => void;
+  onShare: () => void;
+  onOpenReactions?: () => void;
+}> = ({ isOpen, urls, startIndex, onClose, postId, currentUser, reactionCount, commentCount, shareCount, myReaction, onReact, onOpenComments, onShare, onOpenReactions }) => {
+  const scrollerRef = useRef<HTMLDivElement>(null);
+  const [currentIndex, setCurrentIndex] = useState(startIndex);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    document.body.style.overflow = 'hidden';
+    setCurrentIndex(startIndex);
+    requestAnimationFrame(() => {
+      const el = scrollerRef.current;
+      if (!el) return;
+      const w = el.clientWidth || window.innerWidth;
+      el.scrollTo({ left: startIndex * w, behavior: 'instant' as any });
+    });
+    return () => { document.body.style.overflow = ''; };
+  }, [isOpen, startIndex]);
+
+  const handleScroll = () => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    const scrollLeft = el.scrollLeft;
+    const width = el.clientWidth || window.innerWidth;
+    const newIndex = Math.round(scrollLeft / width);
+    if (newIndex !== currentIndex) setCurrentIndex(newIndex);
+  };
+
+  const formatCount = (count: number): string => {
+    if (count >= 1000000) return `${(count / 1000000).toFixed(1)}M`;
+    if (count >= 1000) return `${(count / 1000).toFixed(1)}k`;
+    return count.toString();
+  };
+
+  const reactionEmoji = (t: string) => {
+    switch (t) {
+      case 'like': return '👍';
+      case 'love': return '❤️';
+      case 'haha': return '😂';
+      case 'wow': return '😮';
+      case 'sad': return '😢';
+      case 'angry': return '😡';
+      case 'fire': return '🔥';
+      case 'party': return '🎉';
+      default: return '👍';
+    }
+  };
+
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 z-[9999] bg-black flex flex-col" onClick={(e) => e.stopPropagation()}>
+      <div className="absolute top-0 left-0 right-0 z-10 flex items-center justify-between px-4 py-3 bg-black/40" onClick={(e) => e.stopPropagation()}>
+        <div className="text-white text-sm font-semibold">{currentIndex + 1}/{urls.length}</div>
+        <button className="w-10 h-10 rounded-full bg-black/40 flex items-center justify-center" onClick={onClose} aria-label="Close">
+          <i className="fas fa-times text-white text-lg"></i>
+        </button>
+      </div>
+      <div ref={scrollerRef} className="flex-1 w-full overflow-x-auto overflow-y-hidden flex snap-x snap-mandatory scroll-smooth" style={{ WebkitOverflowScrolling: 'touch' }} onClick={(e) => e.stopPropagation()} onScroll={handleScroll}>
+        {urls.map((url, i) => (
+          <div key={url + i} className="min-w-full h-full snap-center flex items-center justify-center bg-black">
+            <img src={url} alt="" className="max-w-full max-h-full object-contain" draggable={false} onClick={(e) => e.stopPropagation()} />
+          </div>
+        ))}
+      </div>
+      <div className="bg-black/80 backdrop-blur-sm border-t border-white/10 px-4 py-3" onClick={(e) => e.stopPropagation()}>
+        {reactionCount > 0 && (
+          <button onClick={(e) => { e.stopPropagation(); if (onOpenReactions) onOpenReactions(); }} className="w-full flex items-center justify-between px-2 py-2 hover:bg-[#1E293B] rounded-lg mb-2 transition-colors">
+            <div className="flex items-center gap-2 min-w-0">
+              <div className="flex items-center gap-1">
+                <span className="text-[18px]">{reactionEmoji("love")}</span>
+                <span className="-ml-1 text-[18px]">{reactionEmoji("like")}</span>
+              </div>
+              <span className="text-[15px] text-[#94A3B8] font-medium">{fmtCount(reactionCount)}</span>
+            </div>
+            <i className="fas fa-chevron-right text-[#94A3B8] text-[12px]" />
+          </button>
+        )}
+        <div className="flex items-center justify-between text-[#94A3B8] text-sm mb-2 px-2">
+          <div className="flex items-center gap-2">
+            {reactionCount > 0 && (
+              <span className="text-[#F8FAFC] font-bold cursor-pointer hover:underline flex items-center gap-2" onClick={onOpenReactions}>
+                <div className="flex -space-x-2">
+                  {Array.from(new Set([myReaction, 'like', 'love'])).filter(Boolean).slice(0, 2).map((t, i) => (
+                    <span key={i} className="w-[22px] h-[22px] rounded-full bg-[#1E293B] border border-black flex items-center justify-center text-[14px]">
+                      {reactionEmoji(t as string)}
+                    </span>
+                  ))}
+                </div>
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="hover:underline cursor-pointer text-[#CBD5E1] hover:text-[#F8FAFC] text-[15px] md:text-[16px] font-semibold transition-colors" onClick={onOpenComments}>{formatCount(commentCount)} {commentCount === 1 ? 'Discussion' : 'Discussions'}</span>
+            {shareCount > 0 && (<span className="hover:underline cursor-pointer text-[15px] md:text-[16px] text-[#94A3B8] hover:text-[#CBD5E1] transition-colors" onClick={onShare}>{formatCount(shareCount)} {shareCount === 1 ? 'Share' : 'Shares'}</span>)}
+          </div>
+        </div>
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-4">
+            <ReactionButton currentUserReactions={myReaction} reactionCount={reactionCount} onReact={onReact} isGuest={!currentUser} />
+            <button className="flex items-center gap-1.5 text-[#F8FAFC] hover:text-[#38BDF8] transition-colors focus:outline-none p-1 rounded-lg hover:bg-[#1E293B]/60" onClick={() => (currentUser ? onOpenComments() : alert("Login first"))} aria-label="Discuss & Comments" title="Discuss">
+              <i className="far fa-comment text-[22px]"></i>
+            </button>
+            <button className="flex items-center gap-1.5 text-[#F8FAFC] hover:text-[#38BDF8] transition-transform active:scale-110 focus:outline-none p-1 rounded-lg hover:bg-[#1E293B]/60" onClick={() => (currentUser ? onShare() : alert("Please login to share posts."))} aria-label="Share post" title="Share">
+              <i className="far fa-paper-plane text-[21px]"></i>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+interface GroupSettingsModalProps {
+  group: Group;
+  currentUser?: User | null;
+  onClose: () => void;
+  onUpdate: (settings: Partial<Group>) => Promise<void>;
+  isAdmin: boolean;
+  isOwner?: boolean;
+  onDeleteGroup: () => void;
+  onDisableAllMembers?: () => Promise<void>;
+  onEnableAllMembers?: () => Promise<void>;
+}
+
+const GroupSettingsPage: React.FC<GroupSettingsModalProps> = ({
+  group,
+  currentUser,
+  onClose,
+  onUpdate,
+  isAdmin,
+  isOwner,
+  onDeleteGroup,
+  onDisableAllMembers,
+  onEnableAllMembers,
+}) => {
+  const [name, setName] = useState(group.name || '');
+  const [desc, setDesc] = useState(group.description || '');
+  const [postingAllowed, setPostingAllowed] = useState(group.member_posting_allowed ?? true);
+  const [saving, setSaving] = useState(false);
+  const [disablingAll, setDisablingAll] = useState(false);
+  const [enablingAll, setEnablingAll] = useState(false);
+  const [statusMessage, setStatusMessage] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
+
+  const categoryInfo = GROUP_CATEGORIES.find(c => c.id === group.category) || GROUP_CATEGORIES[0];
+
+  const handleSave = async () => {
+    if (!name.trim()) return;
+    setSaving(true);
+    setStatusMessage(null);
+    try {
+      await onUpdate({
+        name: name.trim(),
+        description: desc.trim(),
+        member_posting_allowed: postingAllowed,
+      });
+      setStatusMessage({ text: 'Settings saved successfully!', type: 'success' });
+      setTimeout(() => {
+        onClose();
+      }, 600);
+    } catch (error: any) {
+      console.error('Failed to update group settings:', error);
+      setStatusMessage({ text: error?.message || 'Failed to save settings', type: 'error' });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDisableAllMembers = async () => {
+    if (!confirm('Are you sure you want to disable posting for all members in this group? Only group admins and owner will be able to post.')) {
+      return;
+    }
+    setDisablingAll(true);
+    setStatusMessage(null);
+    try {
+      if (onDisableAllMembers) {
+        await onDisableAllMembers();
+      } else {
+        await apiFetch('/api/group-members?action=disable-all-members', {
+          method: 'PATCH',
+          body: JSON.stringify({ group_id: group.id, actor_id: currentUser?.id }),
+        });
+      }
+      setPostingAllowed(false);
+      setStatusMessage({ text: 'Posting has been disabled for all non-admin members.', type: 'success' });
+    } catch (err: any) {
+      console.error('Failed to disable all members:', err);
+      setStatusMessage({ text: err?.message || 'Failed to disable members posting', type: 'error' });
+    } finally {
+      setDisablingAll(false);
+    }
+  };
+
+  const handleEnableAllMembers = async () => {
+    if (!confirm('Are you sure you want to enable posting for all members in this group?')) {
+      return;
+    }
+    setEnablingAll(true);
+    setStatusMessage(null);
+    try {
+      if (onEnableAllMembers) {
+        await onEnableAllMembers();
+      } else {
+        await apiFetch('/api/group-members?action=enable-all-members', {
+          method: 'PATCH',
+          body: JSON.stringify({ group_id: group.id, actor_id: currentUser?.id }),
+        });
+      }
+      setPostingAllowed(true);
+      setStatusMessage({ text: 'Posting has been re-enabled for all members.', type: 'success' });
+    } catch (err: any) {
+      console.error('Failed to enable all members:', err);
+      setStatusMessage({ text: err?.message || 'Failed to enable members posting', type: 'error' });
+    } finally {
+      setEnablingAll(false);
+    }
+  };
+
+  return (
+    <div className="w-full min-h-screen bg-[#050B18] text-[#F8FAFC] pb-16 animate-fade-in font-sans">
+      {/* Top Header */}
+      <div className="sticky top-0 z-40 bg-[#050B18]/95 backdrop-blur-md border-b border-[#1E293B] px-4 py-3.5">
+        <div className="max-w-3xl mx-auto flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <button
+              onClick={onClose}
+              className="w-10 h-10 rounded-full hover:bg-[#1E293B] flex items-center justify-center text-[#F8FAFC] transition-colors"
+              aria-label="Back to Group"
+            >
+              <i className="fas fa-arrow-left text-base"></i>
+            </button>
+            <div>
+              <h1 className="text-xl font-bold text-[#F8FAFC] flex items-center gap-2">
+                Group Settings
+              </h1>
+              <p className="text-xs text-[#94A3B8] truncate max-w-[200px] md:max-w-md">
+                {group.name}
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={handleSave}
+            disabled={saving || !name.trim()}
+            className="bg-[#1877f2] hover:bg-[#166fe5] text-white px-5 py-2 rounded-xl font-bold text-sm transition-all shadow-md active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+          >
+            {saving ? <i className="fas fa-spinner fa-spin"></i> : <i className="fas fa-check"></i>}
+            <span>{saving ? 'Saving...' : 'Save'}</span>
+          </button>
+        </div>
+      </div>
+
+      <div className="max-w-3xl mx-auto px-4 py-6 space-y-8">
+        {statusMessage && (
+          <div
+            className={`p-3.5 rounded-xl border flex items-center gap-3 text-sm font-semibold animate-slide-up ${
+              statusMessage.type === 'success'
+                ? 'bg-[#45BD62]/10 border-[#45BD62]/30 text-[#45BD62]'
+                : 'bg-[#F3425F]/10 border-[#F3425F]/30 text-[#F3425F]'
+            }`}
+          >
+            <i className={`fas ${statusMessage.type === 'success' ? 'fa-check-circle' : 'fa-exclamation-circle'} text-base`}></i>
+            <span>{statusMessage.text}</span>
+          </div>
+        )}
+
+        {/* Section 1: Community Profile (Flat layout, no container boxes) */}
+        <div className="border-b border-[#1E293B] pb-8 space-y-6">
+          <div>
+            <h2 className="text-lg font-bold text-[#F8FAFC]">Community Profile</h2>
+            <p className="text-xs text-[#94A3B8] mt-0.5">Basic group identity and public information</p>
+          </div>
+
+          <div className="space-y-5">
+            <div>
+              <label className="block text-[#CBD5E1] text-xs font-semibold uppercase tracking-wider mb-2">Group Name</label>
+              <input
+                type="text"
+                className="w-full bg-transparent border-b border-[#334155] focus:border-[#1877f2] px-0 py-2.5 text-[#F8FAFC] font-semibold text-lg outline-none transition-colors placeholder-[#64748B]"
+                value={name}
+                onChange={e => setName(e.target.value)}
+                placeholder="Enter community name"
+              />
+            </div>
+
+            <div>
+              <label className="block text-[#CBD5E1] text-xs font-semibold uppercase tracking-wider mb-2">Description</label>
+              <textarea
+                className="w-full bg-transparent border-b border-[#334155] focus:border-[#1877f2] px-0 py-2.5 text-[#F8FAFC] text-sm outline-none transition-colors h-28 resize-none leading-relaxed placeholder-[#64748B]"
+                value={desc}
+                onChange={e => setDesc(e.target.value)}
+                placeholder="What is this group about?"
+              />
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
+              <div className="py-2.5 flex items-center justify-between border-b border-[#1E293B]">
+                <div className="flex items-center gap-3">
+                  <div className="w-9 h-9 rounded-xl flex items-center justify-center shrink-0" style={{ backgroundColor: `${categoryInfo.color}20` }}>
+                    <i className={categoryInfo.icon} style={{ color: categoryInfo.color }}></i>
+                  </div>
+                  <div>
+                    <div className="text-xs text-[#94A3B8]">Category</div>
+                    <div className="text-sm font-semibold text-[#F8FAFC]">{categoryInfo.label}</div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="py-2.5 flex items-center justify-between border-b border-[#1E293B]">
+                <div className="flex items-center gap-3">
+                  <div className="w-9 h-9 rounded-xl bg-[#1E293B] text-[#94A3B8] flex items-center justify-center shrink-0">
+                    <i className={`fas ${group.type === 'public' ? 'fa-globe-americas' : 'fa-lock'}`}></i>
+                  </div>
+                  <div>
+                    <div className="text-xs text-[#94A3B8]">Privacy</div>
+                    <div className="text-sm font-semibold text-[#F8FAFC] capitalize">{group.type || 'public'} Group</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Section 2: Posting & Member Permissions (Flat layout, no container boxes) */}
+        <div className="border-b border-[#1E293B] pb-8 space-y-6">
+          <div>
+            <h2 className="text-lg font-bold text-[#F8FAFC]">Posting & Member Permissions</h2>
+            <p className="text-xs text-[#94A3B8] mt-0.5">Control who can create posts in this group</p>
+          </div>
+
+          <div className="space-y-6">
+            <div className="flex items-center justify-between py-3 border-b border-[#1E293B]">
+              <div className="pr-6">
+                <div className="text-[#F8FAFC] font-semibold text-base">Allow Member Posting</div>
+                <div className="text-[#94A3B8] text-xs mt-1 leading-relaxed">
+                  When enabled, all members can post. When disabled, only group admins and the owner can post. Members can still view, react, comment, and share.
+                </div>
+              </div>
+              <div
+                className={`w-14 h-8 rounded-full relative cursor-pointer transition-colors shrink-0 ${postingAllowed ? 'bg-[#1877f2]' : 'bg-[#334155]'}`}
+                onClick={() => setPostingAllowed(!postingAllowed)}
+              >
+                <div className={`absolute top-1 w-6 h-6 bg-white rounded-full transition-transform ${postingAllowed ? 'left-7' : 'left-1'}`}></div>
+              </div>
+            </div>
+
+            {/* Quick Bulk Member Controls - Flat list rows */}
+            <div className="pt-2">
+              <div className="text-sm font-semibold text-[#CBD5E1] mb-1">Bulk Member Controls</div>
+              <p className="text-xs text-[#94A3B8] mb-4">Quickly toggle posting permissions for all group members</p>
+              
+              <div className="space-y-3">
+                <div
+                  onClick={handleDisableAllMembers}
+                  className="flex items-center justify-between p-3.5 rounded-xl hover:bg-[#141E33] cursor-pointer transition-colors border border-transparent hover:border-[#1E293B]"
+                >
+                  <div className="flex items-center gap-3.5 pr-4">
+                    <div className="w-10 h-10 rounded-xl bg-[#F7B928]/15 text-[#F7B928] flex items-center justify-center shrink-0">
+                      {disablingAll ? <i className="fas fa-spinner fa-spin"></i> : <i className="fas fa-ban"></i>}
+                    </div>
+                    <div>
+                      <div className="font-semibold text-sm text-[#F8FAFC]">Disable Posting for All Members</div>
+                      <div className="text-xs text-[#94A3B8] mt-0.5">Only admins will be allowed to post. Members can still react and comment.</div>
+                    </div>
+                  </div>
+                  <i className="fas fa-chevron-right text-xs text-[#64748B]"></i>
+                </div>
+
+                <div
+                  onClick={handleEnableAllMembers}
+                  className="flex items-center justify-between p-3.5 rounded-xl hover:bg-[#141E33] cursor-pointer transition-colors border border-transparent hover:border-[#1E293B]"
+                >
+                  <div className="flex items-center gap-3.5 pr-4">
+                    <div className="w-10 h-10 rounded-xl bg-[#45BD62]/15 text-[#45BD62] flex items-center justify-center shrink-0">
+                      {enablingAll ? <i className="fas fa-spinner fa-spin"></i> : <i className="fas fa-check-double"></i>}
+                    </div>
+                    <div>
+                      <div className="font-semibold text-sm text-[#F8FAFC]">Enable Posting for All Members</div>
+                      <div className="text-xs text-[#94A3B8] mt-0.5">Restores standard posting access for all members in this community.</div>
+                    </div>
+                  </div>
+                  <i className="fas fa-chevron-right text-xs text-[#64748B]"></i>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Section 3: Danger Zone */}
+        {isAdmin && (
+          <div className="pb-8 space-y-4">
+            <div>
+              <h2 className="text-lg font-bold text-red-500">Danger Zone</h2>
+              <p className="text-xs text-[#94A3B8] mt-0.5">Permanent actions that cannot be undone</p>
+            </div>
+            <p className="text-xs text-[#94A3B8]">
+              Deleting this community will remove all posts, comments, events, and member records permanently.
+            </p>
+            <button
+              onClick={() => {
+                if (confirm('Are you absolutely sure you want to delete this community? This action is permanent and cannot be undone.')) {
+                  onDeleteGroup();
+                }
+              }}
+              className="bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white font-bold py-2.5 px-5 rounded-xl transition-all border border-red-500/30 text-sm flex items-center gap-2"
+            >
+              <i className="fas fa-trash text-xs"></i>
+              <span>Delete Community</span>
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+const GroupSettingsModal: React.FC<any> = (props) => <GroupSettingsPage {...props} />;
+
+const GroupEventCard: React.FC<{
+  event: Event;
+  group: Group;
+  currentUser: User | null;
+  onRSVP?: (eventId: number, status: string) => Promise<any>;
+  onProfileClick: (id: number) => void;
+}> = ({ event, group, currentUser, onRSVP, onProfileClick }) => {
+  const [rsvpStatus, setRsvpStatus] = useState<string>(event.user_rsvp_status || '');
+  const [loading, setLoading] = useState(false);
+  const eventDate = new Date(event.start_time || event.date || event.event_date || '');
+  const formattedDate = !Number.isNaN(eventDate.getTime())
+    ? eventDate.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+    : 'Upcoming Event';
+
+  const coverUrl = event.cover_url || event.cover_image || (event as any).image;
+
+  const handleRSVP = async (status: string) => {
+    if (!currentUser || !onRSVP) return;
+    setLoading(true);
+    try { 
+      await onRSVP(event.id, status); 
+      setRsvpStatus(status === 'not_going' ? '' : status); 
+    } catch (error) { 
+      console.error('Failed to RSVP:', error); 
+    } finally { 
+      setLoading(false); 
+    }
+  };
+
+  return (
+    <div className="bg-[#0F172A] rounded-2xl border border-[#1E293B] overflow-hidden hover:shadow-lg transition-all">
+      {coverUrl && (
+        <div className="h-44 overflow-hidden relative">
+          <img 
+            src={coverUrl} 
+            alt={event.title} 
+            loading="lazy" 
+            className="w-full h-full object-cover transition-transform duration-300 hover:scale-105" 
+          />
+        </div>
+      )}
+      <div className="p-5">
+        <h4 className="text-[#F8FAFC] font-bold text-lg mb-2">{event.title}</h4>
+        {event.description && (
+          <p className="text-[#94A3B8] text-sm mb-3.5 line-clamp-2 leading-relaxed">{event.description}</p>
+        )}
+        <div className="space-y-2 mb-4">
+          <div className="flex items-center gap-2 text-[#94A3B8] text-sm">
+            <i className="fas fa-calendar text-[#1877f2] w-5"></i>
+            <span>{formattedDate}</span>
+          </div>
+          {event.location && (
+            <div className="flex items-center gap-2 text-[#94A3B8] text-sm">
+              <i className="fas fa-map-marker-alt text-[#1877f2] w-5"></i>
+              <span className="truncate">{event.location}</span>
+            </div>
+          )}
+          <div className="flex items-center gap-2 text-[#94A3B8] text-sm">
+            <i className="fas fa-users text-[#1877f2] w-5"></i>
+            <span>{event.attendees?.length || (event as any).attending_count || 0} attending</span>
+          </div>
+        </div>
+        {currentUser && onRSVP && (
+          <div className="flex gap-2 pt-1">
+            {rsvpStatus === 'going' ? (
+              <button 
+                onClick={() => handleRSVP('not_going')} 
+                disabled={loading} 
+                className="flex-1 bg-[#10B981] text-white px-3 py-2.5 rounded-xl font-bold text-sm hover:bg-[#059669] transition-colors disabled:opacity-50 flex items-center justify-center gap-1.5 shadow-sm"
+              >
+                <i className="fas fa-check text-xs"></i>
+                <span>Going (Attending)</span>
+              </button>
+            ) : rsvpStatus === 'interested' ? (
+              <>
+                <button 
+                  onClick={() => handleRSVP('going')} 
+                  disabled={loading} 
+                  className="flex-1 bg-[#1877f2] text-white px-3 py-2.5 rounded-xl font-bold text-sm hover:bg-[#166fe5] transition-colors disabled:opacity-50"
+                >
+                  Going
+                </button>
+                <button 
+                  onClick={() => handleRSVP('not_going')} 
+                  disabled={loading} 
+                  className="flex-1 bg-[#F7B928]/20 text-[#F7B928] border border-[#F7B928]/40 px-3 py-2.5 rounded-xl font-bold text-sm hover:bg-[#F7B928]/30 transition-colors disabled:opacity-50 flex items-center justify-center gap-1.5"
+                >
+                  <i className="fas fa-star text-xs"></i>
+                  <span>Interested</span>
+                </button>
+              </>
+            ) : (
+              <>
+                <button 
+                  onClick={() => handleRSVP('going')} 
+                  disabled={loading} 
+                  className="flex-1 bg-[#1877f2] text-white px-3 py-2.5 rounded-xl font-bold text-sm hover:bg-[#166fe5] transition-colors disabled:opacity-50 active:scale-95"
+                >
+                  Going
+                </button>
+                <button 
+                  onClick={() => handleRSVP('interested')} 
+                  disabled={loading} 
+                  className="flex-1 bg-[#1E293B] text-[#F8FAFC] border border-[#334155] px-3 py-2.5 rounded-xl font-bold text-sm hover:bg-[#334155] transition-colors disabled:opacity-50 active:scale-95"
+                >
+                  Interested
+                </button>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+const PostActionsMenu: React.FC<{
+  post: PostType;
+  currentUser: User | null;
+  isGroupAdmin: boolean;
+  isPostAuthor: boolean;
+  onEdit?: (postId: number, content: string) => Promise<any>;
+  onDelete?: (postId: number) => Promise<any>;
+  onReport?: (postId: number) => Promise<any>;
+  onClose: () => void;
+}> = ({ post, currentUser, isGroupAdmin, isPostAuthor, onEdit, onDelete, onReport, onClose }) => {
+  const [isEditing, setIsEditing] = useState(false);
+  const [editText, setEditText] = useState(post.content || '');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+  
+
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => { if (menuRef.current && !menuRef.current.contains(e.target as Node)) onClose(); };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [onClose]);
+
+  const handleEdit = async () => {
+    if (!onEdit || !editText.trim()) return;
+    setIsSubmitting(true);
+    try { await onEdit(post.id, editText.trim()); setIsEditing(false); onClose(); } catch (error) { console.error('Failed to edit post:', error); } finally { setIsSubmitting(false); }
+  };
+
+  const handleDelete = async () => {
+    if (!onDelete) return;
+    if (window.confirm('Are you sure you want to delete this post?')) { try { await onDelete(post.id); onClose(); } catch (error) { console.error('Failed to delete post:', error); } }
+  };
+
+  const handleReport = async () => {
+    if (!onReport) return;
+    try { await onReport(post.id); alert('Post reported to group admins'); onClose(); } catch (error) { console.error('Failed to report post:', error); }
+  };
+
+  if (isEditing) {
+    return (
+      <div className="absolute right-0 top-8 z-50 w-80 bg-[#0F172A] rounded-xl shadow-2xl border border-[#1E293B] p-4" ref={menuRef}>
+        <h4 className="text-[#F8FAFC] font-bold mb-3">Edit Post</h4>
+        <textarea className="w-full bg-[#1E293B] border border-[#1E293B] rounded-lg p-3 text-[#F8FAFC] resize-none h-24 outline-none" value={editText} onChange={(e) => setEditText(e.target.value)} />
+        <div className="flex justify-end gap-2 mt-3"><button onClick={() => setIsEditing(false)} className="px-4 py-2 text-[#94A3B8] hover:bg-[#141E33] rounded-lg transition-colors">Cancel</button><button onClick={handleEdit} disabled={isSubmitting || !editText.trim()} className="px-4 py-2 bg-[#1877f2] text-white rounded-lg hover:bg-[#166fe5] transition-colors disabled:opacity-50">{isSubmitting ? 'Saving...' : 'Save'}</button></div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="absolute right-0 top-8 z-50 w-56 bg-[#0F172A] rounded-xl shadow-2xl border border-[#1E293B] overflow-hidden" ref={menuRef}>
+      <div className="py-1">
+        {(isPostAuthor || isGroupAdmin) && (<>{onEdit && (<button onClick={() => setIsEditing(true)} className="w-full px-4 py-3 text-left hover:bg-[#141E33] flex items-center gap-3 text-[#F8FAFC] transition-colors"><i className="fas fa-edit w-5 text-[#94A3B8]"></i><span>Edit Post</span></button>)}{onDelete && (<button onClick={handleDelete} className="w-full px-4 py-3 text-left hover:bg-[#141E33] flex items-center gap-3 text-[#f3425f] transition-colors"><i className="fas fa-trash w-5 text-[#f3425f]"></i><span>Delete Post</span></button>)}<div className="border-t border-[#1E293B] my-1"></div></>)}
+        {!isPostAuthor && onReport && (<button onClick={handleReport} className="w-full px-4 py-3 text-left hover:bg-[#141E33] flex items-center gap-3 text-[#F8FAFC] transition-colors"><i className="fas fa-flag w-5 text-[#94A3B8]"></i><span>Report Post</span></button>)}
+        <button onClick={onClose} className="w-full px-4 py-3 text-left hover:bg-[#141E33] flex items-center gap-3 text-[#94A3B8] transition-colors"><i className="fas fa-times w-5"></i><span>Close</span></button>
+      </div>
+    </div>
+  );
+};
+
+interface GroupCommentPreviewProps {
+  post: any;
+  groupId?: number | string;
+  currentUser: User | null;
+  users: User[];
+  onProfileClick: (userId: number) => void;
+  onOpenComments: () => void;
+}
+
+const GroupCommentPreview: React.FC<GroupCommentPreviewProps> = ({
+  post,
+  groupId,
+  currentUser,
+  users,
+  onProfileClick,
+  onOpenComments,
+}) => {
+  const postId = Number(post?.id ?? post?.post_id ?? 0);
+  const effectiveGroupId = post?.group_id || groupId;
+
+  const [previewComment, setPreviewComment] = useState<any>(() => {
+    if (Array.isArray(post?.comments) && post.comments.length > 0) {
+      return post.comments[0];
+    }
+    const cached = getCachedComments('group_post', postId);
+    if (cached && Array.isArray(cached.data) && cached.data.length > 0) {
+      return cached.data[0];
+    }
+    return null;
+  });
+
+  const commentCount = typeof post?.comment_count === 'number'
+    ? post.comment_count
+    : typeof post?.comments_count === 'number'
+    ? post.comments_count
+    : Array.isArray(post?.comments)
+    ? post.comments.length
+    : 0;
+
+  useEffect(() => {
+    let isMounted = true;
+    if (commentCount > 0 && !previewComment) {
+      const cached = getCachedComments('group_post', postId);
+      if (cached && Array.isArray(cached.data) && cached.data.length > 0) {
+        setPreviewComment(cached.data[0]);
+        return;
+      }
+
+      const viewerId = currentUser?.id || 0;
+      const endpoint = `/api/group-post-comments?post_id=${postId}&viewerId=${viewerId}`;
+
+      apiFetch(endpoint)
+        .then((data: any) => {
+          if (!isMounted) return;
+          const arr = Array.isArray(data) ? data : data?.comments || [];
+          if (arr.length > 0) {
+            setPreviewComment(arr[0]);
+            setCachedComments('group_post', postId, arr);
+          }
+        })
+        .catch(() => {});
+    }
+    return () => {
+      isMounted = false;
+    };
+  }, [commentCount, previewComment, effectiveGroupId, postId, currentUser]);
+
+  const handleLikePreviewComment = async (c: any) => {
+    if (!currentUser) {
+      alert('Please login to react to comments.');
+      return;
+    }
+    const optimisticLiked = !c.liked_by_me;
+    const optimisticCount = c.liked_by_me
+      ? Math.max(0, (c.likes_count || 0) - 1)
+      : (c.likes_count || 0) + 1;
+
+    setPreviewComment((prev: any) =>
+      prev && prev.id === c.id
+        ? { ...prev, liked_by_me: optimisticLiked, likes_count: optimisticCount }
+        : prev
+    );
+
+    updateCachedComment('group_post', postId, c.id, (old: any) => ({
+      ...old,
+      liked_by_me: optimisticLiked,
+      likes_count: optimisticCount,
+    }));
+
+    try {
+      const endpoint = `/api/group-post-comment-likes`;
+      await apiFetch(endpoint, {
+        method: 'POST',
+        body: JSON.stringify({
+          comment_id: c.id,
+          user_id: currentUser.id,
+        }),
+      });
+    } catch {
+      setPreviewComment((prev: any) =>
+        prev && prev.id === c.id
+          ? { ...prev, liked_by_me: !optimisticLiked, likes_count: c.likes_count || 0 }
+          : prev
+      );
+      updateCachedComment('group_post', postId, c.id, (old: any) => ({
+        ...old,
+        liked_by_me: !optimisticLiked,
+        likes_count: c.likes_count || 0,
+      }));
+    }
+  };
+
+  const previewAuthor = useMemo(() => {
+    if (!previewComment) return null;
+    const uid = Number(previewComment.user_id ?? previewComment.userId ?? previewComment.author_id ?? 0);
+    const authorUser = users.find((x: any) => Number(x?.id) === uid);
+    const authorObj = previewComment.user || previewComment.author || authorUser;
+    const authorName = previewComment.name || previewComment.username || authorObj?.name || authorObj?.username || 'User';
+    const authorImage = previewComment.profile_image_url || previewComment.profileImage || authorObj?.profile_image_url || authorObj?.profileImage || avatarFrom(authorObj || { name: authorName });
+    const isVerified = Boolean(previewComment.is_verified || authorObj?.is_verified);
+    return {
+      uid,
+      name: authorName,
+      image: authorImage,
+      isVerified,
+    };
+  }, [previewComment, users]);
+
+  const formatCount = (count: number): string => {
+    if (count >= 1000000) return `${(count / 1000000).toFixed(1)}M`;
+    if (count >= 1000) return `${(count / 1000).toFixed(1)}k`;
+    return count.toString();
+  };
+
+  if (!previewComment || !previewAuthor) return null;
+
+  return (
+    <div className="px-3.5 pb-3 pt-1 border-t border-[#1E293B]/40">
+      <div className="flex items-start gap-2.5">
+        <img
+          src={previewAuthor.image}
+          alt=""
+          className="w-9 h-9 rounded-full object-cover shrink-0 mt-0.5 cursor-pointer hover:opacity-90 transition-opacity"
+          onClick={() => previewAuthor.uid && onProfileClick(previewAuthor.uid)}
+        />
+        <div className="flex-1 min-w-0">
+          <div
+            className="inline-block max-w-full bg-[#162137]/65 hover:bg-[#1E293B]/70 rounded-[18px] px-3.5 py-2 border border-[#1E293B]/60 transition-colors cursor-pointer"
+            onClick={onOpenComments}
+          >
+            <div
+              className="text-[#F8FAFC] font-bold text-[21px] leading-tight cursor-pointer hover:underline inline-flex items-center gap-1.5"
+              onClick={(e) => {
+                e.stopPropagation();
+                if (previewAuthor.uid) onProfileClick(previewAuthor.uid);
+              }}
+            >
+              <span className="truncate">{previewAuthor.name}</span>
+              {previewAuthor.isVerified && (
+                <VerifiedBadge size={21} className="shrink-0" />
+              )}
+            </div>
+            <div className="text-[#CBD5E1] text-[20.5px] leading-[1.38] font-normal whitespace-pre-wrap break-words mt-0.5">
+              {previewComment.text || previewComment.content}
+            </div>
+            {previewComment.image_url && (
+              <div className="mt-1.5 rounded-lg overflow-hidden max-w-[200px]">
+                <img
+                  src={previewComment.image_url}
+                  alt=""
+                  className="object-cover rounded-lg max-h-[140px]"
+                />
+              </div>
+            )}
+          </div>
+          <div className="mt-1 ml-3 flex items-center gap-3 text-[12px]">
+            <span className="text-[#B0B3B8] font-normal">
+              {formatRelativeTime(previewComment.created_at || previewComment.createdAt || previewComment.timestamp)}
+            </span>
+            <button
+              type="button"
+              onClick={() => handleLikePreviewComment(previewComment)}
+              className={`font-bold hover:underline transition-colors inline-flex items-center gap-1 ${
+                previewComment.liked_by_me
+                  ? 'text-[#F43F5E]'
+                  : 'text-[#B0B3B8] hover:text-[#E4E6EB]'
+              }`}
+            >
+              <span className="text-[13px]">{previewComment.liked_by_me ? '❤️' : '🤍'}</span>
+              <span>{previewComment.liked_by_me ? 'Liked' : 'Like'}</span>
+            </button>
+            <button
+              type="button"
+              onClick={onOpenComments}
+              className="font-bold text-[#B0B3B8] hover:text-[#E4E6EB] hover:underline transition-colors"
+            >
+              Reply
+            </button>
+            {previewComment.likes_count > 0 && (
+              <span className="inline-flex items-center gap-1 bg-[#F43F5E]/15 text-[#F43F5E] px-1.5 py-0.5 rounded-full text-[11px] font-bold">
+                <span className="text-[10px]">❤️</span>
+                <span>{formatCount(previewComment.likes_count)}</span>
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const RecruitmentPost: React.FC<any> = (props) => {
+  const { post, author, currentUser, onApply, onProfileClick, users, onComment, onCommentAdded } = props;
+  const [applied, setApplied] = useState(false);
+  const [showFullDescription, setShowFullDescription] = useState(false);
+  const [showActionsMenu, setShowActionsMenu] = useState(false);
+  const [localReactionCount, setLocalReactionCount] = useState(0);
+  const [localMyReaction, setLocalMyReaction] = useState<ReactionType | undefined>();
+  const [commentCount, setCommentCount] = useState(() => {
+    if (typeof post.comment_count === 'number') return post.comment_count;
+    if (typeof (post as any).comments_count === 'number') return (post as any).comments_count;
+    if (Array.isArray(post.comments)) return post.comments.length;
+    return 0;
+  });
+  const [shareCount, setShareCount] = useState(0);
+  const [showShareSheet, setShowShareSheet] = useState(false);
+  const [showReactionsSheet, setShowReactionsSheet] = useState(false);
+  const [galleryOpen, setGalleryOpen] = useState(false);
+  const [galleryUrls, setGalleryUrls] = useState<string[]>([]);
+  const [galleryIndex, setGalleryIndex] = useState(0);
+
+  const jobTitle = (post as any).job_title || 'Position';
+  const company = (post as any).company || '';
+  const location = (post as any).location || '';
+  const salary = (post as any).salary || '';
+  const jobType = (post as any).job_type || 'Full-time';
+  const street = (post as any).street || '';
+  const district = (post as any).district || '';
+  const region = (post as any).region || '';
+  const country = (post as any).country || '';
+  const fullAddress = location || [street, district, region, country].filter(Boolean).join(', ');
+  const applicationType = (post as any).application_type || null;
+  const applicationValue = (post as any).application_value || '';
+  const hasApplicationMethod = Boolean(
+    applicationValue &&
+    String(applicationValue).trim().length > 0 &&
+    (applicationType === 'email' || applicationType === 'link' || String(applicationValue).includes('@') || String(applicationValue).startsWith('http'))
+  );
+  const expiryDate = (post as any).expiry_date ? new Date((post as any).expiry_date) : null;
+  const now = new Date();
+  const isExpired = expiryDate ? expiryDate < now : false;
+
+  const mediaList = useMemo(() => getPostMediaList(post), [post]);
+  const imageMedia = mediaList.filter(m => m.kind === 'image');
+  const videoMedia = mediaList.filter(m => m.kind === 'video');
+
+  useEffect(() => {
+    setLocalMyReaction((post as any).myReaction ?? (post as any).my_reaction ?? null);
+    const likesCount = Number((post as any).likesCount ?? (post as any).reactionsCount ?? (post as any).reactions_count ?? 0);
+    const reactionsArr = Array.isArray(post.reactions) ? post.reactions : null;
+    setLocalReactionCount(likesCount > 0 ? likesCount : reactionsArr ? reactionsArr.length : 0);
+    const newCommentCount = typeof post.comment_count === 'number' ? post.comment_count : typeof (post as any).comments_count === 'number' ? (post as any).comments_count : Array.isArray(post.comments) ? post.comments.length : 0;
+    if (newCommentCount !== commentCount) setCommentCount(newCommentCount);
+    setShareCount(Number(post.shares ?? post.shares_count ?? 0));
+  }, [post.id, post]);
+
+  const handleApply = async () => {
+    if (!currentUser) { alert('Please login to apply'); return; }
+    if (isExpired) { alert('This job posting has expired'); return; }
+    if (applicationType === 'email' && applicationValue) { window.location.href = `mailto:${applicationValue}?subject=Application for ${jobTitle} at ${company}`; }
+    else if (applicationType === 'link' && applicationValue) { window.open(applicationValue, '_blank', 'noopener,noreferrer'); }
+    if (onApply) { try { await onApply(post.id); setApplied(true); } catch (error) { console.error('Failed to apply:', error); } }
+  };
+
+  const isPostAuthor = currentUser?.id === author.id;
+  const canModerate = Boolean(isPostAuthor || props.isGroupAdmin || props.isPlatformAdmin);
+
+  const handleLikeClick = async (type: ReactionType) => {
+    if (!currentUser) return;
+    const previousMyReaction = localMyReaction;
+    const previousReactionCount = localReactionCount;
+    let newMyReaction: ReactionType | null = type;
+    let newReactionCount = previousReactionCount;
+    if (!previousMyReaction) newReactionCount = previousReactionCount + 1;
+    else if (previousMyReaction === type) { newMyReaction = null; newReactionCount = previousReactionCount - 1; }
+    else newMyReaction = type;
+    setLocalMyReaction(newMyReaction || undefined);
+    setLocalReactionCount(newReactionCount);
+    try { await props.onLikePost(post.id, type); } catch (error) { console.error('Failed to like post:', error); setLocalMyReaction(previousMyReaction); setLocalReactionCount(previousReactionCount); }
+  };
+
+  const handleShareComplete = (destination: string, data?: any) => {
+    const nextShares = Number(data?.shares ?? data?.share_count ?? shareCount + 1);
+    if (data?.success) { setShareCount(nextShares); props.onSharePost(post.id, nextShares); }
+    setShowShareSheet(false);
+  };
+
+  const handleCommentAdded = () => { setCommentCount(prev => prev + 1); if (onCommentAdded) onCommentAdded(); };
+  const openGallery = (urls: string[], index: number) => { setGalleryUrls(urls); setGalleryIndex(index); setGalleryOpen(true); };
+  const reactionsArr = Array.isArray(post.reactions) ? post.reactions : null;
+  const emojiList = useMemo(() => {
+    if (Array.isArray(reactionsArr) && reactionsArr.length > 0) { const em = topReactionEmojis(reactionsArr, 2); return em.length ? em : ['👍']; }
+    return localReactionCount > 0 ? ['👍'] : [];
+  }, [reactionsArr, localReactionCount]);
+  const formatCount = (count: number): string => { if (count >= 1000000) return `${(count / 1000000).toFixed(1)}M`; else if (count >= 1000) return `${(count / 1000).toFixed(1)}k`; return count.toString(); };
+  const createdAtLabel = formatRelativeTime(post.created_at || post.createdAt || '');
+  const formatExpiryDate = (date: Date) => date.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+  const handleOpenComments = () => props.onOpenComments(post.id);
+
+  return (
+    <>
+      <div className="bg-[#0F172A] rounded-xl shadow-sm mb-4 animate-fade-in border border-[#1E293B] overflow-hidden">
+        <div className="p-3 md:p-4 flex items-center justify-between">
+          <div className="flex items-center gap-2 flex-1 min-w-0 cursor-pointer" onClick={() => onProfileClick(author.id)}>
+            <img src={avatarFrom(author)} alt="" className="w-10 h-10 rounded-full object-cover border border-[#1E293B]" />
+            <div className="min-w-0">
+              {Boolean((post as any).shared_post_id || (post as any).shared_from || (post as any).original_owner_name) ? (
+                (post as any).shared_from === 'group' || (post as any).original_group_name || (post as any).shared_group_name ? (
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <h4 className="font-bold text-[#F8FAFC] text-[20px] sm:text-[21px] hover:underline truncate">{(post as any).shared_user_name || author.name || 'User'}</h4>
+                    {Boolean(author.is_verified) && <VerifiedBadge size={20} className="shrink-0" />}
+                    <span className="text-[#94A3B8] font-normal text-[15px] sm:text-[16px]">shared a post from</span>
+                    <span className="font-bold text-[#38BDF8] text-[20px] sm:text-[21px] truncate">{(post as any).original_group_name || (post as any).shared_group_name || (post as any).original_owner_name || 'Group'}</span>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <h4 className="font-bold text-[#F8FAFC] text-[20px] sm:text-[21px] hover:underline truncate">{(post as any).shared_user_name || author.name || 'User'}</h4>
+                    {Boolean(author.is_verified) && <VerifiedBadge size={20} className="shrink-0" />}
+                    <span className="text-[#94A3B8] font-normal text-[15px] sm:text-[16px]">shared</span>
+                    <span className="font-bold text-[#38BDF8] text-[20px] sm:text-[21px] hover:underline truncate cursor-pointer" onClick={(e) => { e.stopPropagation(); if ((post as any).original_owner_id) onProfileClick((post as any).original_owner_id); }}>
+                      {(post as any).original_owner_name || 'User'}'s post
+                    </span>
+                  </div>
+                )
+              ) : (
+                <div className="flex items-center gap-1.5 flex-wrap"><h4 className="font-bold text-[#F8FAFC] text-[21px] hover:underline truncate">{author.name || 'User'}</h4>{Boolean(author.is_verified) && (<VerifiedBadge size={21} className="shrink-0" />)}</div>
+              )}
+              <div className="flex items-center gap-1.5 text-[#94A3B8] text-[13px]"><span>{createdAtLabel}</span><span>•</span><i className="fas fa-briefcase text-[12px]"></i><span>Recruitment</span></div>
+            </div>
+          </div>
+          {(canModerate || props.onReportPost) && (
+            <div className="relative">
+              <button className="w-9 h-9 hover:bg-[#1E293B] rounded-full flex items-center justify-center transition-colors" onClick={(e) => { e.stopPropagation(); setShowActionsMenu(!showActionsMenu); }} aria-label="Post actions"><i className="fas fa-ellipsis-h text-[#94A3B8] text-xl"></i></button>
+              {showActionsMenu && (<PostActionsMenu post={post} currentUser={currentUser} isGroupAdmin={canModerate} isPostAuthor={isPostAuthor} onEdit={props.onEditPost} onDelete={props.onDeletePost} onReport={props.onReportPost} onClose={() => setShowActionsMenu(false)} />)}
+            </div>
+          )}
+        </div>
+        <div className="px-3 md:px-4 pb-2 flex flex-wrap items-center gap-2">
+          <div className="inline-flex items-center gap-1 px-3 py-1 bg-[#45BD62]/10 rounded-full border border-[#45BD62]/20"><i className="fas fa-briefcase text-[#45BD62] text-xs"></i><span className="text-[#45BD62] text-xs font-bold">JOB POSTING</span></div>
+          {isExpired && (<div className="inline-flex items-center gap-1 px-3 py-1 bg-[#F3425F]/10 rounded-full border border-[#F3425F]/20"><i className="fas fa-clock text-[#F3425F] text-xs"></i><span className="text-[#F3425F] text-xs font-bold">EXPIRED</span></div>)}
+          {expiryDate && !isExpired && (<div className="inline-flex items-center gap-1 px-3 py-1 bg-[#F7B928]/10 rounded-full border border-[#F7B928]/20"><i className="fas fa-calendar-alt text-[#F7B928] text-xs"></i><span className="text-[#F7B928] text-xs">Expires {formatExpiryDate(expiryDate)}</span></div>)}
+        </div>
+        <div className="px-3 md:px-4 pb-3">
+          <div className="bg-[#1E293B] rounded-lg p-5">
+            <h2 className="text-[#F8FAFC] font-bold text-2xl mb-3">{jobTitle}</h2>
+            {company && (<div className="flex items-center gap-2 text-[#94A3B8] mb-3"><i className="fas fa-building text-sm w-5 text-[#45BD62]"></i><span className="text-base font-medium">{company}</span></div>)}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
+              {fullAddress && (<div className="flex items-center gap-2 text-[#94A3B8]"><i className="fas fa-map-marker-alt text-sm w-5 text-[#45BD62]"></i><span className="text-sm">{fullAddress}</span></div>)}
+              {jobType && (<div className="flex items-center gap-2 text-[#94A3B8]"><i className="fas fa-clock text-sm w-5 text-[#F7B928]"></i><span className="text-sm">{jobType}</span></div>)}
+              {salary && (<div className="flex items-center gap-2 text-[#94A3B8] col-span-2"><i className="fas fa-dollar-sign text-sm w-5 text-[#45BD62]"></i><span className="text-sm font-medium text-[#45BD62]">{salary}</span></div>)}
+            </div>
+
+            {/* Apply Button on top after Job Type and Salary before description - only shown if email or link attached */}
+            {hasApplicationMethod && (
+              <div className="mb-4">
+                {!isExpired ? (
+                  <button
+                    onClick={handleApply}
+                    disabled={applied}
+                    className="w-full bg-[#1B74E4] text-white py-3 rounded-xl font-bold text-lg hover:bg-[#1A6ED8] transition-colors disabled:opacity-50 disabled:cursor-not-allowed shadow-md flex items-center justify-center gap-2 cursor-pointer active:scale-[0.99]"
+                  >
+                    {applied ? (
+                      <>
+                        <i className="fas fa-check"></i>
+                        <span>Applied</span>
+                      </>
+                    ) : (
+                      <>
+                        <i className="fas fa-paper-plane text-base"></i>
+                        <span>Apply Now</span>
+                      </>
+                    )}
+                  </button>
+                ) : (
+                  <div className="w-full bg-[#F3425F]/10 text-[#F3425F] py-3 rounded-xl font-bold text-center border border-[#F3425F]/20 flex items-center justify-center gap-2">
+                    <i className="fas fa-clock"></i>
+                    <span>This job posting has expired</span>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {post.content && (
+              <div className="mb-4">
+                <div className="text-[#F8FAFC] whitespace-pre-wrap" style={{ fontSize: '20px' }}>
+                  {showFullDescription ? post.content : post.content.slice(0, 300)}
+                  {post.content.length > 300 && (
+                    <button
+                      onClick={() => setShowFullDescription(!showFullDescription)}
+                      className="ml-2 text-[#1877F2] hover:text-[#38BDF8] font-bold text-[19px] hover:underline transition-colors inline-flex items-center cursor-pointer"
+                      style={{ fontSize: '19px' }}
+                    >
+                      {showFullDescription ? 'See Less' : 'See More'}
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+            {imageMedia.length > 0 && (<div className="mb-4"><MediaGrid media={imageMedia} onOpen={(url, index) => { const urls = imageMedia.map(m => m.full || m.feed || m.url); openGallery(urls, index); }} /></div>)}
+            {videoMedia.length > 0 && (<div className="mb-4"><video src={videoMedia[0].url} className="w-full rounded-lg" controls playsInline /></div>)}
+          </div>
+        </div>
+        {(localReactionCount > 0 || commentCount > 0) && (
+          <div className="px-3 md:px-4 py-2.5 flex items-center justify-between text-[#94A3B8] text-[15px] border-t border-[#1E293B]">
+            <div className="flex items-center gap-2 min-h-[24px]">
+              {localReactionCount > 0 && (
+                <div onClick={(e) => { e.stopPropagation(); setShowReactionsSheet(true); }} className="flex items-center gap-2 cursor-pointer hover:opacity-80 transition-opacity">
+                  <div className="flex -space-x-2">{emojiList.slice(0, 2).map((e, i) => (<span key={i} className="w-[24px] h-[24px] rounded-full bg-[#1E293B] border border-[#0B1120] flex items-center justify-center text-[16px]" style={{ zIndex: 10 - i }}>{e}</span>))}</div>
+                  <span className="text-[#F8FAFC] font-bold text-[15px] md:text-[16px]">{localReactionCount === 1 ? '1 Reaction' : `${formatCount(localReactionCount)} Reactions`}</span>
+                </div>
+              )}
+            </div>
+            <div className="flex items-center gap-4">
+              <span className="hover:underline cursor-pointer text-[#CBD5E1] hover:text-[#F8FAFC] text-[15px] md:text-[16px] font-semibold transition-colors" onClick={handleOpenComments}>{formatCount(commentCount)} {commentCount === 1 ? 'Discussion' : 'Discussions'}</span>
+              {shareCount > 0 && (<span className="hover:underline cursor-pointer text-[15px] md:text-[16px] text-[#94A3B8] hover:text-[#CBD5E1] transition-colors" onClick={() => setShowShareSheet(true)}>{formatCount(shareCount)} {shareCount === 1 ? 'Share' : 'Shares'}</span>)}
+            </div>
+          </div>
+        )}
+        <div className="px-3.5 py-2.5 border-t border-[#1E293B] flex items-center justify-between">
+          <div className="flex items-center gap-4">
+            <ReactionButton currentUserReactions={localMyReaction} reactionCount={localReactionCount} onReact={handleLikeClick} isGuest={!currentUser} />
+            <button className="flex items-center gap-1.5 text-[#F8FAFC] hover:text-[#38BDF8] transition-colors focus:outline-none p-1 rounded-lg hover:bg-[#1E293B]/60" onClick={() => currentUser ? handleOpenComments() : alert('Login first')} aria-label="Discuss & Comments" title="Discuss">
+              <i className="far fa-comment text-[22px]"></i>
+              {commentCount > 0 && <span className="text-[14px] font-semibold text-[#F8FAFC]">{formatCount(commentCount)}</span>}
+            </button>
+            <button className="flex items-center gap-1.5 text-[#F8FAFC] hover:text-[#38BDF8] transition-transform active:scale-110 focus:outline-none p-1 rounded-lg hover:bg-[#1E293B]/60" onClick={() => { if (!currentUser) { alert('Please login to share posts.'); return; } setShowShareSheet(true); }} aria-label="Share post" title="Share">
+              <i className="far fa-paper-plane text-[21px]"></i>
+              {shareCount > 0 && <span className="text-[14px] font-semibold text-[#F8FAFC]">{formatCount(shareCount)}</span>}
+            </button>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <SavePostButton post={post} />
+          </div>
+        </div>
+        <GroupCommentPreview post={post} groupId={post.group_id || props.group?.id} currentUser={currentUser} users={users} onProfileClick={onProfileClick} onOpenComments={handleOpenComments} />
+      </div>
+      <ShareBottomSheet isOpen={showShareSheet} onClose={() => setShowShareSheet(false)} post={post} currentUser={currentUser} users={users} groups={props.groups || []} onShareComplete={handleShareComplete} />
+      <GalleryViewer isOpen={galleryOpen} urls={galleryUrls} startIndex={galleryIndex} onClose={() => setGalleryOpen(false)} postId={post.id} currentUser={currentUser} reactionCount={localReactionCount} commentCount={commentCount} shareCount={shareCount} myReaction={localMyReaction} onReact={handleLikeClick} onOpenComments={handleOpenComments} onShare={() => setShowShareSheet(true)} onOpenReactions={() => setShowReactionsSheet(true)} />
+    </>
+  );
+};
+
+const BuySellPost: React.FC<any> = (props) => {
+  const { post, author, currentUser, onProfileClick, users, onComment, onCommentAdded } = props;
+  const [showActionsMenu, setShowActionsMenu] = useState(false);
+  const [localReactionCount, setLocalReactionCount] = useState(0);
+  const [localMyReaction, setLocalMyReaction] = useState<ReactionType | undefined>();
+  const [commentCount, setCommentCount] = useState(() => {
+    if (typeof post.comment_count === 'number') return post.comment_count;
+    if (typeof (post as any).comments_count === 'number') return (post as any).comments_count;
+    if (Array.isArray(post.comments)) return post.comments.length;
+    return 0;
+  });
+  const [shareCount, setShareCount] = useState(0);
+  const [showShareSheet, setShowShareSheet] = useState(false);
+  const [showReactionsSheet, setShowReactionsSheet] = useState(false);
+  const [galleryOpen, setGalleryOpen] = useState(false);
+  const [galleryUrls, setGalleryUrls] = useState<string[]>([]);
+  const [galleryIndex, setGalleryIndex] = useState(0);
+
+  const price = (post as any).price || '0';
+  const currency = (post as any).currency || 'USD';
+  const condition = (post as any).condition || 'Used - Good';
+  const location = (post as any).location || '';
+  const status = (post as any).status || 'available';
+
+  const getCurrencySymbol = (currencyCode: string) => { const c = CURRENCY_OPTIONS.find(c => c.code === currencyCode); return c ? c.symbol : currencyCode; };
+  const formattedPrice = `${getCurrencySymbol(currency)} ${price}`;
+  const mediaList = useMemo(() => getPostMediaList(post), [post]);
+  const imageMedia = mediaList.filter(m => m.kind === 'image');
+  const videoMedia = mediaList.filter(m => m.kind === 'video');
+
+  useEffect(() => {
+    setLocalMyReaction((post as any).myReaction ?? (post as any).my_reaction ?? null);
+    const likesCount = Number((post as any).likesCount ?? (post as any).reactionsCount ?? (post as any).reactions_count ?? 0);
+    const reactionsArr = Array.isArray(post.reactions) ? post.reactions : null;
+    setLocalReactionCount(likesCount > 0 ? likesCount : reactionsArr ? reactionsArr.length : 0);
+    const newCommentCount = typeof post.comment_count === 'number' ? post.comment_count : typeof (post as any).comments_count === 'number' ? (post as any).comments_count : Array.isArray(post.comments) ? post.comments.length : 0;
+    if (newCommentCount !== commentCount) setCommentCount(newCommentCount);
+    setShareCount(Number(post.shares ?? post.shares_count ?? 0));
+  }, [post.id, post]);
+
+  const isPostAuthor = currentUser?.id === author.id;
+  const canModerate = Boolean(isPostAuthor || props.isGroupAdmin || props.isPlatformAdmin);
+
+  const handleLikeClick = async (type: ReactionType) => {
+    if (!currentUser) return;
+    const previousMyReaction = localMyReaction;
+    const previousReactionCount = localReactionCount;
+    let newMyReaction: ReactionType | null = type;
+    let newReactionCount = previousReactionCount;
+    if (!previousMyReaction) newReactionCount = previousReactionCount + 1;
+    else if (previousMyReaction === type) { newMyReaction = null; newReactionCount = previousReactionCount - 1; }
+    else newMyReaction = type;
+    setLocalMyReaction(newMyReaction || undefined);
+    setLocalReactionCount(newReactionCount);
+    try { await props.onLikePost(post.id, type); } catch (error) { console.error('Failed to like post:', error); setLocalMyReaction(previousMyReaction); setLocalReactionCount(previousReactionCount); }
+  };
+
+  const handleShareComplete = (destination: string, data?: any) => {
+    const nextShares = Number(data?.shares ?? data?.share_count ?? shareCount + 1);
+    if (data?.success) { setShareCount(nextShares); props.onSharePost(post.id, nextShares); }
+    setShowShareSheet(false);
+  };
+
+  const handleCommentAdded = () => { setCommentCount(prev => prev + 1); if (onCommentAdded) onCommentAdded(); };
+  const openGallery = (urls: string[], index: number) => { setGalleryUrls(urls); setGalleryIndex(index); setGalleryOpen(true); };
+  const reactionsArr = Array.isArray(post.reactions) ? post.reactions : null;
+  const emojiList = useMemo(() => {
+    if (Array.isArray(reactionsArr) && reactionsArr.length > 0) { const em = topReactionEmojis(reactionsArr, 2); return em.length ? em : ['👍']; }
+    return localReactionCount > 0 ? ['👍'] : [];
+  }, [reactionsArr, localReactionCount]);
+  const formatCount = (count: number): string => { if (count >= 1000000) return `${(count / 1000000).toFixed(1)}M`; else if (count >= 1000) return `${(count / 1000).toFixed(1)}k`; return count.toString(); };
+  const createdAtLabel = formatRelativeTime(post.created_at || post.createdAt || '');
+  const statusColors = { available: 'bg-[#45BD62]', pending: 'bg-[#F7B928]', sold: 'bg-[#F3425F]' };
+  const handleOpenComments = () => props.onOpenComments(post.id);
+
+  return (
+    <>
+      <div className="bg-[#0F172A] rounded-xl shadow-sm mb-4 animate-fade-in border border-[#1E293B] overflow-hidden">
+        <div className="p-3 md:p-4 flex items-center justify-between">
+          <div className="flex items-center gap-2 flex-1 min-w-0 cursor-pointer" onClick={() => onProfileClick(author.id)}>
+            <img src={avatarFrom(author)} alt="" className="w-10 h-10 rounded-full object-cover border border-[#1E293B]" />
+            <div className="min-w-0">
+              {Boolean((post as any).shared_post_id || (post as any).shared_from || (post as any).original_owner_name) ? (
+                (post as any).shared_from === 'group' || (post as any).original_group_name || (post as any).shared_group_name ? (
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <h4 className="font-bold text-[#F8FAFC] text-[20px] sm:text-[21px] hover:underline truncate">{(post as any).shared_user_name || author.name || 'User'}</h4>
+                    {Boolean(author.is_verified) && <VerifiedBadge size={20} className="shrink-0" />}
+                    <span className="text-[#94A3B8] font-normal text-[15px] sm:text-[16px]">shared a post from</span>
+                    <span className="font-bold text-[#38BDF8] text-[20px] sm:text-[21px] truncate">{(post as any).original_group_name || (post as any).shared_group_name || (post as any).original_owner_name || 'Group'}</span>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <h4 className="font-bold text-[#F8FAFC] text-[20px] sm:text-[21px] hover:underline truncate">{(post as any).shared_user_name || author.name || 'User'}</h4>
+                    {Boolean(author.is_verified) && <VerifiedBadge size={20} className="shrink-0" />}
+                    <span className="text-[#94A3B8] font-normal text-[15px] sm:text-[16px]">shared</span>
+                    <span className="font-bold text-[#38BDF8] text-[20px] sm:text-[21px] hover:underline truncate cursor-pointer" onClick={(e) => { e.stopPropagation(); if ((post as any).original_owner_id) onProfileClick((post as any).original_owner_id); }}>
+                      {(post as any).original_owner_name || 'User'}'s post
+                    </span>
+                  </div>
+                )
+              ) : (
+                <div className="flex items-center gap-1.5 flex-wrap"><h4 className="font-bold text-[#F8FAFC] text-[21px] hover:underline truncate">{author.name || 'User'}</h4>{Boolean(author.is_verified) && (<VerifiedBadge size={21} className="shrink-0" />)}</div>
+              )}
+              <div className="flex items-center gap-1.5 text-[#94A3B8] text-[13px]"><span>{createdAtLabel}</span><span>•</span><i className="fas fa-store text-[12px]"></i><span>Marketplace</span></div>
+            </div>
+          </div>
+          {(canModerate || props.onReportPost) && (
+            <div className="relative">
+              <button className="w-9 h-9 hover:bg-[#1E293B] rounded-full flex items-center justify-center transition-colors" onClick={(e) => { e.stopPropagation(); setShowActionsMenu(!showActionsMenu); }} aria-label="Post actions"><i className="fas fa-ellipsis-h text-[#94A3B8] text-xl"></i></button>
+              {showActionsMenu && (<PostActionsMenu post={post} currentUser={currentUser} isGroupAdmin={canModerate} isPostAuthor={isPostAuthor} onEdit={props.onEditPost} onDelete={props.onDeletePost} onReport={props.onReportPost} onClose={() => setShowActionsMenu(false)} />)}
+            </div>
+          )}
+          <div className={`px-3 py-1 rounded-full ${statusColors[status as keyof typeof statusColors]} text-white text-xs font-bold uppercase`}>{status}</div>
+        </div>
+        <div className="px-3 md:px-4 pb-2"><span className="text-[#F8FAFC] font-black text-2xl">{formattedPrice}</span>{condition && (<span className="ml-2 text-[#94A3B8] text-sm">• {condition}</span>)}</div>
+        {location && (<div className="px-3 md:px-4 pb-2"><div className="flex items-center gap-1 text-[#94A3B8]"><i className="fas fa-map-marker-alt text-xs text-[#F7B928]"></i><span className="text-xs">{location}</span></div></div>)}
+        {imageMedia.length > 0 && (<MediaGrid media={imageMedia} onOpen={(url, index) => { const urls = imageMedia.map(m => m.full || m.feed || m.url); openGallery(urls, index); }} />)}
+        {videoMedia.length > 0 && (<div className="px-3 md:px-4 mb-3"><video src={videoMedia[0].url} className="w-full rounded-lg" controls playsInline /></div>)}
+        {post.content && (<div className="px-3 md:px-4 py-3"><p className="text-[#F8FAFC] text-base whitespace-pre-wrap">{post.content}</p></div>)}
+        {(localReactionCount > 0 || commentCount > 0) && (
+          <div className="px-3 md:px-4 py-2.5 flex items-center justify-between text-[#94A3B8] text-[15px] border-t border-[#1E293B]">
+            <div className="flex items-center gap-2 min-h-[24px]">
+              {localReactionCount > 0 && (
+                <div onClick={(e) => { e.stopPropagation(); setShowReactionsSheet(true); }} className="flex items-center gap-2 cursor-pointer hover:opacity-80 transition-opacity">
+                  <div className="flex -space-x-2">{emojiList.slice(0, 2).map((e, i) => (<span key={i} className="w-[24px] h-[24px] rounded-full bg-[#1E293B] border border-[#0B1120] flex items-center justify-center text-[16px]" style={{ zIndex: 10 - i }}>{e}</span>))}</div>
+                  <span className="text-[#F8FAFC] font-bold text-[15px] md:text-[16px]">{localReactionCount === 1 ? '1 Reaction' : `${formatCount(localReactionCount)} Reactions`}</span>
+                </div>
+              )}
+            </div>
+            <div className="flex items-center gap-4">
+              <span className="hover:underline cursor-pointer text-[#CBD5E1] hover:text-[#F8FAFC] text-[15px] md:text-[16px] font-semibold transition-colors" onClick={handleOpenComments}>{formatCount(commentCount)} {commentCount === 1 ? 'Discussion' : 'Discussions'}</span>
+              {shareCount > 0 && (<span className="hover:underline cursor-pointer text-[15px] md:text-[16px] text-[#94A3B8] hover:text-[#CBD5E1] transition-colors" onClick={() => setShowShareSheet(true)}>{formatCount(shareCount)} {shareCount === 1 ? 'Share' : 'Shares'}</span>)}
+            </div>
+          </div>
+        )}
+        <div className="px-3.5 py-2.5 border-t border-[#1E293B] flex items-center justify-between">
+          <div className="flex items-center gap-4">
+            <ReactionButton currentUserReactions={localMyReaction} reactionCount={localReactionCount} onReact={handleLikeClick} isGuest={!currentUser} />
+            <button className="flex items-center gap-1.5 text-[#F8FAFC] hover:text-[#38BDF8] transition-colors focus:outline-none p-1 rounded-lg hover:bg-[#1E293B]/60" onClick={() => currentUser ? handleOpenComments() : alert('Login first')} aria-label="Discuss & Comments" title="Discuss">
+              <i className="far fa-comment text-[22px]"></i>
+              {commentCount > 0 && <span className="text-[14px] font-semibold text-[#F8FAFC]">{formatCount(commentCount)}</span>}
+            </button>
+            <button className="flex items-center gap-1.5 text-[#F8FAFC] hover:text-[#38BDF8] transition-transform active:scale-110 focus:outline-none p-1 rounded-lg hover:bg-[#1E293B]/60" onClick={() => { if (!currentUser) { alert('Please login to share posts.'); return; } setShowShareSheet(true); }} aria-label="Share post" title="Share">
+              <i className="far fa-paper-plane text-[21px]"></i>
+              {shareCount > 0 && <span className="text-[14px] font-semibold text-[#F8FAFC]">{formatCount(shareCount)}</span>}
+            </button>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <SavePostButton post={post} />
+          </div>
+        </div>
+        <GroupCommentPreview post={post} groupId={post.group_id || props.group?.id} currentUser={currentUser} users={users} onProfileClick={onProfileClick} onOpenComments={handleOpenComments} />
+      </div>
+      <ShareBottomSheet isOpen={showShareSheet} onClose={() => setShowShareSheet(false)} post={post} currentUser={currentUser} users={users} groups={props.groups || []} onShareComplete={handleShareComplete} />
+      <GalleryViewer isOpen={galleryOpen} urls={galleryUrls} startIndex={galleryIndex} onClose={() => setGalleryOpen(false)} postId={post.id} currentUser={currentUser} reactionCount={localReactionCount} commentCount={commentCount} shareCount={shareCount} myReaction={localMyReaction} onReact={handleLikeClick} onOpenComments={handleOpenComments} onShare={() => setShowShareSheet(true)} onOpenReactions={() => setShowReactionsSheet(true)} />
+    </>
+  );
+};
+
+const GeneralGroupPost: React.FC<any> = ({
+  post, author, currentUser, users = [], groups = [], isGroupAdmin = false, isPlatformAdmin = false, onProfileClick, onLikePost, onOpenComments, onSharePost, onEditPost, onDeletePost, onReportPost, onViewImage, onVideoClick, onHashtagClick, onFollow, checkIsFollowing, onComment, onCommentAdded,
+}) => {
+  const p: any = post as any;
+  const a: any = author as any;
+  const [showActionsMenu, setShowActionsMenu] = useState(false);
+  const [commentCount, setCommentCount] = useState(() => {
+    if (typeof p.comment_count === 'number') return p.comment_count;
+    if (typeof p.comments_count === 'number') return p.comments_count;
+    if (Array.isArray(p.comments)) return p.comments.length;
+    return 0;
+  });
+  const [shareCount, setShareCount] = useState(() => Number(p.shares ?? p.shares_count ?? 0));
+  const [showShareSheet, setShowShareSheet] = useState(false);
+  const [showReactionsSheet, setShowReactionsSheet] = useState(false);
+  const [galleryOpen, setGalleryOpen] = useState(false);
+  const [galleryUrls, setGalleryUrls] = useState<string[]>([]);
+  const [galleryIndex, setGalleryIndex] = useState(0);
+  const [localMyReaction, setLocalMyReaction] = useState<ReactionType | undefined>((p as any).myReaction ?? (p as any).my_reaction ?? null);
+  const [localReactionCount, setLocalReactionCount] = useState(() => {
+    const likesCount = Number((p as any).likesCount ?? (p as any).reactionsCount ?? (p as any).reactions_count ?? 0);
+    const reactionsArr = Array.isArray(p.reactions) ? p.reactions : null;
+    return likesCount > 0 ? likesCount : reactionsArr ? reactionsArr.length : 0;
+  });
+
+  useEffect(() => {
+    setLocalMyReaction((p as any).myReaction ?? (p as any).my_reaction ?? null);
+    const likesCount = Number((p as any).likesCount ?? (p as any).reactionsCount ?? (p as any).reactions_count ?? 0);
+    const reactionsArr = Array.isArray(p.reactions) ? p.reactions : null;
+    setLocalReactionCount(likesCount > 0 ? likesCount : reactionsArr ? reactionsArr.length : 0);
+    const newCommentCount = typeof p.comment_count === 'number' ? p.comment_count : typeof p.comments_count === 'number' ? p.comments_count : Array.isArray(p.comments) ? p.comments.length : 0;
+    if (newCommentCount !== commentCount) setCommentCount(newCommentCount);
+  }, [p.id, (p as any).myReaction, (p as any).my_reaction, (p as any).likesCount, (p as any).reactionsCount, (p as any).reactions_count]);
+
+  const reactionsArr = Array.isArray(p.reactions) ? p.reactions : null;
+  const finalMyReaction = localMyReaction;
+  const finalReactionCount = localReactionCount;
+  const createdAtLabel = formatRelativeTime(p.created_at || p.createdAt || '');
+  const postId = Number(p.id ?? p.post_id ?? 0);
+  const isPostAuthor = currentUser?.id === author.id;
+  const canModerate = Boolean(isPostAuthor || isGroupAdmin || isPlatformAdmin);
+  const mediaList = useMemo(() => getPostMediaList(p), [p]);
+  const imageMedia = mediaList.filter(m => m.kind === 'image');
+  const videoMedia = mediaList.filter(m => m.kind === 'video');
+  const emojiList = useMemo(() => {
+    if (Array.isArray(reactionsArr) && reactionsArr.length > 0) { const em = topReactionEmojis(reactionsArr, 2); return em.length ? em : ['👍']; }
+    return finalReactionCount > 0 ? ['👍'] : [];
+  }, [reactionsArr, finalReactionCount]);
+  const formatCount = (count: number): string => { if (count >= 1000000) return `${(count / 1000000).toFixed(1)}M`; else if (count >= 1000) return `${(count / 1000).toFixed(1)}k`; return count.toString(); };
+
+  const handleLikeClick = async (type: ReactionType) => {
+    if (!currentUser) return;
+    const previousMyReaction = finalMyReaction;
+    const previousReactionCount = finalReactionCount;
+    let newMyReaction: ReactionType | null = type;
+    let newReactionCount = previousReactionCount;
+    if (!previousMyReaction) newReactionCount = previousReactionCount + 1;
+    else if (previousMyReaction === type) { newMyReaction = null; newReactionCount = previousReactionCount - 1; }
+    else newMyReaction = type;
+    setLocalMyReaction(newMyReaction || undefined);
+    setLocalReactionCount(newReactionCount);
+    try { await onLikePost(postId, type); } catch (error) { console.error('Failed to like post:', error); setLocalMyReaction(previousMyReaction); setLocalReactionCount(previousReactionCount); }
+  };
+
+  const handleShareComplete = (destination: string, data?: any) => {
+    const nextShares = Number(data?.shares ?? data?.share_count ?? shareCount + 1);
+    if (data?.success) { setShareCount(nextShares); onSharePost(postId, nextShares); }
+    setShowShareSheet(false);
+  };
+
+  const handleCommentAdded = () => { setCommentCount(prev => prev + 1); if (onCommentAdded) onCommentAdded(); };
+  const handleSeeMore = () => onOpenComments(postId);
+  const openGallery = (urls: string[], index: number) => { setGalleryUrls(urls); setGalleryIndex(index); setGalleryOpen(true); };
+  const handleOpenComments = () => onOpenComments(postId);
+
+  return (
+    <>
+      <div className="bg-[#0F172A] rounded-xl shadow-sm mb-4 animate-fade-in border border-[#1E293B] overflow-hidden">
+        <div className="p-3 md:p-4 flex items-center justify-between">
+          <div className="flex items-center gap-2 flex-1 min-w-0 cursor-pointer" onClick={() => onProfileClick(a.id)}>
+            <img src={avatarFrom(a)} alt="" className="w-10 h-10 rounded-full object-cover border border-[#1E293B]" />
+            <div className="min-w-0">
+              {Boolean((post as any).shared_post_id || (post as any).shared_from || (post as any).original_owner_name) ? (
+                (post as any).shared_from === 'group' || (post as any).original_group_name || (post as any).shared_group_name ? (
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <h4 className="font-bold text-[#F8FAFC] text-[20px] sm:text-[21px] hover:underline truncate">{(post as any).shared_user_name || a.name || 'User'}</h4>
+                    {Boolean(a.is_verified) && <VerifiedBadge size={20} className="shrink-0" />}
+                    <span className="text-[#94A3B8] font-normal text-[15px] sm:text-[16px]">shared a post from</span>
+                    <span className="font-bold text-[#38BDF8] text-[20px] sm:text-[21px] truncate">{(post as any).original_group_name || (post as any).shared_group_name || (post as any).original_owner_name || 'Group'}</span>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <h4 className="font-bold text-[#F8FAFC] text-[20px] sm:text-[21px] hover:underline truncate">{(post as any).shared_user_name || a.name || 'User'}</h4>
+                    {Boolean(a.is_verified) && <VerifiedBadge size={20} className="shrink-0" />}
+                    <span className="text-[#94A3B8] font-normal text-[15px] sm:text-[16px]">shared</span>
+                    <span className="font-bold text-[#38BDF8] text-[20px] sm:text-[21px] hover:underline truncate cursor-pointer" onClick={(e) => { e.stopPropagation(); if ((post as any).original_owner_id) onProfileClick((post as any).original_owner_id); }}>
+                      {(post as any).original_owner_name || 'User'}'s post
+                    </span>
+                  </div>
+                )
+              ) : (
+                <div className="flex items-center gap-1.5 flex-wrap"><h4 className="font-bold text-[#F8FAFC] text-[21px] hover:underline truncate">{a.name || 'User'}</h4>{Boolean(a.is_verified) && (<VerifiedBadge size={21} className="shrink-0" />)}</div>
+              )}
+              <div className="flex items-center gap-1.5 text-[#94A3B8] text-[13px]"><span>{createdAtLabel}</span><span>•</span><i className="fas fa-users text-[12px]"></i><span>Group Post</span></div>
+            </div>
+          </div>
+          {(canModerate || onReportPost) && (
+            <div className="relative">
+              <button className="w-9 h-9 hover:bg-[#1E293B] rounded-full flex items-center justify-center transition-colors" onClick={(e) => { e.stopPropagation(); setShowActionsMenu(!showActionsMenu); }} aria-label="Post actions"><i className="fas fa-ellipsis-h text-[#94A3B8] text-xl"></i></button>
+              {showActionsMenu && (<PostActionsMenu post={post} currentUser={currentUser} isGroupAdmin={canModerate} isPostAuthor={isPostAuthor} onEdit={onEditPost} onDelete={onDeletePost} onReport={onReportPost} onClose={() => setShowActionsMenu(false)} />)}
+            </div>
+          )}
+        </div>
+        {p.content && (
+          p.background && imageMedia.length === 0 && videoMedia.length === 0 ? (
+            <div
+              className="w-full min-h-[300px] md:min-h-[360px] flex items-center justify-center p-8 sm:p-12 text-center text-white font-black text-2xl sm:text-3xl md:text-4xl shadow-inner select-text my-1 leading-relaxed tracking-tight"
+              style={{
+                background: p.background,
+                backgroundSize: 'cover',
+                backgroundPosition: 'center',
+                textShadow: '0 2px 10px rgba(0,0,0,0.5)',
+              }}
+            >
+              <div className="max-w-[85%] break-words whitespace-pre-wrap font-extrabold">
+                {String(p.content)}
+              </div>
+            </div>
+          ) : (
+            <div className="px-3 md:px-4 pb-2">
+              <ExpandableRichText text={String(p.content)} users={users} onProfileClick={onProfileClick} onHashtagClick={onHashtagClick} maxWords={25} fontSizePx={21} onSeeMore={handleSeeMore} />
+            </div>
+          )
+        )}
+        {imageMedia.length > 0 && (<MediaGrid media={imageMedia} onOpen={(url, index) => { const urls = imageMedia.map(m => m.full || m.feed || m.url); openGallery(urls, index); }} />)}
+        {videoMedia.length > 0 && (<div className="cursor-pointer relative h-[500px] bg-black" onClick={() => onVideoClick?.(post)}><video src={videoMedia[0].url} className="w-full h-full object-cover" preload="metadata" playsInline muted onError={(e) => { console.error('Failed to load video:', videoMedia[0].url); e.currentTarget.style.display = 'none'; }} /><div className="absolute inset-0 flex items-center justify-center"><i className="fas fa-play text-white text-4xl opacity-50"></i></div></div>)}
+        {(finalReactionCount > 0 || commentCount > 0) && (
+          <div className="px-3 md:px-4 py-2.5 flex items-center justify-between text-[#94A3B8] text-[15px] border-t border-[#1E293B]">
+            <div className="flex items-center gap-2 min-h-[24px]">
+              {finalReactionCount > 0 && (
+                <div onClick={(e) => { e.stopPropagation(); setShowReactionsSheet(true); }} className="flex items-center gap-2 cursor-pointer hover:opacity-80 transition-opacity">
+                  <div className="flex -space-x-2">{emojiList.slice(0, 2).map((e, i) => (<span key={i} className="w-[24px] h-[24px] rounded-full bg-[#1E293B] border border-[#0B1120] flex items-center justify-center text-[16px]" style={{ zIndex: 10 - i }}>{e}</span>))}</div>
+                  <span className="text-[#F8FAFC] font-bold text-[15px] md:text-[16px]">{finalReactionCount === 1 ? '1 Reaction' : `${formatCount(finalReactionCount)} Reactions`}</span>
+                </div>
+              )}
+            </div>
+            <div className="flex items-center gap-4">
+              <span className="hover:underline cursor-pointer text-[#CBD5E1] hover:text-[#F8FAFC] text-[15px] md:text-[16px] font-semibold transition-colors" onClick={handleOpenComments}>{formatCount(commentCount)} {commentCount === 1 ? 'Discussion' : 'Discussions'}</span>
+              {shareCount > 0 && (<span className="hover:underline cursor-pointer text-[15px] md:text-[16px] text-[#94A3B8] hover:text-[#CBD5E1] transition-colors" onClick={() => setShowShareSheet(true)}>{formatCount(shareCount)} {shareCount === 1 ? 'Share' : 'Shares'}</span>)}
+            </div>
+          </div>
+        )}
+        <div className="px-3.5 py-2.5 border-t border-[#1E293B] flex items-center justify-between">
+          <div className="flex items-center gap-4">
+            <ReactionButton currentUserReactions={finalMyReaction} reactionCount={finalReactionCount} onReact={handleLikeClick} isGuest={!currentUser} />
+            <button className="flex items-center gap-1.5 text-[#F8FAFC] hover:text-[#38BDF8] transition-colors focus:outline-none p-1 rounded-lg hover:bg-[#1E293B]/60" onClick={() => currentUser ? handleOpenComments() : alert('Login first')} aria-label="Discuss & Comments" title="Discuss">
+              <i className="far fa-comment text-[22px]"></i>
+              {commentCount > 0 && <span className="text-[14px] font-semibold text-[#F8FAFC]">{formatCount(commentCount)}</span>}
+            </button>
+            <button className="flex items-center gap-1.5 text-[#F8FAFC] hover:text-[#38BDF8] transition-transform active:scale-110 focus:outline-none p-1 rounded-lg hover:bg-[#1E293B]/60" onClick={() => { if (!currentUser) { alert('Please login to share posts.'); return; } setShowShareSheet(true); }} aria-label="Share post" title="Share">
+              <i className="far fa-paper-plane text-[21px]"></i>
+              {shareCount > 0 && <span className="text-[14px] font-semibold text-[#F8FAFC]">{formatCount(shareCount)}</span>}
+            </button>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <SavePostButton post={p} />
+          </div>
+        </div>
+        <GroupCommentPreview post={p} groupId={p.group_id} currentUser={currentUser} users={users} onProfileClick={onProfileClick} onOpenComments={handleOpenComments} />
+      </div>
+      <ShareBottomSheet isOpen={showShareSheet} onClose={() => setShowShareSheet(false)} post={p} currentUser={currentUser} users={users} groups={groups} onShareComplete={handleShareComplete} />
+      <GalleryViewer isOpen={galleryOpen} urls={galleryUrls} startIndex={galleryIndex} onClose={() => setGalleryOpen(false)} postId={postId} currentUser={currentUser} reactionCount={finalReactionCount} commentCount={commentCount} shareCount={shareCount} myReaction={finalMyReaction} onReact={handleLikeClick} onOpenComments={handleOpenComments} onShare={() => setShowShareSheet(true)} onOpenReactions={() => setShowReactionsSheet(true)} />
+    </>
+  );
+};
+
+const GroupPost: React.FC<any> = (props) => {
+  const { groupCategory = 'general' } = props;
+  const isCareer = groupCategory === 'recruitment' || isCareerCategory(groupCategory) || Boolean(props.post?.job_title);
+  if (isCareer) return <RecruitmentPost {...props} />;
+  if (groupCategory === 'buy_sell' || Boolean(props.post?.price)) return <BuySellPost {...props} />;
+  return <GeneralGroupPost {...props} />;
+};
+//===NORMALIZE GROUP ====
+
+  function normalizeGroup(raw: any): Group {
+  let members: number[] | undefined = undefined;
+
+  if (raw?.members !== undefined && raw?.members !== null) {
+    if (Array.isArray(raw.members)) {
+      members = raw.members
+        .map((m: any) => {
+          if (typeof m === 'number' || typeof m === 'string') return Number(m);
+          if (m && typeof m === 'object') return Number(m.user_id ?? m.id ?? 0);
+          return 0;
+        })
+        .filter((n: number) => Number.isFinite(n) && n > 0);
+    } else if (typeof raw.members === 'string') {
+      try {
+        const parsed = JSON.parse(raw.members);
+        if (Array.isArray(parsed)) {
+          members = parsed
+            .map((m: any) => {
+              if (typeof m === 'number' || typeof m === 'string') return Number(m);
+              if (m && typeof m === 'object') return Number(m.user_id ?? m.id ?? 0);
+              return 0;
+            })
+            .filter((n: number) => Number.isFinite(n) && n > 0);
+        } else {
+          members = [];
+        }
+      } catch {
+        members = [];
+      }
+    } else {
+      members = [];
+    }
+  }
+
+  const posts = Array.isArray(raw?.posts) ? raw.posts : [];
+  const events = Array.isArray(raw?.events) ? raw.events : [];
+
+  const rawIsMember = raw?.is_member ?? raw?.isMember;
+  const normalizedIsMember =
+    rawIsMember === true ||
+    rawIsMember === 1 ||
+    rawIsMember === "1" ||
+    rawIsMember === "true"
+      ? true
+      : rawIsMember === false ||
+        rawIsMember === 0 ||
+        rawIsMember === "0" ||
+        rawIsMember === "false"
+      ? false
+      : undefined;
+
+  return {
+    ...raw,
+    id: Number(raw?.id ?? raw?.groupId ?? 0),
+    admin_id: Number(raw?.admin_id ?? raw?.adminId ?? 0),
+    name: String(raw?.name ?? 'Untitled Group'),
+    description: String(raw?.description ?? ''),
+    type: (raw?.type === 'private' ? 'private' : 'public') as any,
+    category: (raw?.category as GroupCategory) || 'general',
+    cover_image: String(raw?.cover_image ?? raw?.coverImage ?? ''),
+    profile_image: String(raw?.profile_image ?? raw?.profileImage ?? ''),
+    created_at: raw?.created_at ?? new Date().toISOString(),
+    member_posting_allowed: raw?.member_posting_allowed ?? true,
+    members,
+    posts,
+    events,
+    members_count: Number(raw?.members_count ?? (members ? members.length : 0)),
+    is_member: normalizedIsMember,
+  } as Group;
+}
+                                          
+function normalizePost(post: any): PostType {
+  const mediaUrl = post?.media_url ?? post?.mediaUrl ?? null;
+  const mediaType = post?.media_type ?? post?.mediaType ?? null;
+  let mediaUrls: string[] = [];
+  if (post?.media_urls) {
+    if (Array.isArray(post.media_urls)) mediaUrls = post.media_urls;
+    else if (typeof post.media_urls === 'string') { try { const parsed = JSON.parse(post.media_urls); mediaUrls = Array.isArray(parsed) ? parsed : []; } catch { mediaUrls = []; } }
+  }
+  let images: string[] = [];
+  if (post?.images) {
+    if (Array.isArray(post.images)) images = post.images;
+    else if (typeof post.images === 'string') { try { const parsed = JSON.parse(post.images); images = Array.isArray(parsed) ? parsed : []; } catch { images = []; } }
+  }
+  let mediaTypes: string[] = [];
+  if (post?.media_types) {
+    if (Array.isArray(post.media_types)) mediaTypes = post.media_types;
+    else if (typeof post.media_types === 'string') { try { const parsed = JSON.parse(post.media_types); mediaTypes = Array.isArray(parsed) ? parsed : []; } catch { mediaTypes = []; } }
+  }
+  let mediaMeta: any = post?.media_meta ?? null;
+  if (typeof mediaMeta === 'string') {
+    try { mediaMeta = JSON.parse(mediaMeta); } catch {}
+  }
+  const commentCount = typeof post?.comment_count === 'number' ? post.comment_count : typeof post?.comments_count === 'number' ? post.comments_count : Array.isArray(post?.comments) ? post.comments.length : 0;
+  return {
+    ...post,
+    id: Number(post?.id ?? post?.post_id ?? 0),
+    user_id: Number(post?.user_id ?? post?.authorId ?? 0),
+    content: String(post?.content ?? post?.text ?? ''),
+    media_url: mediaUrl,
+    media_type: mediaType,
+    media_urls: mediaUrls.length ? mediaUrls : images,
+    images: mediaUrls.length ? mediaUrls : images,
+    media_types: mediaTypes,
+    media_meta: mediaMeta,
+    type: post?.type ?? (mediaUrl ? (mediaType?.startsWith('image/') ? 'image' : 'video') : 'text'),
+    reactions: Array.isArray(post?.reactions) ? post.reactions : [],
+    comments: Array.isArray(post?.comments) ? post.comments : [],
+    shares: Number(post?.shares ?? 0),
+    views: Number(post?.views ?? 0),
+    created_at: post?.created_at ?? new Date().toISOString(),
+    visibility: 'public',
+    groupId: post?.groupId ? Number(post.groupId) : null,
+    my_reaction: post?.my_reaction ?? null,
+    reactions_count: Number(post?.reactions_count ?? post?.likesCount ?? 0),
+    comment_count: commentCount,
+    comments_count: commentCount,
+    price: post?.price,
+    currency: post?.currency || 'USD',
+    condition: post?.condition,
+    location: post?.location,
+    status: post?.status || 'available',
+    job_title: post?.job_title,
+    company: post?.company,
+    salary: post?.salary,
+    job_type: post?.job_type,
+    street: post?.street,
+    district: post?.district,
+    region: post?.region,
+    country: post?.country,
+    application_type: post?.application_type,
+    application_value: post?.application_value,
+    expiry_date: post?.expiry_date,
+    shared_post_id: post?.shared_post_id,
+    shared_from: post?.shared_from,
+    shared_group_id: post?.shared_group_id,
+    shared_group_name: post?.shared_group_name,
+    shared_by_user_id: post?.shared_by_user_id,
+    shared_user_name: post?.shared_user_name,
+    original_owner_name: post?.original_owner_name,
+    original_owner_id: post?.original_owner_id,
+    original_owner_avatar: post?.original_owner_avatar,
+    original_post_content: post?.original_post_content,
+  } as any;
+}
+
+function normalizeEvent(event: any): Event {
+  const groupId = event?.group_id ?? event?.groupId ?? null;
+  return {
+    ...event,
+    id: Number(event?.id ?? 0),
+    title: String(event?.title ?? ''),
+    description: String(event?.description ?? ''),
+    start_time: event?.event_date ?? event?.start_time ?? event?.date ?? new Date().toISOString(),
+    location: event?.location ?? null,
+    cover_image: event?.cover_url ?? event?.cover_image ?? null,
+    attendees: Array.isArray(event?.attendees) ? event.attendees : [],
+    created_by: Number(event?.creator_id ?? event?.created_by ?? 0),
+    group_id: groupId == null ? null : Number(groupId),
+    created_at: event?.created_at ?? new Date().toISOString(),
+    user_rsvp_status: event?.user_rsvp_status ?? null,
+  } as any;
+}
+
+// Category Selection Modal Component (Full Page Platform Dark Theme)
+const CategorySelectionModal: React.FC<{
+  isOpen: boolean;
+  onClose: () => void;
+  onSelect: (category: GroupCategory) => void;
+}> = ({ isOpen, onClose, onSelect }) => {
+  const [selectedId, setSelectedId] = useState<GroupCategory | null>(null);
+  if (!isOpen) return null;
+  return (
+    <div className="fixed inset-0 z-[200] bg-[#050B18] text-[#F8FAFC] flex flex-col font-sans animate-fade-in overflow-hidden">
+      {/* Top Sticky Header */}
+      <div className="sticky top-0 z-10 bg-[#050B18]/95 backdrop-blur-md border-b border-[#1E293B]">
+        <div className="max-w-[760px] mx-auto px-4 h-16 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <button
+              onClick={onClose}
+              className="w-10 h-10 rounded-full flex items-center justify-center hover:bg-[#1E293B] text-[#F8FAFC] transition-colors"
+              aria-label="Back"
+            >
+              <i className="fas fa-arrow-left text-lg"></i>
+            </button>
+            <h1 className="text-xl font-bold text-[#F8FAFC]">Choose Group Category</h1>
+          </div>
+          <button
+            onClick={() => {
+              if (selectedId) {
+                onSelect(selectedId);
+                onClose();
+              }
+            }}
+            disabled={!selectedId}
+            className="px-5 py-2 bg-[#1877f2] text-white font-bold rounded-xl hover:bg-[#166fe5] transition-all disabled:opacity-40 disabled:cursor-not-allowed shadow-md text-sm active:scale-95"
+          >
+            Continue
+          </button>
+        </div>
+      </div>
+
+      {/* Flat Content without Container Cards (like Facebook) */}
+      <div className="flex-1 overflow-y-auto">
+        <div className="max-w-[760px] mx-auto px-4 py-6 space-y-4">
+          <div className="border-b border-[#1E293B] pb-4">
+            <h2 className="text-[#F8FAFC] text-2xl font-bold mb-1">Select a Category</h2>
+            <p className="text-[#94A3B8] text-sm">
+              Choose the category that best describes your group's mission. This configures specialized tools, custom post formats, and features for your community.
+            </p>
+          </div>
+
+          {/* Flat List of Category Rows */}
+          <div className="divide-y divide-[#1E293B] pb-8">
+            {GROUP_CATEGORIES.map((category) => {
+              const isSelected = selectedId === category.id;
+              return (
+                <div
+                  key={category.id}
+                  onClick={() => setSelectedId(category.id)}
+                  className={`py-4 px-2 flex items-start gap-4 cursor-pointer transition-colors ${
+                    isSelected ? 'bg-[#1877f2]/5' : 'hover:bg-[#141E33]/40'
+                  }`}
+                >
+                  <div
+                    className="w-11 h-11 rounded-xl flex items-center justify-center text-xl shrink-0 mt-0.5"
+                    style={{ backgroundColor: `${category.color}20`, color: category.color }}
+                  >
+                    <i className={category.icon}></i>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center justify-between gap-2 mb-1">
+                      <h3 className="text-[#F8FAFC] font-bold text-base sm:text-lg truncate">
+                        {category.label}
+                      </h3>
+                      <div
+                        className={`w-6 h-6 rounded-full flex items-center justify-center shrink-0 border transition-all ${
+                          isSelected
+                            ? 'border-[#1877f2] bg-[#1877f2] text-white'
+                            : 'border-[#334155] bg-transparent'
+                        }`}
+                      >
+                        {isSelected && <i className="fas fa-check text-xs"></i>}
+                      </div>
+                    </div>
+                    <p className="text-[#94A3B8] text-sm mb-2.5 leading-relaxed">
+                      {category.description}
+                    </p>
+                    <div className="flex flex-wrap gap-1.5">
+                      {category.features.map((feature, i) => (
+                        <span
+                          key={i}
+                          className="px-2.5 py-0.5 bg-[#1E293B]/70 rounded-md text-xs font-medium text-[#CBD5E1] border border-[#334155]/30"
+                        >
+                          {feature}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// Full Page Create Group Modal Component - Flat Page without Container Boxes
+const CreateGroupFullPageModal: React.FC<{
+  isOpen: boolean;
+  onClose: () => void;
+  onCreate: (groupData: Partial<Group>) => Promise<void>;
+  selectedCategory: GroupCategory | null;
+}> = ({ isOpen, onClose, onCreate, selectedCategory }) => {
+  const [name, setName] = useState('');
+  const [desc, setDesc] = useState('');
+  const [type] = useState<'public'>('public');
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (isOpen) {
+      setName('');
+      setDesc('');
+    }
+  }, [isOpen]);
+
+  const handleSubmit = async () => {
+    if (!name.trim() || !selectedCategory) return;
+    setLoading(true);
+    try {
+      await onCreate({
+        name: name.trim(),
+        description: (desc || '').trim(),
+        type: 'public',
+        category: selectedCategory,
+        profile_image: `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=random`,
+        cover_image: 'https://images.unsplash.com/photo-1522202176988-66273c2fd55f?auto=format&fit=crop&w=1500&q=80',
+      });
+      onClose();
+    } catch (error) { console.error('Failed to create group:', error); } finally { setLoading(false); }
+  };
+
+  if (!isOpen) return null;
+
+  const categoryInfo = GROUP_CATEGORIES.find(c => c.id === selectedCategory);
+
+  return (
+    <div className="fixed inset-0 z-[200] bg-[#050B18] text-[#F8FAFC] flex flex-col animate-fade-in font-sans">
+      {/* Top Header */}
+      <div className="sticky top-0 z-10 bg-[#050B18]/95 backdrop-blur-md border-b border-[#1E293B]">
+        <div className="max-w-[640px] mx-auto px-4 h-16 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <button onClick={onClose} className="w-10 h-10 rounded-full flex items-center justify-center hover:bg-[#1E293B] text-[#F8FAFC] transition-colors"><i className="fas fa-arrow-left text-lg"></i></button>
+            <h1 className="text-xl font-bold text-[#F8FAFC]">Create {categoryInfo?.label || ''} Group</h1>
+          </div>
+          <button onClick={handleSubmit} disabled={loading || !name.trim()} className="px-5 py-2 bg-[#1877f2] text-white font-bold rounded-xl hover:bg-[#166fe5] transition-all disabled:opacity-50 text-sm active:scale-95 shadow-md">{loading ? 'Creating...' : 'Create'}</button>
+        </div>
+      </div>
+
+      {/* Flat Form without Container Boxes (like Facebook Group Settings) */}
+      <div className="flex-1 overflow-y-auto">
+        <div className="max-w-[640px] mx-auto px-4 py-6 space-y-6">
+          {categoryInfo && (
+            <div className="border-b border-[#1E293B] pb-5">
+              <div className="flex items-center gap-3">
+                <div className="w-11 h-11 rounded-xl flex items-center justify-center" style={{ backgroundColor: `${categoryInfo.color}20` }}><i className={categoryInfo.icon} style={{ color: categoryInfo.color, fontSize: '22px' }}></i></div>
+                <div>
+                  <div className="text-[#F8FAFC] font-bold text-base">{categoryInfo.label} Community</div>
+                  <div className="text-[#94A3B8] text-xs mt-0.5">{categoryInfo.description}</div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div className="border-b border-[#1E293B] pb-6 space-y-6">
+            <div>
+              <label className="block text-[#CBD5E1] text-xs font-semibold uppercase tracking-wider mb-2">Group Name *</label>
+              <input
+                type="text"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="What's the name of your community?"
+                className="w-full bg-transparent border-b border-[#334155] focus:border-[#1877f2] px-0 py-2.5 text-[#F8FAFC] font-semibold text-lg outline-none transition-colors placeholder-[#64748B]"
+                autoFocus
+              />
+            </div>
+
+            <div>
+              <label className="block text-[#CBD5E1] text-xs font-semibold uppercase tracking-wider mb-2">Description (Optional)</label>
+              <textarea
+                value={desc}
+                onChange={(e) => setDesc(e.target.value)}
+                placeholder="Tell people what this group is about (optional)..."
+                rows={3}
+                className="w-full bg-transparent border-b border-[#334155] focus:border-[#1877f2] px-0 py-2.5 text-[#F8FAFC] text-sm outline-none transition-colors resize-none placeholder-[#64748B] leading-relaxed"
+              />
+            </div>
+
+            <div className="pt-2">
+              <label className="block text-[#CBD5E1] text-xs font-semibold uppercase tracking-wider mb-2">Privacy</label>
+              <div className="py-2.5 flex items-center justify-between border-b border-[#1E293B]">
+                <div className="flex items-center gap-3">
+                  <div className="w-9 h-9 rounded-xl bg-[#1877f2]/15 text-[#1877f2] flex items-center justify-center">
+                    <i className="fas fa-globe text-base"></i>
+                  </div>
+                  <div>
+                    <div className="text-[#F8FAFC] font-semibold text-sm">Public Group</div>
+                    <div className="text-[#94A3B8] text-xs mt-0.5">Anyone can see who's in the group and what they post</div>
+                  </div>
+                </div>
+                <div className="w-5 h-5 rounded-full bg-[#1877f2] flex items-center justify-center text-white text-[10px]">
+                  <i className="fas fa-check"></i>
+                </div>
+              </div>
+            </div>
+
+            {categoryInfo && (
+              <div className="pt-2">
+                <div className="text-xs font-semibold uppercase tracking-wider text-[#94A3B8] mb-3">Group Features:</div>
+                <div className="flex flex-wrap gap-2">
+                  {categoryInfo.features.map((feature, i) => (
+                    <span key={i} className="px-3 py-1 bg-[#1E293B]/70 border border-[#334155]/40 rounded-lg text-[#CBD5E1] text-xs flex items-center gap-1.5">
+                      <i className="fas fa-check text-[#45BD62] text-[10px]"></i>
+                      <span>{feature}</span>
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+  export const GroupsPage: React.FC<any> = ({
+  currentUser,
+  groups = [],
+  users = [],
+  uploadState,
+  onDismissUpload,
+  onCreateGroup,
+  onJoinGroup,
+  onLeaveGroup,
+  onDeleteGroup,
+  onUpdateGroupImage,
+  onPostToGroup,
+  onCreateGroupEvent,
+  onInviteToGroup,
+  onProfileClick,
+  onLikePost,
+  onSharePost,
+  onDeleteGroupPost,
+  onEditGroupPost,
+  onReportGroupPost,
+  onRemoveMember,
+  onUpdateGroupSettings,
+  onEventRSVP,
+  fetchGroupPosts,
+  fetchGroupDetails,
+  fetchGroupEvents,
+  fetchComments,
+  onComment,
+  onLikeComment,
+  initialGroupId,
+  onPlayAudioTrack,
+  onFollow,
+  checkIsFollowing,
+  onHashtagClick,
+  onViewImage,
+  onVideoClick,
+  onApplyToJob,
+  onPlayVideo,
+  fetchGroupInvites,
+  onAcceptGroupInvite,
+  onMakeModerator,
+  onToggleMemberPosting,
+  onDisableAllMembers,
+  onEnableAllMembers,
+  onMakeAdmin,
+  onRemoveAdmin,
+  onRemoveModerator,
+  onDeclineGroupInvite,
+}) => {
+  // ========== STATE DECLARATIONS ==========
+  const [view, setView] = useState<'feed' | 'detail'>('feed');
+  const [activeGroupId, setActiveGroupId] = useState<number | null>(null);
+  const [groupTab, setGroupTab] = useState<'Discussion' | 'Events' | 'Members' | 'About'>('Discussion');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [showCategoryModal, setShowCategoryModal] = useState(false);
+  const [showInviteModal, setShowInviteModal] = useState(false);
+  const [showGroupPostModal, setShowGroupPostModal] = useState(false);
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [showEventModal, setShowEventModal] = useState(false);
+  const [newGroupName, setNewGroupName] = useState('');
+  const [newGroupDesc, setNewGroupDesc] = useState('');
+  const [newGroupType, setNewGroupType] = useState<'public' | 'private'>('public');
+  const [selectedCategory, setSelectedCategory] = useState<GroupCategory | null>(null);
+  const [showPostView, setShowPostView] = useState(false);
+  const [selectedPost, setSelectedPost] = useState<PostType | null>(null);
+  const [selectedPostAuthor, setSelectedPostAuthor] = useState<User | null>(null);
+  const [showReactionsSheet, setShowReactionsSheet] = useState(false);
+  const [groupEvents, setGroupEvents] = useState<Event[]>([]);
+  const [loadingEvents, setLoadingEvents] = useState(false);
+  const eventsLoadedRef = useRef<boolean>(false);
+  const activeGroupIdRef = useRef<number | null>(null);
+  const lastHandledInitialGroupIdRef = useRef<number | null>(null);
+  // ✅ REMOVED 'Posts' from the tabs - only 3 tabs now
+  const [fbTab, setFbTab] = useState<'Your groups' | 'Discover' | 'Invites'>('Your groups');
+  const [sortOpen, setSortOpen] = useState(false);
+  const [sortMode, setSortMode] = useState<'Most visited' | 'Recently active' | 'Alphabetical'>('Most visited');
+  const [pinnedGroups, setPinnedGroups] = useState<Set<number>>(new Set());
+  const [groupPosts, setGroupPosts] = useState<PostType[]>([]);
+  const [loadingPosts, setLoadingPosts] = useState(false);
+  const postsLoadedRef = useRef<boolean>(false);
+  const [joining, setJoining] = useState(false);
+  const [leaving, setLeaving] = useState(false);
+  const groupCoverInputRef = useRef<HTMLInputElement>(null);
+  const groupProfileInputRef = useRef<HTMLInputElement>(null);
+  const postFileInputRef = useRef<HTMLInputElement>(null);
+  const [postContent, setPostContent] = useState('');
+  const [postFiles, setPostFiles] = useState<File[]>([]);
+  const [previews, setPreviews] = useState<string[]>([]);
+  const [postMetadata, setPostMetadata] = useState<any>({});
+  const [inviteSearch, setInviteSearch] = useState('');
+  const [inviteLimit, setInviteLimit] = useState(10);
+  const [locallyInvitedUserIds, setLocallyInvitedUserIds] = useState<number[]>([]);
+  const [showShareGroupModal, setShowShareGroupModal] = useState(false);
+  const [copiedGroupLink, setCopiedGroupLink] = useState(false);
+  const [invitingUserIds, setInvitingUserIds] = useState<number[]>([]);
+  const [showGroupMenu, setShowGroupMenu] = useState(false); 
+  const [groupInvites, setGroupInvites] = useState<any[]>([]);
+  const [loadingInvites, setLoadingInvites] = useState(false);
+  const [acceptingInviteId, setAcceptingInviteId] = useState<number | null>(null);
+  const [decliningInviteId, setDecliningInviteId] = useState<number | null>(null);
+  const [removingMemberId, setRemovingMemberId] = useState<number | null>(null);
+  const [disablePostingUserId, setDisablePostingUserId] = useState<number | null>(null);
+  const [activeGroupDetails, setActiveGroupDetails] = useState<Group | null>(null);
+  const [localGroups, setLocalGroups] = useState<Group[]>([]);
+  const [memberMenuOpenId, setMemberMenuOpenId] = useState<number | null>(null);
+  const [memberMetaOverrides, setMemberMetaOverrides] = useState<
+    Record<number, { group_role?: 'admin' | 'moderator' | 'member'; posting_disabled?: boolean }>
+  >({});    
+  const [groupImageOverrides, setGroupImageOverrides] = useState<Record<number, { cover_image?: string; profile_image?: string }>>({});
+
+  // Group feed infinite scroll
+  const [hasMorePosts, setHasMorePosts] = useState(true);
+  const [loadingMorePosts, setLoadingMorePosts] = useState(false);
+  const infiniteScrollTriggerRef = useRef<HTMLDivElement>(null);
+
+  // Group members search & pagination
+  const [liveMembers, setLiveMembers] = useState<any[]>([]);
+  const [loadingMembers, setLoadingMembers] = useState(false);
+  const [memberSearch, setMemberSearch] = useState('');
+  const [membersLimit, setMembersLimit] = useState(10);
+
+  // Discover & Your groups search & pagination
+  const [discoverSearch, setDiscoverSearch] = useState('');
+  const [discoverLimit, setDiscoverLimit] = useState(10);
+  const [yourGroupsLimit, setYourGroupsLimit] = useState(10);
+
+
+    // ==refs
+const pendingUploadTypeRef = useRef<'cover' | 'profile' | null>(null);
+  // ========== MEMOIZED VALUES ==========
+    const safeGroups = useMemo(() => localGroups.map(normalizeGroup), [localGroups]);
+ const activeGroup = useMemo(() => {
+  const base = safeGroups.find(g => g.id === activeGroupId) || null;
+  const details = activeGroupDetails && Number(activeGroupDetails.id) === Number(activeGroupId) ? activeGroupDetails : null;
+  const source = details || base;
+  if (!source) return null;
+  const overrides = groupImageOverrides[source.id] || {};
+  return { ...source, ...overrides };
+}, [safeGroups, activeGroupId, activeGroupDetails, groupImageOverrides]);
+    
+                            
+//=====INVITABLE USERS===
+  const inviteableUsers = useMemo(() => {
+  if (!activeGroup || !currentUser) return [];
+  
+  // Collect all member IDs of this group
+  const memberIds = new Set<number>(
+    Array.isArray(activeGroup.members) ? activeGroup.members.map(Number) : []
+  );
+  memberIds.add(Number(activeGroup.admin_id));
+  if (Array.isArray(liveMembers)) {
+    liveMembers.forEach((m: any) => memberIds.add(Number(m.user_id || m.id)));
+  }
+  
+  // Create a set of user IDs that already have pending invites or were invited this session
+  const invitedUserIds = new Set<number>([
+    ...groupInvites.map(invite => Number(invite.invitee_id)),
+    ...locallyInvitedUserIds.map(Number),
+  ]);
+
+  // Followers of currentUser
+  const myFollowerIds = new Set<number>([
+    ...((currentUser as any)?.followers || []).map(Number),
+    ...(users || [])
+      .filter((u: any) => Array.isArray(u.following) && u.following.map(Number).includes(Number(currentUser.id)))
+      .map((u: any) => Number(u.id)),
+  ]);
+
+  // If currentUser has followers, prioritize showing followers as requested; fallback to other non-members during testing
+  const candidatePool = myFollowerIds.size > 0
+    ? (users || []).filter((u: User) => myFollowerIds.has(Number(u.id)))
+    : (users || []);
+  
+  return candidatePool.filter((u: User) => {
+    if (!u?.id) return false;
+    if (Number(u.id) === Number(currentUser.id)) return false;
+    // Don't show user in invite list if they are already a member of the group
+    if (memberIds.has(Number(u.id))) return false;
+    
+    const q = inviteSearch.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      String(u.name || '').toLowerCase().includes(q) ||
+      String(u.username || '').toLowerCase().includes(q)
+    );
+  }).map(user => ({
+    ...user,
+    isInvited: invitedUserIds.has(Number(user.id))
+  }));
+}, [activeGroup, currentUser, users, inviteSearch, groupInvites, liveMembers, locallyInvitedUserIds]);
+
+    
+  // ========== HELPER FUNCTIONS ==========
+  const seededShuffle = <T,>(items: T[], seed: number) => {
+    const arr = [...items];
+    let s = seed || 1;
+    const rand = () => {
+      s = (s * 1664525 + 1013904223) % 4294967296;
+      return s / 4294967296;
+    };
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(rand() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  };
+
+  const getGroupShareLink = useCallback((group: Group | null) => {
+    if (!group) return '';
+    return `${window.location.origin}/groups/${group.id}`;
+  }, []);
+
+  const handleShareGroup = useCallback(() => {
+    if (!activeGroup) return;
+    setCopiedGroupLink(false);
+    setShowShareGroupModal(true);
+  }, [activeGroup]);
+
+  // ========== EFFECTS ==========
+  useEffect(() => {
+    if (!initialGroupId) {
+      lastHandledInitialGroupIdRef.current = null;
+      return;
+    }
+    const gid = parseInt(String(initialGroupId), 10);
+    if (Number.isNaN(gid)) return;
+    if (lastHandledInitialGroupIdRef.current === gid) return;
+    lastHandledInitialGroupIdRef.current = gid;
+
+    setActiveGroupId(gid); 
+    setView('detail'); 
+    setGroupTab('Discussion'); 
+
+    const group = safeGroups.find(g => g.id === gid);
+    if (group) { 
+      setActiveGroupDetails(normalizeGroup(group)); 
+    }
+    if (fetchGroupDetails) { 
+      fetchGroupDetails(gid) 
+        .then((details) => { 
+          if (details?.group) setActiveGroupDetails(normalizeGroup(details.group)); 
+        }) 
+        .catch((error) => { 
+          console.error('Failed to fetch initial group details:', error); 
+        }); 
+    } 
+  }, [initialGroupId, safeGroups, fetchGroupDetails]);
+
+
+  useEffect(() => { activeGroupIdRef.current = activeGroupId; }, [activeGroupId]);
+  
+  useEffect(() => {
+  setActiveGroupDetails(null);
+}, [activeGroupId]);
+
+  const loadGroupPosts = useCallback(async (force = false) => {
+    if (!activeGroup || !fetchGroupPosts) { setGroupPosts([]); return; }
+    if (postsLoadedRef.current && !force) return;
+    setLoadingPosts(true);
+    setHasMorePosts(true);
+    try {
+      const res = await fetchGroupPosts(activeGroup.id, 15, 0);
+      let postsList = [];
+      if (Array.isArray(res)) postsList = res;
+      else if (res?.posts && Array.isArray(res.posts)) postsList = res.posts;
+      else if (res?.data && Array.isArray(res.data)) postsList = res.data;
+      else if (res?.success && Array.isArray(res.posts)) postsList = res.posts;
+      const normalizedPosts = postsList.map((p: any) => normalizePost(p));
+      setGroupPosts(normalizedPosts);
+      setHasMorePosts(normalizedPosts.length >= 15);
+      postsLoadedRef.current = true;
+    } catch (error) { 
+      console.error('Failed to load group posts:', error); 
+      setGroupPosts([]); 
+      setHasMorePosts(false);
+    } finally { 
+      setLoadingPosts(false); 
+    }
+  }, [activeGroup, fetchGroupPosts]);
+
+  const loadMoreGroupPosts = useCallback(async () => {
+    if (!activeGroup || !fetchGroupPosts || loadingPosts || loadingMorePosts || !hasMorePosts) return;
+    setLoadingMorePosts(true);
+    try {
+      const offset = groupPosts.length;
+      const res = await fetchGroupPosts(activeGroup.id, 15, offset);
+      let postsList = [];
+      if (Array.isArray(res)) postsList = res;
+      else if (res?.posts && Array.isArray(res.posts)) postsList = res.posts;
+      else if (res?.data && Array.isArray(res.data)) postsList = res.data;
+      else if (res?.success && Array.isArray(res.posts)) postsList = res.posts;
+      const normalized = postsList.map((p: any) => normalizePost(p));
+      if (normalized.length < 15) {
+        setHasMorePosts(false);
+      }
+      setGroupPosts(prev => {
+        const existingIds = new Set(prev.map(p => Number(p.id)));
+        const fresh = normalized.filter(p => !existingIds.has(Number(p.id)));
+        return [...prev, ...fresh];
+      });
+    } catch (error) {
+      console.error('Failed to load more group posts:', error);
+      setHasMorePosts(false);
+    } finally {
+      setLoadingMorePosts(false);
+    }
+  }, [activeGroup, fetchGroupPosts, loadingPosts, loadingMorePosts, hasMorePosts, groupPosts.length]);
+
+  useEffect(() => {
+    if (!infiniteScrollTriggerRef.current || !hasMorePosts || loadingPosts || loadingMorePosts) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries[0].isIntersecting) {
+        loadMoreGroupPosts();
+      }
+    }, { threshold: 0.1 });
+    observer.observe(infiniteScrollTriggerRef.current);
+    return () => observer.disconnect();
+  }, [loadMoreGroupPosts, hasMorePosts, loadingPosts, loadingMorePosts]);
+
+  useEffect(() => { 
+    if (activeGroup && groupTab === 'Discussion') loadGroupPosts(); 
+  }, [activeGroup, groupTab, loadGroupPosts]);
+
+  const loadGroupMembers = useCallback(async () => {
+    if (!activeGroup?.id) return;
+    setLoadingMembers(true);
+    try {
+      const res = await apiFetch(`/api/group-members?group_id=${activeGroup.id}`);
+      if (res?.members && Array.isArray(res.members)) {
+        setLiveMembers(res.members);
+      }
+    } catch (e) {
+      console.error('Failed to fetch group members:', e);
+    } finally {
+      setLoadingMembers(false);
+    }
+  }, [activeGroup?.id]);
+
+  useEffect(() => {
+    if (activeGroup?.id) {
+      loadGroupMembers();
+    }
+  }, [activeGroup?.id, loadGroupMembers]);
+
+  const loadGroupEvents = useCallback(async (force = false) => {
+    if (!activeGroup || !fetchGroupEvents) { setGroupEvents([]); return; }
+    if (eventsLoadedRef.current && activeGroupIdRef.current === activeGroup.id && !force) return;
+    setLoadingEvents(true);
+    try {
+      const res = await fetchGroupEvents(activeGroup.id);
+      const list = Array.isArray(res) ? res : Array.isArray((res as any)?.events) ? (res as any).events : [];
+      setGroupEvents(list.map((e: any) => normalizeEvent(e)));
+      eventsLoadedRef.current = true;
+    } catch (error) { 
+      console.error('Failed to load group events:', error); 
+      setGroupEvents([]); 
+    } finally { 
+      setLoadingEvents(false); 
+    }
+  }, [activeGroup, fetchGroupEvents]);
+
+  useEffect(() => { 
+    if (activeGroup && groupTab === 'Events') loadGroupEvents(); 
+  }, [activeGroup, groupTab, loadGroupEvents]);
+
+  useEffect(() => { 
+    postsLoadedRef.current = false; 
+    eventsLoadedRef.current = false; 
+    setGroupPosts([]); 
+    setGroupEvents([]); 
+    setHasMorePosts(true);
+    setMembersLimit(10);
+    setMemberSearch('');
+  }, [activeGroupId]);
+
+  // Clean up preview URLs
+  useEffect(() => {
+    const urls = postFiles.map(file => URL.createObjectURL(file));
+    setPreviews(urls);
+    return () => { urls.forEach(url => URL.revokeObjectURL(url)); };
+  }, [postFiles]);
+
+  // ✅ FIXED: Reset modal state when closed with proper Buy/Sell defaults
+  useEffect(() => {
+    if (!showGroupPostModal) {
+      setPostContent('');
+      setPostFiles([]);
+      setPreviews([]);
+      // Reset based on category for next open
+      if (activeGroup?.category === 'buy_sell') {
+        setPostMetadata({ 
+          currency: 'USD', 
+          condition: 'Used - Good', 
+          location: '', 
+          price: '', 
+          status: 'available' 
+        });
+      } else if (activeGroup?.category === 'recruitment' || isCareerCategory(activeGroup?.category, activeGroup?.name)) {
+        setPostMetadata({ job_type: 'Full-time' });
+      } else {
+        setPostMetadata({});
+      }
+      if (postFileInputRef.current) {
+        postFileInputRef.current.value = '';
+      }
+    }
+  }, [showGroupPostModal, activeGroup?.category]);
+
+  // Load pinned groups from localStorage
+  useEffect(() => {
+    try {
+      if (typeof window === 'undefined') return;
+      const saved = window.localStorage.getItem('pinnedGroups');
+      if (saved) { 
+        const parsed = JSON.parse(saved); 
+        if (Array.isArray(parsed)) setPinnedGroups(new Set(parsed)); 
+      }
+    } catch (e) { 
+      console.error('Failed to load pinned groups:', e); 
+    }
+  }, []);
+
+  // Save pinned groups to localStorage
+  useEffect(() => {
+    try {
+      if (typeof window === 'undefined') return;
+      if (pinnedGroups.size > 0 || localStorage.getItem('pinnedGroups')) { 
+        window.localStorage.setItem('pinnedGroups', JSON.stringify(Array.from(pinnedGroups))); 
+      }
+    } catch (e) { 
+      console.error('Failed to save pinned groups:', e); 
+    }
+  }, [pinnedGroups]);
+    
+// Load invites when switching to Invites tab - no loading state
+useEffect(() => {
+  if (fbTab === 'Invites' && fetchGroupInvites && groupInvites.length === 0) {
+    fetchGroupInvites()
+      .then(setGroupInvites)
+      .catch(console.error);
+  }
+}, [fbTab, fetchGroupInvites, groupInvites.length]);
+
+    useEffect(() => {
+  setLocalGroups((groups || []).map(normalizeGroup));
+}, [groups]);
+
+
+useEffect(() => {
+  setMemberMenuOpenId(null);
+}, [groupTab, activeGroupId]);
+
+
+useEffect(() => {
+  setMemberMetaOverrides({});
+}, [activeGroupId]);
+
+useEffect(() => {
+  const handleNativeUpload = (event: any) => {
+    const media = event.detail;
+    if (!media || media.type !== 'image') return;
+    
+    const imageUrl = media.full || media.feed || media.url;
+    if (!imageUrl) return;
+    
+    console.log('📱 Groups: Native image uploaded:', imageUrl);
+    
+    if (pendingUploadTypeRef.current === 'cover') {
+      updateGroupImageWithUrl('cover', imageUrl, media);
+    } else if (pendingUploadTypeRef.current === 'profile') {
+      updateGroupImageWithUrl('profile', imageUrl, media);
+    } else if (pendingUploadTypeRef.current === 'post') {
+      // Handle post image upload
+      fetch(imageUrl)
+        .then(res => res.blob())
+        .then(blob => {
+          const file = new File([blob], `native-post-${Date.now()}.jpg`, { type: 'image/jpeg' });
+          setPostFiles(prev => [...prev, file]);
+          setPreviews(prev => [...prev, URL.createObjectURL(blob)]);
+        })
+        .catch(err => console.error('Failed to process native image for post:', err));
+    }
+    pendingUploadTypeRef.current = null;
+  };
+
+  window.addEventListener('uneraNativeUpload', handleNativeUpload);
+  return () => window.removeEventListener('uneraNativeUpload', handleNativeUpload);
+}, [activeGroup, onUpdateGroupImage, fetchGroupDetails]);
+
+    
+    
+  // ========== HANDLER FUNCTIONS ==========
+  const fetchUpdatedPost = useCallback(async (postId: number) => {
+    if (!currentUser) return;
+    try {
+      const viewerId = currentUser.id;
+      const url = `/api/posts/${postId}?viewerId=${viewerId}`;
+      const token = localStorage.getItem('unera_token');
+      const headers: HeadersInit = { 
+        'Accept': 'application/json', 
+        'Content-Type': 'application/json', 
+        ...(token ? { 'Authorization': `Bearer ${token}` } : {}) 
+      };
+      const res = await fetch(url, { headers });
+      const data = await res.json();
+      if (data && typeof data.comments_count === 'number') {
+        setGroupPosts(prev => prev.map(post => { 
+          if (post.id === postId) { 
+            return { ...post, comment_count: data.comments_count, comments_count: data.comments_count }; 
+          } 
+          return post; 
+        }));
+      }
+    } catch (error) { 
+      console.error('Failed to fetch updated post:', error); 
+    }
+  }, [currentUser]);
+    
+
+const updateGroupImageWithUrl = useCallback(async (type: 'cover' | 'profile', imageUrl: string, media: any) => {
+  if (!activeGroup) return;
+
+  const previewUrl = imageUrl;
+
+  setGroupImageOverrides(prev => ({
+    ...prev,
+    [activeGroup.id]: {
+      ...(prev[activeGroup.id] || {}),
+      ...(type === 'cover' ? { cover_image: previewUrl } : { profile_image: previewUrl }),
+    },
+  }));
+
+  try {
+    // Here you would call an API to update the group with the native URL
+    // Since the image is already uploaded by Flutter, you can send the URL directly
+    const result = await onUpdateGroupImage(activeGroup.id, type, null as any, imageUrl);
+
+    if (fetchGroupDetails) {
+      const details = await fetchGroupDetails(activeGroup.id);
+      if (details?.group) {
+        setActiveGroupDetails(normalizeGroup(details.group));
+      }
+    }
+  } catch (error: any) {
+    setGroupImageOverrides(prev => {
+      const next = { ...prev };
+      const current = { ...(next[activeGroup.id] || {}) };
+      if (type === 'cover') delete current.cover_image;
+      else delete current.profile_image;
+      next[activeGroup.id] = current;
+      return next;
+    });
+    alert(`Failed to update image: ${error?.message || 'Unknown error'}`);
+  } finally {
+    pendingUploadTypeRef.current = null;
+  }
+}, [activeGroup, onUpdateGroupImage, fetchGroupDetails]);
+    
+    
+const handleGroupClick = async (group: Group) => {
+  setActiveGroupId(group.id);
+  setView('detail');
+  setGroupTab('Discussion');
+  window.scrollTo(0, 0);
+
+  if (fetchGroupDetails) {
+    try {
+      const details = await fetchGroupDetails(group.id);
+      if (details?.group) {
+        const normalized = normalizeGroup(details.group);
+        setActiveGroupDetails(normalized);
+
+        setLocalGroups(prev =>
+          prev.map(g => Number(g.id) === Number(normalized.id) ? { ...g, ...normalized } : g)
+        );
+      }
+    } catch (error) {
+      console.error('Failed to fetch group details:', error);
+    }
+  }
+};
+
+  const handleCreateGroupClick = () => {
+    if (!currentUser) { 
+      alert('Please login to create a group'); 
+      return; 
+    }
+    setShowCategoryModal(true);
+  };
+
+  const handleCategorySelect = (category: GroupCategory) => {
+    setSelectedCategory(category);
+    setShowCategoryModal(false);
+    setShowCreateModal(true);
+  };
+
+  const handleCreateSubmit = async () => {
+    if (!newGroupName.trim() || !selectedCategory) return;
+    try {
+      await onCreateGroup({
+        name: newGroupName.trim(),
+        description: newGroupDesc.trim(),
+        type: newGroupType,
+        category: selectedCategory,
+        profile_image: `https://ui-avatars.com/api/?name=${encodeURIComponent(newGroupName)}&background=random`,
+        cover_image: 'https://images.unsplash.com/photo-1522202176988-66273c2fd55f?auto=format&fit=crop&w=1500&q=80',
+      });
+      setShowCreateModal(false);
+      setNewGroupName('');
+      setNewGroupDesc('');
+      setSelectedCategory(null);
+    } catch (error) { 
+      console.error('Failed to create group:', error); 
+    }
+  };
+ 
+  const handleInviteUser = async (userId: number) => {
+    if (!activeGroup) return;
+    try {
+      setInvitingUserIds(prev => [...prev, userId]);
+      setLocallyInvitedUserIds(prev => [...prev, userId]);
+      if (onInviteToGroup) {
+        await onInviteToGroup(activeGroup.id, [userId]);
+      } else {
+        await apiFetch('/api/group-invites', {
+          method: 'POST',
+          body: JSON.stringify({ group_id: activeGroup.id, invitee_id: userId, inviter_id: currentUser?.id })
+        });
+      }
+
+      // Refresh invites list to update the "Invited" status
+      if (fetchGroupInvites) {
+        const updatedInvites = await fetchGroupInvites().catch(() => []);
+        if (Array.isArray(updatedInvites)) setGroupInvites(updatedInvites);
+      }
+    } catch (error) {
+      console.error('Failed to invite user:', error);
+    } finally {
+      setInvitingUserIds(prev => prev.filter(id => id !== userId));
+    }
+  };
+
+
+  // ✅ FIXED: Submit post handler with proper Buy/Sell metadata
+  const handlePostSubmit = async () => {
+    if (!activeGroup) return;
+    if (!postContent.trim() && postFiles.length === 0) return;
+
+    let metadata: any = {};
+
+    if (activeGroup.category === 'buy_sell') {
+      metadata = {
+        price: postMetadata.price !== undefined && postMetadata.price !== null && String(postMetadata.price).trim() !== '' ? Number(postMetadata.price) : null,
+        currency: postMetadata.currency || 'USD',
+        condition: postMetadata.condition || 'Used - Good',
+        location: (postMetadata.location || '').trim(),
+        status: postMetadata.status || 'available',
+      };
+    } else if (activeGroup.category === 'recruitment' || isCareerCategory(activeGroup.category, activeGroup.name)) {
+      const hasAppVal = Boolean(postMetadata.application_value && String(postMetadata.application_value).trim().length > 0);
+      const appType = hasAppVal ? (postMetadata.application_type || 'link') : undefined;
+      const appVal = hasAppVal ? String(postMetadata.application_value).trim() : undefined;
+      metadata = {
+        job_title: postMetadata.job_title,
+        company: postMetadata.company,
+        street: postMetadata.street,
+        district: postMetadata.district,
+        region: postMetadata.region,
+        country: postMetadata.country,
+        location: (postMetadata.location || [postMetadata.street, postMetadata.district, postMetadata.region, postMetadata.country].filter(Boolean).join(', ') || '').trim(),
+        salary: postMetadata.salary,
+        job_type: postMetadata.job_type,
+        application_type: appType,
+        application_value: appVal,
+        expiry_date: postMetadata.expiry_date,
+      };
+    }
+
+    const targetGroupId = activeGroup.id;
+    const contentToSend = postContent.trim();
+    const filesToSend = [...postFiles];
+    const metadataToSend = { ...metadata };
+
+    // Immediately close modal and reset inputs so the user can continue exploring feeds/group data without waiting
+    setShowGroupPostModal(false);
+    setPostContent('');
+    setPostFiles([]);
+    setPreviews([]);
+    if (activeGroup.category === 'buy_sell') {
+      setPostMetadata({ 
+        currency: 'USD', 
+        condition: 'Used - Good', 
+        location: '', 
+        price: '', 
+        status: 'available' 
+      });
+    } else {
+      setPostMetadata({});
+    }
+    if (postFileInputRef.current) postFileInputRef.current.value = '';
+
+    // Asynchronously submit with progress bar and percent counter
+    onPostToGroup(targetGroupId, contentToSend, filesToSend, metadataToSend)
+      .then(() => {
+        postsLoadedRef.current = false;
+        loadGroupPosts(true);
+      })
+      .catch((error: any) => {
+        console.error('Failed to create group post:', error);
+      });
+  };
+
+const compressGroupImage = async (file: File, type: 'cover' | 'profile'): Promise<File> => {
+  if (file.type === 'image/gif' || file.type === 'image/svg+xml') {
+    return file;
+  }
+  try {
+    const maxWidth = type === 'cover' ? 1920 : 800;
+    const quality = type === 'cover' ? 0.88 : 0.88;
+    return await buildCompressedImageFile(file, maxWidth, quality, type);
+  } catch (err) {
+    console.warn('Image compression fallback to original file:', err);
+    return file;
+  }
+};
+
+const handleImageChange = async (e: React.ChangeEvent<HTMLInputElement>, type: 'cover' | 'profile') => {
+  const rawFile = e.target.files?.[0];
+  if (!rawFile || !activeGroup) return;
+
+  const file = await compressGroupImage(rawFile, type);
+  const previewUrl = URL.createObjectURL(file);
+
+  setGroupImageOverrides(prev => ({
+    ...prev,
+    [activeGroup.id]: {
+      ...(prev[activeGroup.id] || {}),
+      ...(type === 'cover' ? { cover_image: previewUrl } : { profile_image: previewUrl }),
+    },
+  }));
+
+  try {
+    const result = await onUpdateGroupImage(activeGroup.id, type, file);
+
+    const finalUrl =
+      typeof result === 'string'
+        ? result
+        : result?.cover_image || result?.profile_image || result?.image_url || result?.url || result?.group?.cover_image || result?.group?.profile_image || null;
+
+    if (!finalUrl) {
+      throw new Error('No image URL returned after upload');
+    }
+
+    setGroupImageOverrides(prev => ({
+      ...prev,
+      [activeGroup.id]: {
+        ...(prev[activeGroup.id] || {}),
+        ...(type === 'cover' ? { cover_image: finalUrl } : { profile_image: finalUrl }),
+      },
+    }));
+
+    if (fetchGroupDetails) {
+      const details = await fetchGroupDetails(activeGroup.id);
+      if (details?.group) {
+        setActiveGroupDetails(normalizeGroup(details.group));
+      }
+    }
+
+    URL.revokeObjectURL(previewUrl);
+  } catch (error: any) {
+    setGroupImageOverrides(prev => {
+      const next = { ...prev };
+      const current = { ...(next[activeGroup.id] || {}) };
+      if (type === 'cover') delete current.cover_image;
+      else delete current.profile_image;
+      next[activeGroup.id] = current;
+      return next;
+    });
+
+    URL.revokeObjectURL(previewUrl);
+
+    alert(
+      `Failed to update image\n\n${
+        error?.message ||
+        error?.error ||
+        (typeof error === 'string' ? error : JSON.stringify(error))
+      }`
+    );
+  } finally {
+    e.target.value = '';
+  }
+};
+                                                    
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => { 
+    if (e.target.files) {
+      const selected = Array.from(e.target.files) as File[];
+      const imageFiles = selected.filter(f => f.type.startsWith('image/'));
+      const hasVideo = selected.some(f => f.type.startsWith('video/') || /\.(mp4|webm|mov|m4v|avi|mkv|3gp)$/i.test(f.name));
+      if (hasVideo) {
+        alert('Video uploads are disabled in groups. Only photos can be posted.');
+      }
+      setPostFiles(imageFiles);
+    }
+  };
+  
+  const handleRemoveFile = (index: number) => setPostFiles(prev => prev.filter((_, i) => i !== index));
+
+  const handleCreateEvent = async (eventData: Partial<Event>) => {
+    if (!activeGroup || !currentUser) return;
+    try { 
+      const created = await onCreateGroupEvent(activeGroup.id, { 
+        ...eventData, 
+        created_by: currentUser.id, 
+        group_id: activeGroup.id,
+        visibility: 'group',
+      }); 
+      setShowEventModal(false); 
+      setGroupTab('Events');
+      if (created) {
+        setGroupEvents(prev => [created, ...prev.filter(e => Number(e.id) !== Number(created.id))]);
+      }
+      eventsLoadedRef.current = false; 
+      loadGroupEvents(true); 
+    } catch (error) { 
+      console.error('Failed to create event:', error); 
+      throw error; 
+    }
+  };
+
+  const handleEventRSVP = async (eventId: number, status: string) => {
+    try { 
+      const meId = currentUser?.id;
+      if (status === 'going') {
+        await apiFetch(`/api/group-events/${eventId}/attend`, {
+          method: 'POST',
+          body: JSON.stringify({ event_id: eventId, user_id: meId, action: 'attend' })
+        }).catch(() => {});
+        await apiFetch(`/api/group-events/${eventId}/interested`, {
+          method: 'POST',
+          body: JSON.stringify({ event_id: eventId, user_id: meId, action: 'remove' })
+        }).catch(() => {});
+      } else if (status === 'interested') {
+        await apiFetch(`/api/group-events/${eventId}/interested`, {
+          method: 'POST',
+          body: JSON.stringify({ event_id: eventId, user_id: meId, action: 'interested' })
+        }).catch(() => {});
+        await apiFetch(`/api/group-events/${eventId}/attend`, {
+          method: 'POST',
+          body: JSON.stringify({ event_id: eventId, user_id: meId, action: 'remove' })
+        }).catch(() => {});
+      } else {
+        await apiFetch(`/api/group-events/${eventId}/attend`, {
+          method: 'POST',
+          body: JSON.stringify({ event_id: eventId, user_id: meId, action: 'remove' })
+        }).catch(() => {});
+        await apiFetch(`/api/group-events/${eventId}/interested`, {
+          method: 'POST',
+          body: JSON.stringify({ event_id: eventId, user_id: meId, action: 'remove' })
+        }).catch(() => {});
+      }
+
+      if (onEventRSVP) {
+        await onEventRSVP(eventId, status);
+      }
+
+      setGroupEvents(prev => prev.map(event => { 
+        if (event.id === eventId) { 
+          return { 
+            ...event, 
+            user_rsvp_status: status === 'not_going' ? '' : status, 
+            attendees: status === 'going' 
+              ? Array.from(new Set([...(event.attendees || []), currentUser?.id]))
+              : (event.attendees || []).filter(id => id !== currentUser?.id) 
+          } as any; 
+        } 
+        return event; 
+      })); 
+    } catch (error) { 
+      console.error('Failed to RSVP to event:', error); 
+    }
+  };
+
+const handleJoinGroup = async () => {
+  if (!activeGroup) return;
+  if (!currentUser) {
+    alert('Please login to join groups');
+    return;
+  }
+  if (joining) return;
+
+  setJoining(true);
+
+  const meId = Number(currentUser.id);
+
+  try {
+    await onJoinGroup(activeGroup.id);
+
+    // optimistic local update for all lists immediately
+    setLocalGroups(prev =>
+      prev.map(g => {
+        if (Number(g.id) !== Number(activeGroup.id)) return g;
+
+        const members = Array.isArray(g.members) ? g.members : [];
+        const nextMembers = members.includes(meId) ? members : [...members, meId];
+
+        return {
+          ...g,
+          is_member: true,
+          members: nextMembers,
+          members_count: Math.max(Number(g.members_count || 0), nextMembers.length),
+        };
+      })
+    );
+
+    postsLoadedRef.current = false;
+    eventsLoadedRef.current = false;
+
+    if (fetchGroupDetails) {
+      const details = await fetchGroupDetails(activeGroup.id);
+      if (details?.group) {
+        const normalized = normalizeGroup(details.group);
+        setActiveGroupDetails(normalized);
+
+        setLocalGroups(prev =>
+          prev.map(g => Number(g.id) === Number(normalized.id) ? { ...g, ...normalized } : g)
+        );
+      }
+    }
+
+    await loadGroupPosts(true);
+    if (groupTab === 'Events') await loadGroupEvents(true);
+  } catch (error) {
+    console.error('Failed to join group:', error);
+    alert('Failed to join group. Please try again.');
+  } finally {
+    setJoining(false);
+  }
+};
+
+const handleLeaveGroup = async () => {
+  if (!activeGroup) return;
+  if (!currentUser) {
+    alert('Please login to leave groups');
+    return;
+  }
+  if (leaving) return;
+  if (!confirm('Are you sure you want to leave this group?')) return;
+
+  setLeaving(true);
+
+  const meId = Number(currentUser.id);
+
+  try {
+    await onLeaveGroup(activeGroup.id);
+
+    // optimistic local update for all lists immediately
+    setLocalGroups(prev =>
+      prev.map(g => {
+        if (Number(g.id) !== Number(activeGroup.id)) return g;
+
+        const members = Array.isArray(g.members) ? g.members : [];
+        const nextMembers = members.filter(id => Number(id) !== meId);
+
+        return {
+          ...g,
+          is_member: false,
+          members: nextMembers,
+          members_count: nextMembers.length,
+        };
+      })
+    );
+
+    setGroupPosts([]);
+    setGroupEvents([]);
+    postsLoadedRef.current = false;
+    eventsLoadedRef.current = false;
+
+    if (fetchGroupDetails) {
+      const details = await fetchGroupDetails(activeGroup.id);
+      if (details?.group) {
+        const normalized = normalizeGroup(details.group);
+        setActiveGroupDetails(normalized);
+
+        setLocalGroups(prev =>
+          prev.map(g => Number(g.id) === Number(normalized.id) ? { ...g, ...normalized } : g)
+        );
+      } else {
+        setActiveGroupDetails(null);
+      }
+    }
+  } catch (error) {
+    console.error('Failed to leave group:', error);
+    alert('Failed to leave group. Please try again.');
+  } finally {
+    setLeaving(false);
+  }
+};
+
+
+  const handleOpenComments = (postId: number) => {
+    const post = groupPosts.find(p => p.id === postId);
+    if (!post) return;
+    const author = users.find(u => u.id === post.user_id);
+    if (!author) return;
+    const effectivePost = {
+      ...post,
+      group_id: post.group_id || activeGroup?.id || activeGroupId,
+      source: 'group_post',
+      item_type: 'group_post',
+      onCommentAdded: () => fetchUpdatedPost(postId)
+    };
+    setSelectedPost(effectivePost);
+    setSelectedPostAuthor(author);
+    setShowPostView(true);
+  };
+
+  const handleLikePost = async (postId: number, type?: ReactionType) => { 
+    if (!currentUser) return; 
+    try { 
+      await onLikePost(postId, type); 
+    } catch (error) { 
+      console.error('Failed to like post:', error); 
+    } 
+  };
+
+  const handleSharePost = async (postId: number, newShareCount: number) => {
+    try {
+      await onSharePost(postId, newShareCount);
+      setGroupPosts(prev => prev.map(post => { 
+        if (post.id === postId) return { ...post, shares: newShareCount } as any; 
+        return post; 
+      }));
+      if (selectedPost && selectedPost.id === postId) {
+        setSelectedPost(prev => prev ? { ...prev, shares: newShareCount } as any : null);
+      }
+    } catch (error) { 
+      console.error('Failed to share post:', error); 
+    }
+  };
+
+  const handleDeletePost = async (postId: number) => {
+    if (!activeGroup) return;
+    if (!confirm('Are you sure you want to delete this post?')) return;
+    try { 
+      await onDeleteGroupPost(activeGroup.id, postId); 
+      setGroupPosts(prev => prev.filter(post => post.id !== postId)); 
+      if (selectedPost && selectedPost.id === postId) { 
+        setShowPostView(false); 
+        setSelectedPost(null); 
+      } 
+    } catch (error) { 
+      console.error('Failed to delete post:', error); 
+    }
+  };
+
+  const handleEditPost = async (postId: number, content: string) => {
+    if (!onEditGroupPost) return;
+    try { 
+      await onEditGroupPost(postId, content); 
+      setGroupPosts(prev => prev.map(post => { 
+        if (post.id === postId) return { ...post, content } as any; 
+        return post; 
+      }));
+      if (selectedPost && selectedPost.id === postId) {
+        setSelectedPost(prev => prev ? { ...prev, content } as any : null);
+      }
+    } catch (error) { 
+      console.error('Failed to edit post:', error); 
+      throw error; 
+    }
+  };
+
+  const handleReportPost = async (postId: number) => { 
+    if (!onReportGroupPost) return; 
+    try { 
+      await onReportGroupPost(postId); 
+    } catch (error) { 
+      console.error('Failed to report post:', error); 
+      throw error; 
+    } 
+  };
+
+  const handlePostImageClick = () => {
+    postFileInputRef.current?.click();
+  };  
+
+    //=== GROUP ADMIN HANDLERS ===
+
+const canUserPost = useCallback((userId: number) => {
+  if (!activeGroup || !userId) return false;
+  const isOwner = Number(userId) === Number(activeGroup.admin_id);
+  if (isOwner) return true; // Owner can always post
+
+  const override = memberMetaOverrides[Number(userId)];
+  const liveMem = liveMembers.find(m => Number(m.user_id || m.id) === Number(userId));
+  const role = override?.group_role || liveMem?.group_role || (isOwner ? 'admin' : 'member');
+  const isGroupAdminUser = role === 'admin' || currentUser?.role === 'admin';
+  if (isGroupAdminUser) return true; // Group admins can always post
+
+  // If member posting is disabled globally in this group:
+  if (activeGroup.member_posting_allowed === false) return false;
+
+  // If member is individually restricted from posting:
+  if (override?.posting_disabled !== undefined) {
+    return !override.posting_disabled;
+  }
+  if (liveMem) {
+    const isDis = liveMem.posting_disabled === 1 || liveMem.posting_disabled === true || liveMem.posting_disabled === '1' || liveMem.posting_disabled === 'true';
+    if (isDis) return false;
+  }
+  return true;
+}, [activeGroup, memberMetaOverrides, liveMembers, currentUser]);
+    
+  const handleViewImage = (url: string, index?: number) => { 
+    if (onViewImage) onViewImage(url); 
+  };
+  
+  const isAdmin = currentUser?.role === 'admin';
+
+  const togglePinGroup = (groupId: number, e: React.MouseEvent) => { 
+    e.stopPropagation(); 
+    setPinnedGroups(prev => { 
+      const newSet = new Set(prev); 
+      if (newSet.has(groupId)) newSet.delete(groupId); 
+      else newSet.add(groupId); 
+      return newSet; 
+    }); 
+  };
+
+  const computeVisits = (g: Group) => Number((g as any)?.visits ?? ((g.posts?.length ?? 0) * 5 + (g.members?.length ?? 0)));
+  const computeLastActive = (g: Group) => { 
+    const fromField = Number((g as any)?.lastActiveAt ?? 0); 
+    if (fromField) return fromField; 
+    const newest = (g.posts ?? [])
+      .map((p: any) => new Date(p?.created_at ?? 0).getTime())
+      .filter((t: number) => Number.isFinite(t))
+      .sort((a: number, b: number) => b - a)[0];
+    return newest || 0; 
+  };
+
+    //===NEW POST COUNT=== will be added later 
+const formatNewPostsText = (g: Group) => { 
+  return '';
+};
+    
+  const hasNewPosts = (g: Group) => Number((g as any)?.newPostsCount ?? 0) > 0;
+
+  const sortedGroups = useMemo(() => {
+    if (sortMode === 'Alphabetical') return [...safeGroups].sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+    if (sortMode === 'Recently active') return [...safeGroups].sort((a, b) => computeLastActive(b) - computeLastActive(a));
+    return [...safeGroups].sort((a, b) => computeVisits(b) - computeVisits(a));
+  }, [safeGroups, sortMode]);
+
+  const getCategoryIcon = (category?: GroupCategory) => { 
+    const cat = GROUP_CATEGORIES.find(c => c.id === category); 
+    return cat?.icon || 'fas fa-users'; 
+  };
+  
+  const getCategoryColor = (category?: GroupCategory) => { 
+    const cat = GROUP_CATEGORIES.find(c => c.id === category); 
+    return cat?.color || '#1877F2'; 
+  };
+
+
+    // ========== FEED VIEW RENDER ==========
+
+  if (view === 'feed' || !activeGroup) {
+  return (
+    <>
+      <div className="w-full bg-[#050B18] min-h-screen font-sans pb-24">
+        {/* Header */}
+        <div className="sticky top-0 z-[50] bg-[#0F172A] border-b border-[#1E293B]">
+          <div className="max-w-[900px] mx-auto px-4">
+            <div className="h-14 flex items-center justify-between">
+              <button
+                className="w-10 h-10 rounded-full flex items-center justify-center hover:bg-[#141E33] active:scale-95 transition"
+                onClick={() => {
+                  if (view === 'detail') {
+                    setView('feed');
+                    setActiveGroupId(null);
+                  } else {
+                    window.history.back();
+                  }
+                }}
+                aria-label="Back"
+              >
+                <i className="fas fa-arrow-left text-[18px] text-[#F8FAFC]"></i>
+              </button>
+
+              <div className="text-[20px] font-extrabold text-[#F8FAFC]">Groups</div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  className="w-10 h-10 rounded-full flex items-center justify-center hover:bg-[#141E33] active:scale-95 transition"
+                  onClick={handleCreateGroupClick}
+                  aria-label="Create"
+                >
+                  <i className="fas fa-plus text-[18px] text-[#F8FAFC]"></i>
+                </button>
+
+                <button
+                  className="w-10 h-10 rounded-full flex items-center justify-center hover:bg-[#141E33] active:scale-95 transition"
+                  onClick={() => {
+                    const el = document.getElementById('groupsSearchInput');
+                    (el as HTMLInputElement | null)?.focus();
+                  }}
+                  aria-label="Search"
+                >
+                  <i className="fas fa-search text-[18px] text-[#F8FAFC]"></i>
+                </button>
+              </div>
+            </div>
+
+            {/* Tabs - Only 3 tabs */}
+            <div className="flex gap-2 overflow-x-auto pb-3 pt-1 scrollbar-hide">
+              {(['Your groups', 'Discover', 'Invites'] as const).map(tab => {
+                const active = fbTab === tab;
+                return (
+                  <button
+                    key={tab}
+                    onClick={() => setFbTab(tab)}
+                    className={
+                      active
+                        ? 'px-4 py-2 rounded-full bg-[#1877f2] text-white font-extrabold whitespace-nowrap'
+                        : 'px-2 py-2 text-[#94A3B8] font-bold whitespace-nowrap hover:text-[#F8FAFC] transition-colors'
+                    }
+                  >
+                    {tab}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Search input */}
+            <div className="pb-3">
+              <div className="relative">
+                <i className="fas fa-search absolute left-3 top-1/2 -translate-y-1/2 text-[#94A3B8] text-sm"></i>
+                <input
+                  id="groupsSearchInput"
+                  value={searchQuery}
+                  onChange={e => setSearchQuery(e.target.value)}
+                  placeholder="Search Groups"
+                  className="w-full bg-[#1E293B] rounded-full pl-9 pr-4 py-2.5 outline-none text-[15px] text-[#F8FAFC] placeholder-[#64748B]"
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {uploadState && (
+          <div className="max-w-[900px] mx-auto px-4 pt-3">
+            <PostUploadProgressBanner
+              uploadState={uploadState}
+              onDismiss={onDismissUpload}
+            />
+          </div>
+        )}
+
+        {/* Content */}
+        <div className="max-w-[900px] mx-auto">
+          {(() => {
+            // ========== INVITES TAB ==========
+            if (fbTab === 'Invites') {
+              if (!fetchGroupInvites) {
+                return (
+                  <div className="px-4">
+                    <div className="pt-3 pb-2">
+                      <div className="text-[20px] font-extrabold text-[#F8FAFC]">Group Invites</div>
+                      <div className="text-[#94A3B8] text-sm">Invites feature is not available</div>
+                    </div>
+                    <div className="py-16 text-center text-[#94A3B8]">
+                      <div className="text-[15px]">Please refresh the page or try again later.</div>
+                    </div>
+                  </div>
+                );
+              }
+
+              return (
+                <div className="px-4">
+                  <div className="pt-3 pb-2">
+                    <div className="text-[20px] font-extrabold text-[#F8FAFC]">Group Invites</div>
+                    <div className="text-[#94A3B8] text-sm">Groups you've been invited to join</div>
+                  </div>
+                  
+                  {loadingInvites ? (
+                    <div className="py-16 text-center text-[#94A3B8]">
+                      <div className="w-12 h-12 mx-auto mb-4 border-2 border-[#1877f2] border-t-transparent rounded-full animate-spin"></div>
+                      <div className="text-[15px]">Loading invites...</div>
+                    </div>
+                  ) : groupInvites && groupInvites.length > 0 ? (
+                    <div className="space-y-3">
+                      {groupInvites.map((invite: any) => {
+                        const group = normalizeGroup(invite.group || invite);
+                        const inviter = users.find(u => Number(u.id) === Number(invite.inviter_id));
+                        const isLoading = (acceptingInviteId === invite.id) || (decliningInviteId === invite.id);
+                        
+                        return (
+                          <div key={invite.id || `${group.id}-${invite.inviter_id}`} className="bg-[#0F172A] rounded-xl border border-[#1E293B] overflow-hidden hover:border-[#334155] transition-all">
+                            <div className="h-[120px] bg-[#1E293B] relative">
+                              <img 
+                                src={group.cover_image || 'https://images.unsplash.com/photo-1522202176988-66273c2fd55f?auto=format&fit=crop&w=1500&q=80'} 
+                                className="w-full h-full object-cover" 
+                                alt="" 
+                              />
+                              <div className="absolute bottom-3 left-3 px-2 py-1 bg-black/60 backdrop-blur-sm rounded-lg text-xs text-white">
+                                <i className={getCategoryIcon?.(group.category) || 'fas fa-users'}></i>
+                                <span className="ml-1">{GROUP_CATEGORIES.find(c => c.id === group.category)?.label || 'General'}</span>
+                              </div>
+                            </div>
+                            <div className="p-4">
+                              <div className="flex items-center gap-3 mb-3">
+                                <img 
+                                  src={group.profile_image || `https://ui-avatars.com/api/?name=${encodeURIComponent(group.name || 'Group')}&background=random`} 
+                                  className="w-14 h-14 rounded-xl object-cover border-2 border-[#1877f2]" 
+                                  alt="" 
+                                />
+                                <div className="min-w-0 flex-1">
+                                  <div className="text-[#F8FAFC] font-extrabold text-[18px] truncate">{group.name}</div>
+                                  <div className="text-[#94A3B8] text-sm">{group.members_count || 0} members</div>
+                                  {inviter && (
+                                    <div className="text-[#94A3B8] text-xs mt-1 flex items-center gap-1">
+                                      <i className="fas fa-user-plus text-[#45BD62] text-[10px]"></i>
+                                      <span>Invited by {inviter.name || inviter.username}</span>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                              <p className="text-[#94A3B8] text-sm mb-4 line-clamp-2">{group.description || 'No description provided'}</p>
+                              <div className="flex gap-3">
+                                <button
+                                  onClick={async () => {
+                                    if (!onAcceptGroupInvite) {
+                                      alert('Accept invite function not available');
+                                      return;
+                                    }
+                                    setAcceptingInviteId(invite.id);
+                                    try {
+                                      await onAcceptGroupInvite(invite.id, group.id);
+                                      setGroupInvites((prev: any[]) => prev.filter(i => i.id !== invite.id));
+                                      alert(`You joined "${group.name}"!`);
+                                    } catch (error) {
+                                      console.error('Failed to accept invite:', error);
+                                      alert('Failed to join group. Please try again.');
+                                    } finally {
+                                      setAcceptingInviteId(null);
+                                    }
+                                  }}
+                                  disabled={isLoading}
+                                  className="flex-1 bg-[#1877f2] text-white py-2.5 rounded-lg font-bold hover:bg-[#166fe5] transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
+                                >
+                                  {isLoading && acceptingInviteId === invite.id ? (
+                                    <i className="fas fa-spinner fa-spin"></i>
+                                  ) : (
+                                    <i className="fas fa-check"></i>
+                                  )}
+                                  Accept & Join
+                                </button>
+                                <button
+                                  onClick={async () => {
+                                    if (!onDeclineGroupInvite) {
+                                      alert('Decline invite function not available');
+                                      return;
+                                    }
+                                    setDecliningInviteId(invite.id);
+                                    try {
+                                      await onDeclineGroupInvite(invite.id);
+                                      setGroupInvites((prev: any[]) => prev.filter(i => i.id !== invite.id));
+                                    } catch (error) {
+                                      console.error('Failed to decline invite:', error);
+                                      alert('Failed to decline invite. Please try again.');
+                                    } finally {
+                                      setDecliningInviteId(null);
+                                    }
+                                  }}
+                                  disabled={isLoading}
+                                  className="flex-1 bg-[#1E293B] text-[#F8FAFC] py-2.5 rounded-lg font-bold hover:bg-[#334155] transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
+                                >
+                                  {isLoading && decliningInviteId === invite.id ? (
+                                    <i className="fas fa-spinner fa-spin"></i>
+                                  ) : (
+                                    <i className="fas fa-times"></i>
+                                  )}
+                                  Reject
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div className="py-16 text-center text-[#94A3B8]">
+                      <div className="w-20 h-20 mx-auto mb-4 bg-[#1E293B] rounded-full flex items-center justify-center">
+                        <i className="fas fa-envelope-open-text text-3xl text-[#94A3B8]"></i>
+                      </div>
+                      <div className="text-[18px] font-bold text-[#F8FAFC] mb-2">No pending invites</div>
+                      <div className="text-[15px]">When someone invites you to a group, it will appear here.</div>
+                    </div>
+                  )}
+                </div>
+              );
+            }
+
+            // ========== DISCOVER TAB ==========
+            if (fbTab === 'Discover') {
+              const base = currentUser ? safeGroups.filter(g => {
+                if (Number(g.admin_id) === Number(currentUser.id)) return false;
+                if (
+                  g.is_member === true ||
+                  (Array.isArray(g.members) &&
+                    g.members.map((id: any) => Number(id)).includes(Number(currentUser.id)))
+                ) return false;
+                return true;
+              }) : safeGroups;
+              
+              const todaySeed = Number(currentUser?.id || 1) + Number(new Date().toISOString().slice(0, 10).replace(/-/g, ''));
+              const shuffledList = seededShuffle(base, todaySeed);
+              
+              // Apply professional search filter
+              const searchKey = (discoverSearch || searchQuery).trim().toLowerCase();
+              let displayList = shuffledList;
+              if (searchKey) {
+                displayList = displayList.filter((g: any) => 
+                  (g.name || '').toLowerCase().includes(searchKey) ||
+                  (g.description || '').toLowerCase().includes(searchKey) ||
+                  (g.category || '').toLowerCase().includes(searchKey)
+                );
+              }
+
+              const pagedList = displayList.slice(0, discoverLimit);
+              
+              return (
+                <div className="px-4">
+                  {/* Professional Search on top */}
+                  <div className="pt-3 pb-2">
+                    <div className="relative mb-3">
+                      <i className="fas fa-search absolute left-3.5 top-1/2 -translate-y-1/2 text-[#94A3B8] text-sm"></i>
+                      <input
+                        type="text"
+                        value={discoverSearch}
+                        onChange={(e) => {
+                          setDiscoverSearch(e.target.value);
+                          setDiscoverLimit(10);
+                        }}
+                        placeholder="Search groups to discover by name or topic..."
+                        className="w-full bg-[#0F172A] border border-[#1E293B] focus:border-[#1877f2] rounded-xl pl-10 pr-10 py-2.5 text-sm text-[#F8FAFC] placeholder-[#94A3B8] outline-none transition-colors shadow-sm"
+                      />
+                      {discoverSearch && (
+                        <button
+                          onClick={() => {
+                            setDiscoverSearch('');
+                            setDiscoverLimit(10);
+                          }}
+                          className="absolute right-3.5 top-1/2 -translate-y-1/2 text-[#94A3B8] hover:text-[#F8FAFC] text-sm"
+                        >
+                          <i className="fas fa-times"></i>
+                        </button>
+                      )}
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <div className="text-[20px] font-extrabold text-[#F8FAFC]">Discover Groups</div>
+                        <div className="text-[#94A3B8] text-sm">Groups you might like ({displayList.length})</div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {pagedList.length > 0 ? (
+                    <div className="space-y-1">
+                      {pagedList.map((g: any) => {
+                        const categoryColor = getCategoryColor(g.category);
+                        const categoryIcon = getCategoryIcon(g.category);
+                        return (
+                          <button
+                            key={g.id}
+                            onClick={() => handleGroupClick(g)}
+                            className="w-full flex items-center gap-3 py-3 hover:bg-[#141E33] rounded-lg transition-colors group px-2"
+                          >
+                            <div className="w-12 h-12 rounded-full overflow-hidden bg-[#1E293B] flex items-center justify-center shrink-0">
+                              {g.profile_image ? (
+                                <img src={g.profile_image} className="w-full h-full object-cover" alt="" />
+                              ) : (
+                                <span className="text-[#F8FAFC] font-extrabold">
+                                  {(g.name || 'G').slice(0, 1).toUpperCase()}
+                                </span>
+                              )}
+                            </div>
+                            <div className="flex-1 min-w-0 text-left">
+                              <div className="flex items-center gap-2">
+                                <span className="text-[18px] font-extrabold text-[#F8FAFC] truncate">
+                                  {g.name}
+                                </span>
+                                <i className={categoryIcon} style={{ color: categoryColor, fontSize: '12px' }}></i>
+                              </div>
+                              <div className="flex items-center gap-2 mt-0.5">
+                                <div className="text-[15px] text-[#94A3B8] truncate">
+                                  {g.members_count || 0} members
+                                </div>
+                              </div>
+                            </div>
+                            <div className="w-10 h-10 rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100">
+                              <i className="fas fa-chevron-right text-[#94A3B8]"></i>
+                            </div>
+                          </button>
+                        );
+                      })}
+
+                      {displayList.length > discoverLimit && (
+                        <div className="pt-3 pb-6 text-center">
+                          <button
+                            onClick={() => setDiscoverLimit(prev => prev + 10)}
+                            className="w-full py-3 bg-[#0F172A] hover:bg-[#1E293B] text-[#F8FAFC] rounded-xl font-bold text-sm transition-all border border-[#1E293B] flex items-center justify-center gap-2 shadow-sm"
+                          >
+                            <span>See More Groups</span>
+                            <span className="text-xs text-[#94A3B8]">({displayList.length - discoverLimit} remaining)</span>
+                            <i className="fas fa-chevron-down text-xs text-[#94A3B8]"></i>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="py-16 text-center text-[#94A3B8]">
+                      <div className="text-[18px] font-bold text-[#F8FAFC] mb-2">No groups to discover</div>
+                      <div className="text-[15px]">Check back later for new groups!</div>
+                    </div>
+                  )}
+                </div>
+              );
+            }
+
+            // ========== YOUR GROUPS TAB ==========
+            // Split into Created and Joined groups
+            let createdGroups = currentUser
+              ? safeGroups.filter(g => Number(g.admin_id) === Number(currentUser.id))
+              : [];
+
+            let joinedGroups = currentUser
+              ? safeGroups.filter(g =>
+                  Number(g.admin_id) !== Number(currentUser.id) &&
+                  (
+                    g.is_member === true ||
+                    (Array.isArray(g.members) &&
+                      g.members.map((id: any) => Number(id)).includes(Number(currentUser.id)))
+                  )
+                )
+              : [];
+
+            // Apply search filter
+            if (searchQuery.trim()) {
+              const q = searchQuery.toLowerCase();
+              createdGroups = createdGroups.filter(g => (g.name || '').toLowerCase().includes(q));
+              joinedGroups = joinedGroups.filter(g => (g.name || '').toLowerCase().includes(q));
+            }
+
+            const totalYourGroups = createdGroups.length + joinedGroups.length;
+            const hasGroups = totalYourGroups > 0;
+
+            // Apply 10 groups limit then See More
+            let visibleCreated = createdGroups;
+            let visibleJoined = joinedGroups;
+            if (totalYourGroups > yourGroupsLimit) {
+              if (createdGroups.length >= yourGroupsLimit) {
+                visibleCreated = createdGroups.slice(0, yourGroupsLimit);
+                visibleJoined = [];
+              } else {
+                visibleCreated = createdGroups;
+                visibleJoined = joinedGroups.slice(0, yourGroupsLimit - createdGroups.length);
+              }
+            }
+
+            return (
+              <div className="px-4">
+                {/* Sort button */}
+                <div className="flex items-center justify-between pt-2 pb-2">
+                  <div className="text-[20px] font-extrabold text-[#F8FAFC]">Your groups</div>
+                  <button
+                    onClick={() => setSortOpen(true)}
+                    className="text-[#1877f2] font-bold text-[18px] active:opacity-70 hover:text-[#166fe5] transition-colors"
+                  >
+                    Sort
+                  </button>
+                </div>
+
+                <div className="border-b border-[#1E293B] my-3" />
+
+                {/* Created by you section */}
+                {visibleCreated.length > 0 && (
+                  <div className="mb-6">
+                    <div className="flex items-center gap-2 mb-3">
+                      <i className="fas fa-user-plus text-[#1877f2] text-sm"></i>
+                      <div className="text-[16px] font-bold text-[#F8FAFC]">Created by you</div>
+                      <span className="text-[13px] text-[#94A3B8]">({createdGroups.length})</span>
+                    </div>
+                    <div className="space-y-1">
+                      {visibleCreated.map(g => {
+                        const categoryColor = getCategoryColor(g.category);
+                        const categoryIcon = getCategoryIcon(g.category);
+                        const isPinned = pinnedGroups.has(g.id);
+                        return (
+                          <button
+                            key={g.id}
+                            onClick={() => handleGroupClick(g)}
+                            className="w-full flex items-center gap-3 py-3 hover:bg-[#141E33] rounded-lg transition-colors group px-2"
+                          >
+                            <div className="w-12 h-12 rounded-full overflow-hidden bg-[#1E293B] flex items-center justify-center shrink-0 relative">
+                              {g.profile_image ? (
+                                <img src={g.profile_image} className="w-full h-full object-cover" alt="" />
+                              ) : (
+                                <span className="text-[#F8FAFC] font-extrabold">
+                                  {(g.name || 'G').slice(0, 1).toUpperCase()}
+                                </span>
+                              )}
+                              {isPinned && (
+                                <div className="absolute -bottom-1 -right-1 w-5 h-5 bg-[#1877f2] rounded-full flex items-center justify-center">
+                                  <i className="fas fa-thumbtack text-white text-[10px]"></i>
+                                </div>
+                              )}
+                            </div>
+                            <div className="flex-1 min-w-0 text-left">
+                              <div className="flex items-center gap-2">
+                                <span className="text-[18px] font-extrabold text-[#F8FAFC] truncate">
+                                  {g.name}
+                                </span>
+                                <i className={categoryIcon} style={{ color: categoryColor, fontSize: '12px' }}></i>
+                              </div>
+                              <div className="flex items-center gap-2 mt-0.5">
+                                <span className={`w-2 h-2 rounded-full ${hasNewPosts(g) ? 'bg-[#1877f2]' : 'bg-transparent'}`} />
+                              </div>
+                            </div>
+                            <div
+                              className="w-10 h-10 rounded-full flex items-center justify-center hover:bg-[#334155] transition-colors opacity-0 group-hover:opacity-100"
+                              onClick={(e) => togglePinGroup(g.id, e)}
+                            >
+                              <i className={`${isPinned ? 'fas' : 'far'} fa-thumbtack text-[#94A3B8] hover:text-[#1877f2] text-[18px] transition-colors`}></i>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {/* Groups you joined section */}
+                {visibleJoined.length > 0 && (
+                  <div className="mb-6">
+                    <div className="flex items-center gap-2 mb-3">
+                      <i className="fas fa-users text-[#45BD62] text-sm"></i>
+                      <div className="text-[16px] font-bold text-[#F8FAFC]">Groups you joined</div>
+                      <span className="text-[13px] text-[#94A3B8]">({joinedGroups.length})</span>
+                    </div>
+                    <div className="space-y-1">
+                      {visibleJoined.map(g => {
+                        const categoryColor = getCategoryColor(g.category);
+                        const categoryIcon = getCategoryIcon(g.category);
+                        const isPinned = pinnedGroups.has(g.id);
+                        return (
+                          <button
+                            key={g.id}
+                            onClick={() => handleGroupClick(g)}
+                            className="w-full flex items-center gap-3 py-3 hover:bg-[#141E33] rounded-lg transition-colors group px-2"
+                          >
+                            <div className="w-12 h-12 rounded-full overflow-hidden bg-[#1E293B] flex items-center justify-center shrink-0 relative">
+                              {g.profile_image ? (
+                                <img src={g.profile_image} className="w-full h-full object-cover" alt="" />
+                              ) : (
+                                <span className="text-[#F8FAFC] font-extrabold">
+                                  {(g.name || 'G').slice(0, 1).toUpperCase()}
+                                </span>
+                              )}
+                              {isPinned && (
+                                <div className="absolute -bottom-1 -right-1 w-5 h-5 bg-[#1877f2] rounded-full flex items-center justify-center">
+                                  <i className="fas fa-thumbtack text-white text-[10px]"></i>
+                                </div>
+                              )}
+                            </div>
+                            <div className="flex-1 min-w-0 text-left">
+                              <div className="flex items-center gap-2">
+                                <span className="text-[18px] font-extrabold text-[#F8FAFC] truncate">
+                                  {g.name}
+                                </span>
+                                <i className={categoryIcon} style={{ color: categoryColor, fontSize: '12px' }}></i>
+                              </div>
+                              <div className="flex items-center gap-2 mt-0.5">
+                                <span className={`w-2 h-2 rounded-full ${hasNewPosts(g) ? 'bg-[#1877f2]' : 'bg-transparent'}`} />
+                              </div>
+                            </div>
+                            <div
+                              className="w-10 h-10 rounded-full flex items-center justify-center hover:bg-[#334155] transition-colors opacity-0 group-hover:opacity-100"
+                              onClick={(e) => togglePinGroup(g.id, e)}
+                            >
+                              <i className={`${isPinned ? 'fas' : 'far'} fa-thumbtack text-[#94A3B8] hover:text-[#1877f2] text-[18px] transition-colors`}></i>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {/* See More for Your Groups */}
+                {totalYourGroups > yourGroupsLimit && (
+                  <div className="pt-2 pb-6 text-center">
+                    <button
+                      onClick={() => setYourGroupsLimit(prev => prev + 10)}
+                      className="w-full py-3 bg-[#0F172A] hover:bg-[#1E293B] text-[#F8FAFC] rounded-xl font-bold text-sm transition-all border border-[#1E293B] flex items-center justify-center gap-2 shadow-sm"
+                    >
+                      <span>See More Groups</span>
+                      <span className="text-xs text-[#94A3B8]">({totalYourGroups - yourGroupsLimit} remaining)</span>
+                      <i className="fas fa-chevron-down text-xs text-[#94A3B8]"></i>
+                    </button>
+                  </div>
+                )}
+
+                {/* Empty state */}
+                {!hasGroups && (
+                  <div className="py-16 text-center text-[#94A3B8]">
+                    <div className="text-[18px] font-bold text-[#F8FAFC] mb-2">No groups yet</div>
+                    <div className="text-[15px]">Create your first group or join existing ones!</div>
+                    <button
+                      onClick={handleCreateGroupClick}
+                      className="mt-4 bg-[#1877f2] text-white px-6 py-2 rounded-lg font-bold hover:bg-[#166fe5] transition-colors"
+                    >
+                      Create a group
+                    </button>
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+        </div>
+
+        {/* Sort Bottom Sheet */}
+        {sortOpen && (
+          <div className="fixed inset-0 z-[200] bg-black/60 flex items-end animate-fade-in" onClick={() => setSortOpen(false)}>
+            <div
+              className="w-full bg-[#0F172A] rounded-t-2xl p-4 animate-slide-up border-t border-[#1E293B]"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="w-12 h-1 bg-[#1E293B] rounded-full mx-auto mb-4" />
+              <div className="text-[18px] font-extrabold text-[#F8FAFC] mb-3">Sort</div>
+              {(['Most visited', 'Recently active', 'Alphabetical'] as const).map(opt => (
+                <button
+                  key={opt}
+                  onClick={() => {
+                    setSortMode(opt);
+                    setSortOpen(false);
+                  }}
+                  className="w-full flex items-center justify-between py-3 hover:bg-[#141E33] rounded-lg transition-colors px-2"
+                >
+                  <div className="text-[16px] font-bold text-[#F8FAFC]">{opt}</div>
+                  {sortMode === opt ? (
+                    <i className="fas fa-check text-[#1877f2]" />
+                  ) : (
+                    <span />
+                  )}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Modals */}
+        <CategorySelectionModal
+          isOpen={showCategoryModal}
+          onClose={() => setShowCategoryModal(false)}
+          onSelect={handleCategorySelect}
+        />
+        <CreateGroupFullPageModal
+          isOpen={showCreateModal}
+          onClose={() => setShowCreateModal(false)}
+          onCreate={onCreateGroup}
+          selectedCategory={selectedCategory}
+        />
+      </div>
+
+      {/* Full Post View */}
+      {showPostView && selectedPost && selectedPostAuthor && currentUser && (
+        <CommentsSheet
+          post={selectedPost}
+          currentUser={currentUser}
+          users={users}
+          onClose={() => {
+            setShowPostView(false);
+            setSelectedPost(null);
+            setSelectedPostAuthor(null);
+          }}
+          onComment={onComment}
+          onLikeComment={onLikeComment}
+          onCommentAdded={selectedPost?.onCommentAdded}
+          getCommentAuthor={(id) => users.find(u => u.id === id)}
+          onProfileClick={onProfileClick}
+          onHashtagClick={onHashtagClick}
+          onFollow={onFollow}
+          checkIsFollowing={checkIsFollowing}
+        />
+      )}
+    </>
+  );
+}
+              
+
+
+  // ========== GROUP SETTINGS FULL FLAT PAGE ==========
+  if (showSettingsModal && activeGroup) {
+    const isOwner = Number(activeGroup.admin_id) === Number(currentUser?.id);
+    return (
+      <GroupSettingsPage
+        group={activeGroup}
+        currentUser={currentUser}
+        onClose={() => setShowSettingsModal(false)}
+        onUpdate={async (settings) => {
+          await onUpdateGroupSettings(activeGroup.id, settings);
+        }}
+        isAdmin={Boolean(isAdmin)}
+        isOwner={isOwner}
+        onDeleteGroup={() => {
+          onDeleteGroup(activeGroup.id);
+          setShowSettingsModal(false);
+          setActiveGroupId(null);
+          setView('feed');
+        }}
+        onDisableAllMembers={async () => {
+          if (onDisableAllMembers) {
+            await onDisableAllMembers(activeGroup.id);
+          } else {
+            await apiFetch('/api/group-members?action=disable-all-members', {
+              method: 'PATCH',
+              body: JSON.stringify({ group_id: activeGroup.id, actor_id: currentUser?.id }),
+            });
+          }
+          setLiveMembers(prev => prev.map(m => m.role === 'admin' ? m : { ...m, posting_disabled: 1 }));
+        }}
+        onEnableAllMembers={async () => {
+          if (onEnableAllMembers) {
+            await onEnableAllMembers(activeGroup.id);
+          } else {
+            await apiFetch('/api/group-members?action=enable-all-members', {
+              method: 'PATCH',
+              body: JSON.stringify({ group_id: activeGroup.id, actor_id: currentUser?.id }),
+            });
+          }
+          setLiveMembers(prev => prev.map(m => ({ ...m, posting_disabled: 0 })));
+          setMemberMetaOverrides({});
+        }}
+      />
+    );
+  }
+
+  // ========== DETAIL VIEW RENDER ==========
+const isMember = currentUser
+  ? Number(activeGroup.admin_id) === Number(currentUser.id) ||
+    activeGroup.is_member === true ||
+    (Array.isArray(activeGroup.members) &&
+      activeGroup.members.map((id: any) => Number(id)).includes(Number(currentUser.id)))
+  : false;
+    
+  const isGroupAdmin = currentUser && activeGroup.admin_id === currentUser.id;
+  const canManage = Boolean(isGroupAdmin || isAdmin);
+  const canPost = canManage || (activeGroup.member_posting_allowed ?? true);
+  const createdDate = activeGroup.created_at && !Number.isNaN(new Date(activeGroup.created_at as any).getTime()) ? new Date(activeGroup.created_at as any) : null;
+  const categoryInfo = GROUP_CATEGORIES.find(c => c.id === activeGroup.category) || GROUP_CATEGORIES[0];
+return (
+    <>
+      <div className="w-full bg-[#050B18] min-h-screen pb-10">
+        {/* Cover & Header */}
+        <div className="bg-[#0F172A] border-b border-[#1E293B] shadow-sm mb-4 animate-fade-in">
+          <div className="max-w-[1100px] mx-auto">
+            <div className="h-[200px] md:h-[350px] relative group bg-[#1E293B] md:rounded-b-xl overflow-hidden">       
+<img 
+  src={activeGroup.cover_image || 'https://images.unsplash.com/photo-1522202176988-66273c2fd55f?auto=format&fit=crop&w=1500&q=80'} 
+  className="w-full h-full object-cover" 
+  alt="Cover" 
+/>
+              
+              {/* ✅ BACK BUTTON - Added here */}
+              <button
+                onClick={() => {
+                  setView('feed');
+                  setActiveGroupId(null);
+                }}
+                className="absolute top-4 left-4 z-20 w-10 h-10 rounded-full bg-black/50 backdrop-blur-sm flex items-center justify-center hover:bg-black/70 transition-all"
+                aria-label="Back to groups"
+              >
+                <i className="fas fa-arrow-left text-white text-xl"></i>
+              </button>
+
+        {canManage && (
+  <div 
+    className="absolute bottom-4 right-4 bg-black/60 backdrop-blur-sm px-3 py-1.5 rounded-lg cursor-pointer hover:bg-black/70 font-bold text-white text-sm flex items-center gap-2 transition-all" 
+    onClick={() => {
+      groupCoverInputRef.current?.click();
+    }}
+  >
+    <i className="fas fa-camera"></i> Edit Cover
+  </div>
+)}
+<input type="file" ref={groupCoverInputRef} className="hidden" accept="image/*" onChange={e => handleImageChange(e, 'cover')} />
+</div>
+
+<div className="px-4 pb-0">
+  <div className="flex flex-col md:flex-row items-start md:items-end -mt-[40px] md:-mt-[30px] relative z-10 gap-4 mb-4">
+    <div className="relative">
+      <div className="w-[100px] h-[100px] md:w-[140px] md:h-[140px] rounded-xl border-4 border-[#0F172A] overflow-hidden bg-[#0F172A] shadow-xl">
+        <img 
+          src={activeGroup.profile_image || `https://ui-avatars.com/api/?name=${encodeURIComponent(activeGroup.name || 'Group')}&background=random`} 
+          className="w-full h-full object-cover" 
+          alt="" 
+        />
+      </div>
+      
+      {/* Profile image edit button */}
+      {canManage && (
+        <div 
+          className="absolute bottom-2 right-2 bg-[#1E293B] p-2 rounded-full cursor-pointer hover:bg-[#334155] shadow-md transition-colors" 
+          onClick={() => {
+            groupProfileInputRef.current?.click();
+          }}
+        >
+          <i className="fas fa-camera text-white text-xs"></i>
+        </div>
+      )}
+      <input type="file" ref={groupProfileInputRef} className="hidden" accept="image/*" onChange={e => handleImageChange(e, 'profile')} />
+    </div>
+    
+         
+                <div className="flex-1 mt-2">
+                  <div className="flex items-center gap-2 mb-1">
+                    <h1 className="text-2xl md:text-4xl font-bold text-[#F8FAFC] leading-tight">{activeGroup.name}</h1>
+                    <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ backgroundColor: `${categoryInfo.color}20` }}>
+                      <i className={categoryInfo.icon} style={{ color: categoryInfo.color, fontSize: '16px' }}></i>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 text-[#94A3B8] text-sm font-semibold mb-1">
+                    <span style={{ color: categoryInfo.color }} className="font-bold">{categoryInfo.label}</span>
+                    <span>•</span>
+                    <i className={`fas ${activeGroup.type === 'public' ? 'fa-globe-americas' : 'fa-lock'} text-xs`}></i>
+                    <span className="capitalize">{activeGroup.type} group</span>
+                    <span>•</span>
+                    <span>{(Array.isArray(activeGroup.members) ? activeGroup.members.length : activeGroup.members_count)} members</span>
+                  </div>
+                </div>
+            
+<div className="flex items-center gap-2 mt-4 md:mt-0 w-full md:w-auto">
+  {isMember ? (
+    <>
+      {/* Joined button FIRST */}
+      <button className="bg-[#1E293B] text-[#F8FAFC] px-4 py-2 rounded-lg font-bold text-sm flex items-center justify-center gap-2 hover:bg-[#334155] flex-1 md:flex-none transition-all disabled:opacity-50" onClick={handleLeaveGroup} disabled={leaving}>
+        {leaving ? (<i className="fas fa-spinner fa-spin mr-2"></i>) : (<i className="fas fa-check mr-2"></i>)}
+        {leaving ? 'Leaving...' : 'Joined'}
+      </button>
+
+      {/* Direct Share button */}
+      <button 
+        onClick={handleShareGroup} 
+        className="bg-[#1E293B] hover:bg-[#334155] text-[#F8FAFC] px-3.5 py-2 rounded-lg font-bold text-sm flex items-center justify-center gap-2 transition-all active:scale-95"
+        title="Share Group"
+      >
+        <i className="fas fa-share-alt text-[#94A3B8]"></i>
+        <span>Share</span>
+      </button>
+      
+      {/* ... menu button (on the right) */}
+      <div className="relative">
+        <button onClick={() => setShowGroupMenu(prev => !prev)} className="w-10 h-10 rounded-full flex items-center justify-center hover:bg-[#141E33] transition-all" aria-label="More options">
+          <i className="fas fa-ellipsis-h text-[#F8FAFC] text-xl"></i>
+        </button>
+        {showGroupMenu && (
+          <div className="absolute right-0 top-12 z-[120] w-56 bg-[#0F172A] rounded-xl shadow-2xl border border-[#1E293B] overflow-hidden">
+            <button onClick={() => { setShowGroupMenu(false); setShowInviteModal(true); }} className="w-full px-4 py-3 text-left hover:bg-[#141E33] flex items-center gap-3 text-[#F8FAFC]">
+              <i className="fas fa-user-plus w-5 text-[#94A3B8]"></i><span>Invite People</span>
+            </button>
+            <button onClick={() => { setShowGroupMenu(false); handleShareGroup(); }} className="w-full px-4 py-3 text-left hover:bg-[#141E33] flex items-center gap-3 text-[#F8FAFC]">
+              <i className="fas fa-share-alt w-5 text-[#94A3B8]"></i><span>Share Group</span>
+            </button>
+            <button onClick={() => { setShowGroupMenu(false); handleLeaveGroup(); }} className="w-full px-4 py-3 text-left hover:bg-[#141E33] flex items-center gap-3 text-[#f3425f]">
+              <i className="fas fa-sign-out-alt w-5 text-[#f3425f]"></i><span>Leave Group</span>
+            </button>
+            {canManage && (
+              <button onClick={() => { setShowGroupMenu(false); setShowSettingsModal(true); }} className="w-full px-4 py-3 text-left hover:bg-[#141E33] flex items-center gap-3 text-[#F8FAFC]">
+                <i className="fas fa-cog w-5 text-[#94A3B8]"></i><span>Group Settings</span>
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    </>
+  ) : (
+    <div className="flex items-center gap-2 w-full md:w-auto">
+      <button onClick={handleJoinGroup} disabled={joining} className="bg-[#1877f2] text-white px-8 py-2 rounded-lg font-bold text-base hover:bg-[#166fe5] flex-1 md:flex-none transition-all shadow-lg disabled:opacity-50 disabled:cursor-not-allowed">
+        {joining ? 'Joining...' : 'Join Group'}
+      </button>
+      <button 
+        onClick={handleShareGroup} 
+        className="bg-[#1E293B] hover:bg-[#334155] text-[#F8FAFC] px-4 py-2 rounded-lg font-bold text-sm flex items-center justify-center gap-2 transition-all active:scale-95"
+        title="Share Group"
+      >
+        <i className="fas fa-share-alt text-[#94A3B8]"></i>
+        <span>Share</span>
+      </button>
+    </div>
+  )}
+</div>
+              </div>
+              
+              <div className="border-t border-[#1E293B] mt-4"></div>
+              
+              {/* Tabs */}
+              <div className="flex items-center gap-1 pt-1 overflow-x-auto scrollbar-hide">
+                {(['Discussion', 'Events', 'Members', 'About'] as const).map(tab => (
+                  <div key={tab} onClick={() => setGroupTab(tab)} className={`px-5 py-3 cursor-pointer font-bold text-base border-b-[3px] transition-all whitespace-nowrap ${
+                    groupTab === tab ? 'text-[#1877f2] border-[#1877f2]' : 'text-[#94A3B8] border-transparent hover:bg-[#141E33] rounded-t-lg'
+                  }`}>
+                    {tab}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+        
+        {/* Content Area */}
+        <div className="max-w-[700px] mx-auto px-0 md:px-4">
+          {uploadState && (
+            <div className="mb-4">
+              <PostUploadProgressBanner
+                uploadState={uploadState}
+                onDismiss={onDismissUpload}
+              />
+            </div>
+          )}
+
+          {/* Discussion Tab */}
+          {groupTab === 'Discussion' && (
+            <div className="animate-fade-in">
+            
+      {isMember && canPost && canUserPost(currentUser?.id ?? 0) && !uploadState?.isUploading && (
+        <div 
+          className="bg-[#070D1A] rounded-2xl p-4 sm:p-5 mb-5 border-y border-[#1E293B]/80 border-x-0 shadow-md transition-all hover:bg-[#0B1325] mx-0"
+        >
+          <div 
+            className="flex gap-3.5 items-center cursor-pointer"
+            onClick={() => { 
+              if (activeGroup?.category === 'buy_sell') { 
+                setPostMetadata({ currency: 'USD', condition: 'Used - Good', location: '', price: '', status: 'available' }); 
+              } else if (activeGroup?.category === 'recruitment' || isCareerCategory(activeGroup?.category, activeGroup?.name)) {
+                setPostMetadata({ job_type: 'Full-time' });
+              } else { 
+                setPostMetadata({}); 
+              } 
+              setShowGroupPostModal(true); 
+            }}
+          >
+            <img src={avatarFrom(currentUser)} className="w-12 h-12 rounded-full bg-[#1E293B] object-cover ring-2 ring-[#1E293B] flex-shrink-0" alt="" />
+            <div className="flex-1 bg-[#0F172A] hover:bg-[#141E33] transition-colors rounded-2xl px-5 py-3.5 flex items-center justify-between border-0">
+              <span className="text-[#94A3B8] text-[19px] font-normal truncate">
+                {activeGroup.category === 'buy_sell' && `Sell something in ${activeGroup.name}...`}
+                {(activeGroup.category === 'recruitment' || isCareerCategory(activeGroup.category, activeGroup.name)) && `Post a job opportunity in ${activeGroup.name}...`}
+                {activeGroup.category !== 'buy_sell' && activeGroup.category !== 'recruitment' && !isCareerCategory(activeGroup.category, activeGroup.name) && `Write something to ${activeGroup.name}...`}
+              </span>
+              <i className="fas fa-pen text-[#64748B] text-sm ml-2"></i>
+            </div>
+          </div>
+
+          <div className="border-t border-[#1E293B]/70 mt-3.5 pt-3 flex items-center justify-around sm:justify-start sm:gap-6 text-sm">
+            <button
+              type="button"
+              onClick={() => {
+                setShowGroupPostModal(true);
+                setTimeout(() => handlePostImageClick(), 100);
+              }}
+              className="flex items-center gap-2.5 px-3 py-1.5 rounded-xl hover:bg-[#141E33] text-[#CBD5E1] font-semibold transition-colors"
+            >
+              <i className="fas fa-images text-[#45BD62] text-lg"></i>
+              <span>Photo/Video</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowEventModal(true)}
+              className="flex items-center gap-2.5 px-3 py-1.5 rounded-xl hover:bg-[#141E33] text-[#CBD5E1] font-semibold transition-colors"
+            >
+              <i className="fas fa-calendar-plus text-[#1877f2] text-lg"></i>
+              <span>Event</span>
+            </button>
+            {activeGroup.category === 'buy_sell' && (
+              <button
+                type="button"
+                onClick={() => {
+                  setPostMetadata({ currency: 'USD', condition: 'Used - Good', location: '', price: '', status: 'available' });
+                  setShowGroupPostModal(true);
+                }}
+                className="flex items-center gap-2.5 px-3 py-1.5 rounded-xl hover:bg-[#141E33] text-[#CBD5E1] font-semibold transition-colors"
+              >
+                <i className="fas fa-tag text-[#F7B928] text-lg"></i>
+                <span>Sell Item</span>
+              </button>
+            )}
+            {(activeGroup.category === 'recruitment' || isCareerCategory(activeGroup.category, activeGroup.name)) && (
+              <button
+                type="button"
+                onClick={() => {
+                  setPostMetadata({ job_type: 'Full-time' });
+                  setShowGroupPostModal(true);
+                }}
+                className="flex items-center gap-2.5 px-3 py-1.5 rounded-xl hover:bg-[#141E33] text-[#CBD5E1] font-semibold transition-colors"
+              >
+                <i className="fas fa-briefcase text-[#45BD62] text-lg"></i>
+                <span>Post Job</span>
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+              
+              <div className="space-y-4">
+                {activeGroup.type === 'private' && !isMember ? (
+                  <div className="bg-[#0F172A] rounded-xl p-12 text-center border border-[#1E293B] mx-0 shadow-sm">
+                    <div className="w-16 h-16 bg-[#1E293B] rounded-full flex items-center justify-center mx-auto mb-4 border border-[#1E293B]">
+                      <i className="fas fa-lock text-[#94A3B8] text-2xl"></i>
+                    </div>
+                    <h3 className="text-[#F8FAFC] font-bold text-xl mb-2">This Group is Private</h3>
+                    <p className="text-[#94A3B8] mb-8 max-w-xs mx-auto">Only members of this community can see the discussions and members.</p>
+                    <button onClick={handleJoinGroup} disabled={joining} className="bg-[#1877f2] text-white px-10 py-2.5 rounded-lg font-black shadow-lg hover:bg-[#166fe5] transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed">
+                      {joining ? 'Joining...' : 'Join Group'}
+                    </button>
+                  </div>
+                ) : groupPosts.length > 0 ? (
+                  groupPosts.map((post) => {
+                    const author = users.find(u => u.id === post.user_id) || {
+                      id: post.user_id || 0,
+                      username: 'unknown',
+                      name: 'Unknown User',
+                      profile_image_url: 'https://ui-avatars.com/api/?name=User&background=random',
+                      followers: [],
+                      following: [],
+                      email: '',
+                      is_verified: false,
+                      role: 'user',
+                      is_online: false,
+                      location: '',
+                      bio: '',
+                      created_at: null,
+                    };
+                    return (
+                      <GroupPost
+                        key={post.id}
+                        post={post}
+                        author={author}
+                        currentUser={currentUser}
+                        users={users}
+                        groups={groups}
+                        groupCategory={activeGroup.category}
+                        isGroupAdmin={isGroupAdmin}
+                        isPlatformAdmin={isAdmin}
+                        onProfileClick={onProfileClick}
+                        onLikePost={handleLikePost}
+                        onOpenComments={handleOpenComments}
+                        onSharePost={handleSharePost}
+                        onEditPost={onEditGroupPost ? handleEditPost : undefined}
+                        onDeletePost={onDeleteGroupPost ? handleDeletePost : undefined}
+                        onReportPost={onReportGroupPost ? handleReportPost : undefined}
+                        onViewImage={handleViewImage}
+                        onVideoClick={onVideoClick}
+                        onHashtagClick={onHashtagClick}
+                        onFollow={onFollow}
+                        checkIsFollowing={checkIsFollowing}
+                        onComment={onComment}
+                        onCommentAdded={() => fetchUpdatedPost(post.id)}
+                        onApply={onApplyToJob}
+                        onPlayVideo={onPlayVideo}
+                      />
+                    );
+                  })
+                ) : loadingPosts ? (
+                  <div className="bg-[#0F172A] rounded-xl p-16 text-center border border-[#1E293B] mx-0 shadow-sm">
+                    <div className="w-16 h-16 bg-[#1E293B] rounded-full flex items-center justify-center mx-auto mb-4 border border-[#1E293B]">
+                      <i className="fas fa-spinner fa-spin text-[#94A3B8] text-2xl"></i>
+                    </div>
+                    <h3 className="text-[#F8FAFC] font-bold text-lg mb-1">Loading posts...</h3>
+                  </div>
+                ) : (
+                  <div className="bg-[#0F172A] rounded-xl p-16 text-center border border-[#1E293B] mx-0 shadow-sm">
+                    <div className="w-16 h-16 bg-[#1E293B] rounded-full flex items-center justify-center mx-auto mb-4 border border-[#1E293B]">
+                      <i className="fas fa-comments text-[#94A3B8] text-2xl"></i>
+                    </div>
+                    <h3 className="text-[#F8FAFC] font-bold text-lg mb-1">No posts yet</h3>
+                    <p className="text-[#94A3B8] text-sm">Be the first to start a conversation in this group!</p>
+                  </div>
+                )}
+
+                {/* Infinite Scroll Sentinel */}
+                {groupPosts.length > 0 && hasMorePosts && (
+                  <div ref={infiniteScrollTriggerRef} className="py-6 flex flex-col items-center justify-center text-center">
+                    {loadingMorePosts ? (
+                      <div className="flex items-center gap-2 text-[#94A3B8] text-sm font-semibold">
+                        <div className="w-5 h-5 border-2 border-[#1877f2] border-t-transparent rounded-full animate-spin"></div>
+                        <span>Loading more posts...</span>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={loadMoreGroupPosts}
+                        className="px-5 py-2.5 bg-[#0F172A] hover:bg-[#1E293B] text-[#94A3B8] hover:text-[#F8FAFC] text-sm font-bold rounded-xl transition-all border border-[#1E293B] shadow-sm flex items-center gap-2"
+                      >
+                        <i className="fas fa-arrow-down text-xs"></i>
+                        <span>Load more posts</span>
+                      </button>
+                    )}
+                  </div>
+                )}
+                {groupPosts.length > 0 && !hasMorePosts && (
+                  <div className="py-6 text-center text-xs font-semibold text-[#64748B]">
+                    You've reached the end of the feed
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+          
+          {/* Events Tab */}
+          {groupTab === 'Events' && (
+            <div className="animate-fade-in">
+              {isMember && (
+                <div className="bg-[#0F172A] rounded-xl p-4 mb-4 border border-[#1E293B] mx-0">
+                  <button onClick={() => setShowEventModal(true)} className="w-full bg-[#1877f2] text-white px-4 py-3 rounded-lg font-bold flex items-center justify-center gap-2 hover:bg-[#166fe5] transition-all">
+                    <i className="fas fa-calendar-plus"></i> Create Event in {activeGroup.name}
+                  </button>
+                </div>
+              )}
+              <div className="space-y-4">
+                {!isMember && activeGroup.type === 'private' ? (
+                  <div className="bg-[#0F172A] rounded-xl p-12 text-center border border-[#1E293B] mx-0 shadow-sm">
+                    <div className="w-16 h-16 bg-[#1E293B] rounded-full flex items-center justify-center mx-auto mb-4 border border-[#1E293B]">
+                      <i className="fas fa-lock text-[#94A3B8] text-2xl"></i>
+                    </div>
+                    <h3 className="text-[#F8FAFC] font-bold text-xl mb-2">Join to See Events</h3>
+                    <p className="text-[#94A3B8] mb-8 max-w-xs mx-auto">Only members can view and RSVP to events in this group.</p>
+                    <button onClick={handleJoinGroup} disabled={joining} className="bg-[#1877f2] text-white px-10 py-2.5 rounded-lg font-black shadow-lg hover:bg-[#166fe5] transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed">
+                      {joining ? 'Joining...' : 'Join Group'}
+                    </button>
+                  </div>
+                ) : groupEvents.length > 0 ? (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mx-0">
+                    {groupEvents.map(event => (
+                      <GroupEventCard key={event.id} event={event} group={activeGroup} currentUser={currentUser} onRSVP={onEventRSVP ? handleEventRSVP : undefined} onProfileClick={onProfileClick} />
+                    ))}
+                  </div>
+                ) : loadingEvents ? (
+                  <div className="bg-[#0F172A] rounded-xl p-16 text-center border border-[#1E293B] mx-0 shadow-sm">
+                    <div className="w-16 h-16 bg-[#1E293B] rounded-full flex items-center justify-center mx-auto mb-4 border border-[#1E293B]">
+                      <i className="fas fa-spinner fa-spin text-[#94A3B8] text-2xl"></i>
+                    </div>
+                    <h3 className="text-[#F8FAFC] font-bold text-lg mb-1">Loading events...</h3>
+                  </div>
+                ) : (
+                  <div className="bg-[#0F172A] rounded-xl p-16 text-center border border-[#1E293B] mx-0 shadow-sm">
+                    <div className="w-16 h-16 bg-[#1E293B] rounded-full flex items-center justify-center mx-auto mb-4 border border-[#1E293B]">
+                      <i className="fas fa-calendar text-[#94A3B8] text-2xl"></i>
+                    </div>
+                    <h3 className="text-[#F8FAFC] font-bold text-lg mb-1">No upcoming events</h3>
+                    {isMember ? (
+                      <p className="text-[#94A3B8] text-sm">Create an event to bring the community together!</p>
+                    ) : (
+                      <p className="text-[#94A3B8] text-sm">Check back later for events in this group.</p>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+          
+          {/* About Tab */}
+          {groupTab === 'About' && (
+            <div className="bg-[#0F172A] rounded-xl p-8 border border-[#1E293B] mx-0 shadow-sm animate-fade-in">
+              <h3 className="text-xl font-bold text-[#F8FAFC] mb-4">About this group</h3>
+              <p className="text-[#F8FAFC] text-base mb-8 leading-relaxed">{activeGroup.description}</p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div className="flex items-center gap-4 text-[#F8FAFC]">
+                  <div className="w-12 h-12 bg-[#1E293B] rounded-xl flex items-center justify-center">
+                    <i className={`fas ${activeGroup.type === 'public' ? 'fa-globe-americas' : 'fa-lock'} text-xl text-[#94A3B8]`}></i>
+                  </div>
+                  <div>
+                    <div className="font-bold">{activeGroup.type === 'public' ? 'Public' : 'Private'}</div>
+                    <div className="text-xs text-[#94A3B8]">Anyone can see who's in the group and what they post.</div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-4 text-[#F8FAFC]">
+                  <div className="w-12 h-12 bg-[#1E293B] rounded-xl flex items-center justify-center">
+                    <i className="fas fa-history text-xl text-[#94A3B8]"></i>
+                  </div>
+                  <div>
+                    <div className="font-bold">History</div>
+                    <div className="text-xs text-[#94A3B8]">Created on {createdDate ? createdDate.toLocaleDateString() : 'Recently'}</div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-4 text-[#F8FAFC]">
+                  <div className="w-12 h-12 bg-[#1E293B] rounded-xl flex items-center justify-center" style={{ backgroundColor: `${categoryInfo.color}20` }}>
+                    <i className={categoryInfo.icon} style={{ color: categoryInfo.color }}></i>
+                  </div>
+                  <div>
+                    <div className="font-bold">Category</div>
+                    <div className="text-xs text-[#94A3B8]">{categoryInfo.label}</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+          
+          {/* Members Tab */}
+          {groupTab === 'Members' && (() => {
+            const memberIds: number[] = Array.from(
+              new Set([
+                ...(Array.isArray(activeGroup.members) ? activeGroup.members.map(Number) : []),
+                ...(Array.isArray(liveMembers) ? liveMembers.map(m => Number(m.user_id || m.id)) : []),
+                Number(activeGroup.admin_id)
+              ].filter(id => Boolean(id) && id > 0))
+            );
+
+            const allMembersData = memberIds.map(memberId => {
+              const rawMember = users.find(u => Number(u.id) === Number(memberId));
+              const live = liveMembers.find(m => Number(m.user_id || m.id) === Number(memberId));
+              const override = memberMetaOverrides[Number(memberId)] || {};
+              const isOwner = Number(memberId) === Number(activeGroup.admin_id);
+              const isSelf = Number(memberId) === Number(currentUser?.id);
+
+              const role = isOwner ? 'admin' : (override.group_role || live?.role || live?.group_role || 'member');
+              const isAdminMember = isOwner || role === 'admin';
+              const postingDisabled = isOwner ? false : Boolean(
+                override.posting_disabled !== undefined
+                  ? override.posting_disabled
+                  : (live?.posting_disabled === 1 || live?.posting_disabled === true || live?.posting_disabled === '1' || live?.posting_disabled === 'true')
+              );
+
+              return {
+                id: memberId,
+                name: rawMember?.name || live?.name || live?.username || `User ${memberId}`,
+                username: rawMember?.username || live?.username || `user${memberId}`,
+                avatar: rawMember?.avatar || rawMember?.profile_image || live?.avatar || live?.profile_image,
+                rawMember,
+                isOwner,
+                isSelf,
+                role,
+                isAdminMember,
+                postingDisabled,
+              };
+            });
+
+            // Sort: Owner first, then Admins, then alphabetical
+            allMembersData.sort((a, b) => {
+              if (a.isOwner) return -1;
+              if (b.isOwner) return 1;
+              if (a.isAdminMember && !b.isAdminMember) return -1;
+              if (!a.isAdminMember && b.isAdminMember) return 1;
+              return a.name.localeCompare(b.name);
+            });
+
+            const q = memberSearch.trim().toLowerCase();
+            const filteredMembers = q
+              ? allMembersData.filter(m => m.name.toLowerCase().includes(q) || m.username.toLowerCase().includes(q))
+              : allMembersData;
+
+            const visibleMembers = filteredMembers.slice(0, membersLimit);
+
+            return (
+              <div className="bg-[#0F172A] rounded-xl border border-[#1E293B] mx-0 shadow-sm animate-fade-in overflow-visible">
+                <div className="p-4 md:p-5 border-b border-[#1E293B] bg-[#0F172A]">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div>
+                      <h3 className="text-[#F8FAFC] font-bold text-lg">
+                        Members · {allMembersData.length}
+                      </h3>
+                      {canManage && (
+                        <p className="text-[#94A3B8] text-xs mt-0.5">
+                          Manage posting permissions and admin roles from the member options
+                        </p>
+                      )}
+                    </div>
+
+                    {canManage && (
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <button
+                          onClick={async () => {
+                            if (!confirm('Disable posting for all non-admin members in this group?')) return;
+                            try {
+                              if (onDisableAllMembers) {
+                                await onDisableAllMembers(activeGroup.id);
+                              } else {
+                                await apiFetch('/api/group-members?action=disable-all-members', {
+                                  method: 'PATCH',
+                                  body: JSON.stringify({ group_id: activeGroup.id, actor_id: currentUser?.id })
+                                });
+                              }
+                              setLiveMembers(prev => prev.map(m => m.role === 'admin' ? m : { ...m, posting_disabled: 1 }));
+                              alert('Posting disabled for all non-admin members.');
+                            } catch (err: any) {
+                              alert(err?.message || 'Failed to disable all members');
+                            }
+                          }}
+                          className="px-3 py-1.5 bg-[#1E293B] hover:bg-[#334155] text-[#F7B928] text-xs font-bold rounded-lg transition-colors flex items-center gap-1.5"
+                          title="Restrict all non-admin members from posting"
+                        >
+                          <i className="fas fa-ban text-xs"></i>
+                          <span>Disable All Posting</span>
+                        </button>
+
+                        <button
+                          onClick={async () => {
+                            if (!confirm('Enable posting for all members in this group?')) return;
+                            try {
+                              if (onEnableAllMembers) {
+                                await onEnableAllMembers(activeGroup.id);
+                              } else {
+                                await apiFetch('/api/group-members?action=enable-all-members', {
+                                  method: 'PATCH',
+                                  body: JSON.stringify({ group_id: activeGroup.id, actor_id: currentUser?.id })
+                                });
+                              }
+                              setLiveMembers(prev => prev.map(m => ({ ...m, posting_disabled: 0 })));
+                              setMemberMetaOverrides({});
+                              alert('Posting enabled for all members.');
+                            } catch (err: any) {
+                              alert(err?.message || 'Failed to enable all members');
+                            }
+                          }}
+                          className="px-3 py-1.5 bg-[#1E293B] hover:bg-[#334155] text-[#45BD62] text-xs font-bold rounded-lg transition-colors flex items-center gap-1.5"
+                          title="Re-enable posting for all members"
+                        >
+                          <i className="fas fa-check-circle text-xs"></i>
+                          <span>Enable All Posting</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Professional Search on top */}
+                  <div className="relative mt-3">
+                    <i className="fas fa-search absolute left-3.5 top-1/2 -translate-y-1/2 text-[#94A3B8] text-sm"></i>
+                    <input
+                      type="text"
+                      value={memberSearch}
+                      onChange={(e) => {
+                        setMemberSearch(e.target.value);
+                        setMembersLimit(10);
+                      }}
+                      placeholder="Search group members by name or username..."
+                      className="w-full bg-[#1E293B] border border-[#334155]/60 focus:border-[#1877f2] rounded-xl pl-10 pr-10 py-2.5 text-sm text-[#F8FAFC] placeholder-[#94A3B8] outline-none transition-colors"
+                    />
+                    {memberSearch && (
+                      <button
+                        onClick={() => {
+                          setMemberSearch('');
+                          setMembersLimit(10);
+                        }}
+                        className="absolute right-3.5 top-1/2 -translate-y-1/2 text-[#94A3B8] hover:text-[#F8FAFC] text-sm"
+                      >
+                        <i className="fas fa-times"></i>
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <div className="p-2 space-y-1">
+                  {visibleMembers.length > 0 ? (
+                    visibleMembers.map(member => {
+                      const isRemoving = removingMemberId === member.id;
+                      const isDisabling = disablePostingUserId === member.id;
+                      const menuOpen = memberMenuOpenId === member.id;
+
+                      return (
+                        <div
+                          key={member.id}
+                          className="flex items-center justify-between p-3 hover:bg-[#141E33] rounded-lg transition-colors relative overflow-visible"
+                        >
+                          <div
+                            className="flex items-center gap-3 cursor-pointer min-w-0"
+                            onClick={() => onProfileClick(member.id)}
+                          >
+                            <img
+                              src={avatarFrom(member.rawMember || member)}
+                              className="w-12 h-12 rounded-xl object-cover border border-[#1E293B]"
+                              alt=""
+                            />
+
+                            <div className="min-w-0">
+                              <div className="font-bold text-[#F8FAFC] truncate flex items-center gap-2 flex-wrap">
+                                <span>{member.name}</span>
+
+                                {member.isOwner && (
+                                  <span className="text-[10px] text-[#1877f2] font-black bg-[#1877f2]/10 px-2 py-0.5 rounded-full">
+                                    Admin (Owner)
+                                  </span>
+                                )}
+
+                                {!member.isOwner && member.isAdminMember && (
+                                  <span className="text-[10px] text-[#38BDF8] font-black bg-[#38BDF8]/10 px-2 py-0.5 rounded-full">
+                                    Admin
+                                  </span>
+                                )}
+
+                                {member.postingDisabled && (
+                                  <span className="text-[10px] text-[#F7B928] font-black bg-[#F7B928]/10 px-2 py-0.5 rounded-full">
+                                    Posting Disabled
+                                  </span>
+                                )}
+                              </div>
+
+                              <div className="text-[#94A3B8] text-xs truncate">
+                                @{member.username || 'user'}
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-2">
+                            {member.isSelf && (
+                              <span className="text-[#94A3B8] text-xs bg-[#1E293B] px-3 py-1 rounded-full">
+                                You
+                              </span>
+                            )}
+
+                            {canManage && !member.isOwner && !member.isSelf && (
+                              <div className="relative">
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setMemberMenuOpenId(prev => (prev === member.id ? null : member.id));
+                                  }}
+                                  className="w-9 h-9 rounded-full flex items-center justify-center hover:bg-[#334155] text-[#94A3B8] hover:text-[#F8FAFC] transition-colors"
+                                  aria-label="Member options"
+                                >
+                                  <i className="fas fa-ellipsis-v"></i>
+                                </button>
+
+                                {menuOpen && (
+                                  <div
+                                    className="absolute right-0 top-11 z-[999] w-60 bg-[#0F172A] rounded-xl shadow-2xl border border-[#1E293B] overflow-hidden py-1"
+                                    onClick={(e) => e.stopPropagation()}
+                                  >
+                                    {/* Action: Toggle Posting */}
+                                    <button
+                                      onClick={async (e) => {
+                                        e.stopPropagation();
+                                        const nextDisabled = !member.postingDisabled;
+                                        const actionText = nextDisabled ? 'disable' : 'enable';
+                                        if (!confirm(`Are you sure you want to ${actionText} posting for ${member.name}?`)) return;
+
+                                        setDisablePostingUserId(member.id);
+                                        try {
+                                          if (onToggleMemberPosting) {
+                                            await onToggleMemberPosting(Number(activeGroup.id), Number(member.id), nextDisabled);
+                                          } else {
+                                            await apiFetch('/api/group-members?action=toggle-posting', {
+                                              method: 'PATCH',
+                                              body: JSON.stringify({
+                                                group_id: Number(activeGroup.id),
+                                                user_id: Number(member.id),
+                                                actor_id: Number(currentUser?.id),
+                                                disabled: nextDisabled,
+                                              }),
+                                            });
+                                          }
+
+                                          setMemberMetaOverrides(prev => ({
+                                            ...prev,
+                                            [Number(member.id)]: {
+                                              ...(prev[Number(member.id)] || {}),
+                                              posting_disabled: nextDisabled,
+                                            },
+                                          }));
+                                          setLiveMembers(prev => prev.map(m => Number(m.user_id || m.id) === Number(member.id) ? { ...m, posting_disabled: nextDisabled ? 1 : 0 } : m));
+                                          setMemberMenuOpenId(null);
+                                        } catch (err: any) {
+                                          console.error(err);
+                                          alert(err?.message || 'Failed to update posting');
+                                        } finally {
+                                          setDisablePostingUserId(null);
+                                        }
+                                      }}
+                                      disabled={isRemoving || isDisabling}
+                                      className="w-full px-4 py-2.5 text-left hover:bg-[#141E33] flex items-center gap-3 text-sm text-[#F8FAFC] disabled:opacity-50 transition-colors"
+                                    >
+                                      <i className={`fas ${member.postingDisabled ? 'fa-check-circle text-[#45BD62]' : 'fa-ban text-[#F7B928]'} w-5`}></i>
+                                      <span>
+                                        {isDisabling
+                                          ? 'Updating...'
+                                          : member.postingDisabled
+                                          ? 'Enable Posting'
+                                          : 'Disable Posting'}
+                                      </span>
+                                    </button>
+
+                                    {/* Action: Make admin (if not admin) */}
+                                    {!member.isAdminMember && (
+                                      <button
+                                        onClick={async (e) => {
+                                          e.stopPropagation();
+                                          if (!confirm(`Make ${member.name} an admin of this group?`)) return;
+
+                                          try {
+                                            if (onMakeAdmin) {
+                                              await onMakeAdmin(Number(activeGroup.id), Number(member.id));
+                                            } else {
+                                              await apiFetch('/api/group-members?action=make-admin', {
+                                                method: 'PATCH',
+                                                body: JSON.stringify({
+                                                  group_id: Number(activeGroup.id),
+                                                  user_id: Number(member.id),
+                                                  actor_id: Number(currentUser?.id),
+                                                }),
+                                              });
+                                            }
+
+                                            setMemberMetaOverrides(prev => ({
+                                              ...prev,
+                                              [Number(member.id)]: {
+                                                ...(prev[Number(member.id)] || {}),
+                                                group_role: 'admin',
+                                                posting_disabled: false,
+                                              },
+                                            }));
+                                            setLiveMembers(prev => prev.map(m => Number(m.user_id || m.id) === Number(member.id) ? { ...m, role: 'admin', group_role: 'admin', posting_disabled: 0 } : m));
+                                            setMemberMenuOpenId(null);
+                                          } catch (err: any) {
+                                            console.error(err);
+                                            alert(err?.message || 'Failed to make admin');
+                                          }
+                                        }}
+                                        className="w-full px-4 py-2.5 text-left hover:bg-[#141E33] flex items-center gap-3 text-sm text-[#F8FAFC] transition-colors"
+                                      >
+                                        <i className="fas fa-shield-alt text-[#1877f2] w-5"></i>
+                                        <span>Make Admin</span>
+                                      </button>
+                                    )}
+
+                                    {/* Action: Remove admin (only owner can remove admins) */}
+                                    {member.isAdminMember && isGroupAdmin && (
+                                      <button
+                                        onClick={async (e) => {
+                                          e.stopPropagation();
+                                          if (!confirm(`Remove admin role from ${member.name}?`)) return;
+
+                                          try {
+                                            if (onRemoveAdmin) {
+                                              await onRemoveAdmin(Number(activeGroup.id), Number(member.id));
+                                            } else {
+                                              await apiFetch('/api/group-members?action=remove-admin', {
+                                                method: 'PATCH',
+                                                body: JSON.stringify({
+                                                  group_id: Number(activeGroup.id),
+                                                  user_id: Number(member.id),
+                                                  actor_id: Number(currentUser?.id),
+                                                }),
+                                              });
+                                            }
+
+                                            setMemberMetaOverrides(prev => ({
+                                              ...prev,
+                                              [Number(member.id)]: {
+                                                ...(prev[Number(member.id)] || {}),
+                                                group_role: 'member',
+                                              },
+                                            }));
+                                            setLiveMembers(prev => prev.map(m => Number(m.user_id || m.id) === Number(member.id) ? { ...m, role: 'member', group_role: 'member' } : m));
+                                            setMemberMenuOpenId(null);
+                                          } catch (err: any) {
+                                            console.error(err);
+                                            alert(err?.message || 'Failed to remove admin');
+                                          }
+                                        }}
+                                        className="w-full px-4 py-2.5 text-left hover:bg-[#141E33] flex items-center gap-3 text-sm text-[#F7B928] transition-colors"
+                                      >
+                                        <i className="fas fa-user-minus w-5"></i>
+                                        <span>Remove Admin</span>
+                                      </button>
+                                    )}
+
+                                    <div className="border-t border-[#1E293B] my-1" />
+
+                                    {/* Action: Remove member (owner, group admin, or self) */}
+                                    <button
+                                      onClick={async (e) => {
+                                        e.stopPropagation();
+                                        if (!confirm(`Remove ${member.name} from the group?`)) return;
+
+                                        setRemovingMemberId(member.id);
+                                        try {
+                                          if (onRemoveMember) {
+                                            await onRemoveMember(Number(activeGroup.id), Number(member.id));
+                                          } else {
+                                            await apiFetch(`/api/group-members?group_id=${Number(activeGroup.id)}&user_id=${Number(member.id)}&actor_id=${Number(currentUser?.id)}`, {
+                                              method: 'DELETE',
+                                            });
+                                          }
+
+                                          setActiveGroupDetails(prev =>
+                                            prev && Number(prev.id) === Number(activeGroup.id)
+                                              ? {
+                                                  ...prev,
+                                                  members: Array.isArray(prev.members)
+                                                    ? prev.members.filter(id => Number(id) !== Number(member.id))
+                                                    : [],
+                                                  members_count: Math.max(0, (Array.isArray(prev.members) ? prev.members.length : (prev.members_count || 1)) - 1),
+                                                }
+                                              : prev
+                                          );
+                                          setLiveMembers(prev => prev.filter(m => Number(m.user_id || m.id) !== Number(member.id)));
+                                          setMemberMenuOpenId(null);
+                                        } catch (err: any) {
+                                          console.error(err);
+                                          alert(err?.message || 'Failed to remove member');
+                                        } finally {
+                                          setRemovingMemberId(null);
+                                        }
+                                      }}
+                                      disabled={isRemoving || isDisabling}
+                                      className="w-full px-4 py-2.5 text-left hover:bg-[#141E33] flex items-center gap-3 text-sm text-[#f3425f] disabled:opacity-50 transition-colors"
+                                    >
+                                      <i className="fas fa-trash w-5"></i>
+                                      <span>{isRemoving ? 'Removing...' : 'Remove Member'}</span>
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })
+                  ) : (
+                    <div className="py-12 text-center text-[#94A3B8]">
+                      <div className="text-base font-semibold text-[#F8FAFC]">No members found</div>
+                      <div className="text-xs mt-1">Try another search term</div>
+                    </div>
+                  )}
+                </div>
+
+                {filteredMembers.length > membersLimit && (
+                  <div className="p-3 text-center border-t border-[#1E293B]">
+                    <button
+                      onClick={() => setMembersLimit(prev => prev + 10)}
+                      className="w-full py-2.5 bg-[#1E293B] hover:bg-[#334155] text-[#F8FAFC] rounded-xl font-bold text-sm transition-all border border-[#1E293B] flex items-center justify-center gap-2 shadow-sm"
+                    >
+                      <span>See More Members</span>
+                      <span className="text-xs text-[#94A3B8]">({filteredMembers.length - membersLimit} remaining)</span>
+                      <i className="fas fa-chevron-down text-xs text-[#94A3B8]"></i>
+                    </button>
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+                            
+                                                                                               
+    </div>
+        
+        {/* Create Post Modal */}
+        {showGroupPostModal && (
+          <div className="fixed inset-0 z-[150] bg-black/75 backdrop-blur-sm flex items-center justify-center p-0 md:p-4 overflow-y-auto animate-fade-in font-sans">
+            <div className="w-full h-full md:h-auto md:max-w-2xl bg-[#0F172A] md:rounded-2xl border border-[#1E293B] shadow-2xl flex flex-col max-h-[100vh] md:max-h-[88vh] overflow-hidden animate-slide-up">
+              <div className="flex items-center justify-between px-5 py-4 border-b border-[#1E293B] bg-[#0F172A]">
+                <div className="flex items-center gap-3">
+                  <button 
+                    onClick={() => setShowGroupPostModal(false)}
+                    className="w-9 h-9 rounded-full hover:bg-[#1E293B] flex items-center justify-center text-[#CBD5E1] hover:text-white transition-colors"
+                  >
+                    <i className="fas fa-arrow-left text-base"></i>
+                  </button>
+                  <h3 className="text-[#F8FAFC] text-lg font-bold">
+                    {activeGroup.category === 'buy_sell' && 'Sell an Item'}
+                    {(activeGroup.category === 'recruitment' || isCareerCategory(activeGroup.category, activeGroup.name)) && 'Post a Job Opening'}
+                    {activeGroup.category !== 'buy_sell' && activeGroup.category !== 'recruitment' && !isCareerCategory(activeGroup.category, activeGroup.name) && 'Create Group Post'}
+                  </h3>
+                </div>
+                <button 
+                  onClick={() => setShowGroupPostModal(false)}
+                  className="w-9 h-9 rounded-full hover:bg-[#1E293B] text-[#94A3B8] hover:text-white flex items-center justify-center transition-colors hidden md:flex"
+                >
+                  <i className="fas fa-times"></i>
+                </button>
+              </div>
+              
+              <div className="flex-1 flex flex-col overflow-y-auto">
+                <div className="p-5 flex items-center gap-3.5 border-b border-[#1E293B]/40 bg-[#0F172A]">
+                  <img src={avatarFrom(currentUser)} className="w-12 h-12 rounded-full object-cover flex-shrink-0 ring-1 ring-[#1E293B]" alt="" />
+                  <div className="min-w-0">
+                    <div className="font-bold text-[#F8FAFC] text-[21px] leading-tight truncate" style={{ fontSize: '21px' }}>{currentUser?.name}</div>
+                    <div className="text-[#94A3B8] text-[19px] font-normal flex items-center gap-1.5 mt-0.5 truncate" style={{ fontSize: '19px' }}>
+                      <i className="fas fa-users text-sm text-[#64748B]"></i>
+                      <span>Posting to {activeGroup.name}</span>
+                    </div>
+                  </div>
+                </div>
+                
+                {/* Buy & Sell Fields */}
+                {activeGroup.category === 'buy_sell' && (
+                  <div className="px-5 pt-4 space-y-3.5 border-b border-[#1E293B]/50 pb-4">
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-[#94A3B8] text-xs font-semibold mb-1">Price</label>
+                        <div className="flex gap-2">
+                          <select value={postMetadata.currency || 'USD'} onChange={(e) => setPostMetadata({ ...postMetadata, currency: e.target.value })} className="w-24 bg-[#1E293B] border border-[#334155] rounded-xl p-2.5 text-[#F8FAFC] text-sm outline-none">
+                            {CURRENCY_OPTIONS.map(currency => (<option key={currency.code} value={currency.code}>{currency.code}</option>))}
+                          </select>
+                          <input type="number" value={postMetadata.price || ''} onChange={(e) => setPostMetadata({ ...postMetadata, price: e.target.value })} className="flex-1 bg-[#1E293B] border border-[#334155] rounded-xl p-2.5 text-[#F8FAFC] text-sm outline-none placeholder-[#64748B]" placeholder="Price" />
+                        </div>
+                      </div>
+                      <div>
+                        <label className="block text-[#94A3B8] text-xs font-semibold mb-1">Condition</label>
+                        <select value={postMetadata.condition || 'Used - Good'} onChange={(e) => setPostMetadata({ ...postMetadata, condition: e.target.value })} className="w-full bg-[#1E293B] border border-[#334155] rounded-xl p-2.5 text-[#F8FAFC] text-sm outline-none">
+                          <option>New</option><option>Like New</option><option>Used - Like New</option><option>Used - Good</option><option>Used - Fair</option><option>For Parts/Not Working</option>
+                        </select>
+                      </div>
+                    </div>
+                    <div>
+                      <label className="block text-[#94A3B8] text-xs font-semibold mb-1">Location</label>
+                      <input type="text" value={postMetadata.location || ''} onChange={(e) => setPostMetadata({ ...postMetadata, location: e.target.value })} className="w-full bg-[#1E293B] border border-[#334155] rounded-xl p-2.5 text-[#F8FAFC] text-sm outline-none placeholder-[#64748B]" placeholder="City, State / Area" />
+                    </div>
+                  </div>
+                )}
+                
+                {/* Recruitment Fields */}
+                {(activeGroup.category === 'recruitment' || isCareerCategory(activeGroup.category, activeGroup.name)) && (
+                  <div className="px-5 pt-4 space-y-3 border-b border-[#1E293B]/50 pb-4">
+                    <div><label className="block text-[#94A3B8] text-xs font-semibold mb-1">Job Title</label><input type="text" value={postMetadata.job_title || ''} onChange={(e) => setPostMetadata({ ...postMetadata, job_title: e.target.value })} className="w-full bg-[#1E293B] border border-[#334155] rounded-xl p-2.5 text-[#F8FAFC] text-sm outline-none placeholder-[#64748B]" placeholder="e.g. Senior Frontend Engineer" /></div>
+                    <div><label className="block text-[#94A3B8] text-xs font-semibold mb-1">Company</label><input type="text" value={postMetadata.company || ''} onChange={(e) => setPostMetadata({ ...postMetadata, company: e.target.value })} className="w-full bg-[#1E293B] border border-[#334155] rounded-xl p-2.5 text-[#F8FAFC] text-sm outline-none placeholder-[#64748B]" placeholder="Company name" /></div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div><label className="block text-[#94A3B8] text-xs font-semibold mb-1">Job Type</label><select value={postMetadata.job_type || 'Full-time'} onChange={(e) => setPostMetadata({ ...postMetadata, job_type: e.target.value })} className="w-full bg-[#1E293B] border border-[#334155] rounded-xl p-2.5 text-[#F8FAFC] text-sm outline-none"><option>Full-time</option><option>Part-time</option><option>Contract</option><option>Internship</option><option>Freelance</option></select></div>
+                      <div><label className="block text-[#94A3B8] text-xs font-semibold mb-1">Salary Range</label><input type="text" value={postMetadata.salary || ''} onChange={(e) => setPostMetadata({ ...postMetadata, salary: e.target.value })} className="w-full bg-[#1E293B] border border-[#334155] rounded-xl p-2.5 text-[#F8FAFC] text-sm outline-none placeholder-[#64748B]" placeholder="e.g. $70k - $90k" /></div>
+                    </div>
+                    <div>
+                      <label className="block text-[#94A3B8] text-xs font-semibold mb-1">Job Location</label>
+                      <input 
+                        type="text" 
+                        value={postMetadata.location || ''} 
+                        onChange={(e) => setPostMetadata({ ...postMetadata, location: e.target.value })} 
+                        className="w-full bg-[#1E293B] border border-[#334155] rounded-xl p-2.5 text-[#F8FAFC] text-sm outline-none placeholder-[#64748B]" 
+                        placeholder="e.g. San Francisco, CA / Remote" 
+                      />
+                    </div>
+
+                    {/* Application Method: Email or External Link */}
+                    <div className="pt-2 border-t border-[#334155]/60">
+                      <label className="block text-[#94A3B8] text-xs font-semibold mb-1.5">
+                        How can candidates apply? <span className="text-[#64748B] font-normal">(Optional — if left empty, Apply button is hidden)</span>
+                      </label>
+                      <div className="grid grid-cols-2 gap-2 mb-2.5">
+                        <button
+                          type="button"
+                          onClick={() => setPostMetadata({ ...postMetadata, application_type: 'email' })}
+                          className={`py-2 px-3 rounded-xl border text-sm font-semibold flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                            postMetadata.application_type === 'email'
+                              ? 'bg-[#1877F2]/15 border-[#1877F2] text-[#1877F2]'
+                              : 'bg-[#1E293B] border-[#334155] text-[#94A3B8] hover:text-[#F8FAFC]'
+                          }`}
+                        >
+                          <i className="fas fa-envelope text-xs"></i>
+                          <span>By Email</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setPostMetadata({ ...postMetadata, application_type: 'link' })}
+                          className={`py-2 px-3 rounded-xl border text-sm font-semibold flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                            postMetadata.application_type === 'link'
+                              ? 'bg-[#1877F2]/15 border-[#1877F2] text-[#1877F2]'
+                              : 'bg-[#1E293B] border-[#334155] text-[#94A3B8] hover:text-[#F8FAFC]'
+                          }`}
+                        >
+                          <i className="fas fa-external-link-alt text-xs"></i>
+                          <span>By External Link</span>
+                        </button>
+                      </div>
+
+                      {postMetadata.application_type === 'email' && (
+                        <div className="animate-fade-in">
+                          <label className="block text-[#94A3B8] text-[11px] font-medium mb-1">
+                            Application Email Address
+                          </label>
+                          <div className="relative">
+                            <i className="fas fa-envelope absolute left-3 top-1/2 -translate-y-1/2 text-[#64748B] text-xs"></i>
+                            <input
+                              type="email"
+                              value={postMetadata.application_value || ''}
+                              onChange={(e) => setPostMetadata({ ...postMetadata, application_value: e.target.value })}
+                              className="w-full bg-[#1E293B] border border-[#334155] rounded-xl pl-8 pr-3 py-2 text-[#F8FAFC] text-sm outline-none placeholder-[#64748B] focus:border-[#1877F2]"
+                              placeholder="e.g. jobs@company.com"
+                            />
+                          </div>
+                        </div>
+                      )}
+
+                      {postMetadata.application_type === 'link' && (
+                        <div className="animate-fade-in">
+                          <label className="block text-[#94A3B8] text-[11px] font-medium mb-1">
+                            Application Website / Careers URL
+                          </label>
+                          <div className="relative">
+                            <i className="fas fa-link absolute left-3 top-1/2 -translate-y-1/2 text-[#64748B] text-xs"></i>
+                            <input
+                              type="url"
+                              value={postMetadata.application_value || ''}
+                              onChange={(e) => setPostMetadata({ ...postMetadata, application_value: e.target.value })}
+                              className="w-full bg-[#1E293B] border border-[#334155] rounded-xl pl-8 pr-3 py-2 text-[#F8FAFC] text-sm outline-none placeholder-[#64748B] focus:border-[#1877F2]"
+                              placeholder="e.g. https://company.com/careers/apply"
+                            />
+                          </div>
+                        </div>
+                      )}
+
+                      {postMetadata.application_type && (
+                        <div className="flex justify-end mt-1.5">
+                          <button
+                            type="button"
+                            onClick={() => setPostMetadata({ ...postMetadata, application_type: undefined, application_value: '' })}
+                            className="text-[#94A3B8] hover:text-[#CBD5E1] text-[11px] underline cursor-pointer"
+                          >
+                            Remove application method (hide Apply button)
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+                
+                {/* Large, Professional Typing Area - Flat Dark with zero borders and no shade */}
+                <div className="px-0 py-4 min-h-[260px] md:min-h-[320px] flex-1 flex flex-col bg-transparent border-0">
+                  <textarea 
+                    className="w-full flex-1 bg-transparent outline-none text-[#F8FAFC] placeholder-[#64748B] resize-none text-[19px] leading-relaxed font-normal min-h-[240px] px-4 border-0 focus:ring-0 focus:outline-none" 
+                    style={{ fontSize: '19px' }}
+                    placeholder={
+                      activeGroup.category === 'buy_sell' ? "Describe your item in detail (features, condition, specifications, warranty, why you're selling)..." : 
+                      activeGroup.category === 'recruitment' ? "Describe the role, responsibilities, requirements, qualifications, and how to apply..." : 
+                      `What's on your mind? Share thoughts, ask questions, or contribute to ${activeGroup.name}...`
+                    } 
+                    value={postContent} 
+                    onChange={e => setPostContent(e.target.value)} 
+                    rows={8} 
+                    autoFocus
+                  />
+                </div>
+                
+                {/* File Previews */}
+                {previews.length > 0 && (
+                  <div className="px-5 mb-4">
+                    <div className="grid grid-cols-4 gap-2.5">
+                      {previews.slice(0, 4).map((preview, index) => (
+                        <div key={index} className="relative aspect-square rounded-xl overflow-hidden group border border-[#1E293B]">
+                          <img src={preview} alt={`Preview ${index + 1}`} className="w-full h-full object-cover" />
+                          <button onClick={() => handleRemoveFile(index)} className="absolute top-1.5 right-1.5 w-7 h-7 bg-black/70 hover:bg-black text-white rounded-full flex items-center justify-center transition-colors"><i className="fas fa-times text-xs"></i></button>
+                        </div>
+                      ))}
+                      {previews.length > 4 && (<div className="aspect-square rounded-xl bg-[#1E293B] border border-[#334155] flex items-center justify-center"><span className="text-[#F8FAFC] font-bold text-lg">+{previews.length - 4}</span></div>)}
+                    </div>
+                  </div>
+                )}
+                
+                {/* Action Buttons Toolbar */}
+                <div className="border-t border-[#1E293B] bg-[#0B1120] p-3 px-5 flex items-center justify-between">
+                  <span className="text-xs text-[#94A3B8] font-semibold">Add to your post</span>
+                  <div className="flex items-center gap-2">
+                    <button 
+                      type="button"
+                      className="flex items-center gap-2 px-3.5 py-2 hover:bg-[#1E293B] rounded-xl cursor-pointer transition-colors border border-transparent hover:border-[#334155]" 
+                      onClick={handlePostImageClick}
+                    >
+                      <i className="fas fa-images text-[#45BD62] text-lg"></i>
+                      <span className="text-sm font-semibold text-[#CBD5E1]">
+                        {postFiles.length > 0 ? `${postFiles.length} photo${postFiles.length > 1 ? 's' : ''}` : 'Photos'}
+                      </span>
+                    </button>
+                  </div>
+                </div>
+                
+                {/* Submit Button */}
+                <div className="p-5 border-t border-[#1E293B] bg-[#0F172A]">
+                  <button 
+                    onClick={handlePostSubmit} 
+                    disabled={!postContent.trim() && postFiles.length === 0} 
+                    className="w-full bg-[#1877f2] text-white font-bold text-base py-3.5 rounded-xl hover:bg-[#166fe5] disabled:opacity-50 transition-all shadow-lg active:scale-95 disabled:cursor-not-allowed"
+                  >
+                    {activeGroup.category === 'buy_sell' ? 'List Item in Group' : activeGroup.category === 'recruitment' ? 'Post Job' : 'Post to Community'}
+                  </button>
+                </div>
+              </div>
+              <input type="file" ref={postFileInputRef} className="hidden" accept="image/*" multiple onChange={handleFileChange} />
+            </div>
+          </div>
+        )}
+        
+        {/* Create Event Modal */}
+        {showEventModal && currentUser && activeGroup && (
+          <CreateEventModal 
+            currentUser={currentUser} 
+            onClose={() => setShowEventModal(false)} 
+            onCreate={(eventData) => handleCreateEvent(eventData)} 
+            groupId={activeGroup.id} 
+            groupName={activeGroup.name} 
+          />
+        )}
+      </div>
+
+{/* Invite Modal */}
+{showInviteModal && activeGroup && (
+  <div className="fixed inset-0 z-[210] bg-black/65 backdrop-blur-sm flex items-end md:items-center md:justify-center p-0 md:p-4 animate-fade-in" onClick={() => setShowInviteModal(false)}>
+    <div className="w-full md:max-w-[520px] bg-[#0F172A] rounded-t-3xl md:rounded-2xl border border-[#1E293B] max-h-[85vh] flex flex-col overflow-hidden animate-slide-up shadow-2xl" onClick={(e) => e.stopPropagation()}>
+      <div className="px-5 py-4 border-b border-[#1E293B] flex items-center justify-between">
+        <div>
+          <div className="text-[#F8FAFC] font-bold text-lg">Invite Followers</div>
+          <div className="text-[#94A3B8] text-xs mt-0.5">{activeGroup.name}</div>
+        </div>
+        <button onClick={() => setShowInviteModal(false)} className="w-9 h-9 rounded-full hover:bg-[#141E33] text-[#94A3B8] hover:text-white flex items-center justify-center transition-colors">
+          <i className="fas fa-times"></i>
+        </button>
+      </div>
+      <div className="p-4 border-b border-[#1E293B] bg-[#0B1120]">
+        <div className="relative">
+          <i className="fas fa-search absolute left-3.5 top-1/2 -translate-y-1/2 text-[#94A3B8] text-sm"></i>
+          <input 
+            value={inviteSearch} 
+            onChange={(e) => {
+              setInviteSearch(e.target.value);
+              setInviteLimit(10);
+            }} 
+            placeholder="Search followers by name or username..." 
+            className="w-full bg-[#1E293B] border border-[#334155]/60 focus:border-[#1877f2] rounded-xl pl-10 pr-4 py-2.5 outline-none text-sm text-[#F8FAFC] placeholder-[#64748B] transition-colors" 
+          />
+          {inviteSearch && (
+            <button onClick={() => setInviteSearch('')} className="absolute right-3 top-1/2 -translate-y-1/2 text-[#64748B] hover:text-[#CBD5E1] text-xs">
+              <i className="fas fa-times-circle"></i>
+            </button>
+          )}
+        </div>
+      </div>
+      <div className="overflow-y-auto max-h-[55vh] p-2 space-y-1">
+        {inviteableUsers.length > 0 ? (
+          <>
+            {inviteableUsers.slice(0, inviteLimit).map((user: any) => {
+              const loading = invitingUserIds.includes(user.id);
+              const isInvited = user.isInvited === true || locallyInvitedUserIds.includes(Number(user.id));
+              
+              return (
+                <div key={user.id} className="flex items-center justify-between p-3 hover:bg-[#141E33] rounded-xl transition-colors">
+                  <div className="flex items-center gap-3 cursor-pointer min-w-0 flex-1 mr-3" onClick={() => onProfileClick?.(user.id)}>
+                    <img src={avatarFrom(user)} className="w-12 h-12 rounded-full object-cover flex-shrink-0 border border-[#1E293B]" alt="" />
+                    <div className="min-w-0">
+                      <div className="text-[#F8FAFC] font-bold text-sm truncate">{user.name || user.username}</div>
+                      <div className="text-[#94A3B8] text-xs truncate">@{user.username || 'user'}</div>
+                    </div>
+                  </div>
+                  <button 
+                    onClick={() => !isInvited && !loading && handleInviteUser(user.id)} 
+                    disabled={isInvited || loading}
+                    className={`px-4 py-2 rounded-xl font-bold text-xs transition-all flex items-center gap-1.5 flex-shrink-0 ${
+                      isInvited 
+                        ? 'bg-[#1E293B] text-[#94A3B8] cursor-not-allowed border border-[#334155]/40'
+                        : 'bg-[#1877f2] text-white hover:bg-[#166fe5] shadow-sm active:scale-95'
+                    } disabled:opacity-75`}
+                  >
+                    {loading ? (
+                      <>
+                        <i className="fas fa-spinner fa-spin text-xs"></i>
+                        <span>Inviting...</span>
+                      </>
+                    ) : isInvited ? (
+                      <>
+                        <i className="fas fa-check text-xs"></i>
+                        <span>Invited</span>
+                      </>
+                    ) : (
+                      <>
+                        <i className="fas fa-user-plus text-xs"></i>
+                        <span>Invite</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              );
+            })}
+
+            {inviteableUsers.length > inviteLimit && (
+              <div className="pt-2 pb-1 px-3 text-center">
+                <button
+                  type="button"
+                  onClick={() => setInviteLimit(prev => prev + 10)}
+                  className="w-full py-2.5 rounded-xl bg-[#1E293B] hover:bg-[#334155] text-[#1877f2] hover:text-white font-bold text-xs transition-colors flex items-center justify-center gap-2"
+                >
+                  <span>See More</span>
+                  <span className="text-[11px] text-[#94A3B8]">({inviteableUsers.length - inviteLimit} remaining)</span>
+                  <i className="fas fa-chevron-down text-[10px]"></i>
+                </button>
+              </div>
+            )}
+          </>
+        ) : (
+          <div className="py-12 text-center text-[#94A3B8] text-sm">
+            <i className="fas fa-user-friends text-3xl mb-3 text-[#334155] block"></i>
+            {inviteSearch ? 'No followers match your search.' : 'No followers available to invite.'}
+          </div>
+        )}
+      </div>
+    </div>
+  </div>
+)}
+
+{/* Professional Share Group Modal with Copy Link */}
+{showShareGroupModal && activeGroup && (
+  <div 
+    className="fixed inset-0 z-[220] bg-black/70 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4 animate-fade-in font-sans"
+    onClick={() => setShowShareGroupModal(false)}
+  >
+    <div 
+      className="bg-[#0F172A] w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl border border-[#1E293B] overflow-hidden shadow-2xl animate-slide-up"
+      onClick={e => e.stopPropagation()}
+    >
+      {/* Header */}
+      <div className="flex items-center justify-between px-5 py-4 border-b border-[#1E293B]">
+        <div className="flex items-center gap-2.5">
+          <div className="w-8 h-8 rounded-lg bg-[#1877f2]/15 text-[#1877f2] flex items-center justify-center text-sm">
+            <i className="fas fa-share-alt"></i>
+          </div>
+          <h3 className="text-base font-bold text-[#F8FAFC]">Share Group</h3>
+        </div>
+        <button 
+          onClick={() => setShowShareGroupModal(false)}
+          className="w-8 h-8 rounded-full hover:bg-[#1E293B] text-[#94A3B8] hover:text-white flex items-center justify-center transition-colors"
+        >
+          <i className="fas fa-times"></i>
+        </button>
+      </div>
+
+      <div className="p-5 space-y-4">
+        {/* Group Preview Card */}
+        <div className="flex items-center gap-3.5 p-3 rounded-xl bg-[#1E293B]/60 border border-[#334155]/40">
+          <img 
+            src={activeGroup.cover_image || activeGroup.image_url || 'https://images.unsplash.com/photo-1522071820081-009f0129c71c?auto=format&fit=crop&w=400'} 
+            alt={activeGroup.name}
+            className="w-12 h-12 rounded-xl object-cover flex-shrink-0 border border-[#334155]"
+          />
+          <div className="min-w-0 flex-1">
+            <h4 className="font-bold text-[#F8FAFC] text-sm truncate">{activeGroup.name}</h4>
+            <p className="text-xs text-[#94A3B8] flex items-center gap-1.5 mt-0.5">
+              <span className="capitalize">{activeGroup.type || 'public'} group</span>
+              <span>•</span>
+              <span>{(Array.isArray(activeGroup.members) ? activeGroup.members.length : activeGroup.members_count) || 1} members</span>
+            </p>
+          </div>
+        </div>
+
+        {/* Copy Link Section */}
+        <div>
+          <label className="block text-xs font-semibold uppercase tracking-wider text-[#94A3B8] mb-2">Group Link</label>
+          <div className="flex items-center gap-2 bg-[#1E293B] border border-[#334155] rounded-xl p-2 pl-3">
+            <i className="fas fa-link text-[#94A3B8] text-sm flex-shrink-0"></i>
+            <input 
+              readOnly 
+              value={getGroupShareLink(activeGroup)} 
+              className="bg-transparent text-sm text-[#CBD5E1] outline-none flex-1 truncate select-all"
+            />
+            <button
+              onClick={async () => {
+                const link = getGroupShareLink(activeGroup);
+                try {
+                  await navigator.clipboard.writeText(link);
+                  setCopiedGroupLink(true);
+                  setTimeout(() => setCopiedGroupLink(false), 3000);
+                } catch {
+                  const input = document.createElement('input');
+                  input.value = link;
+                  document.body.appendChild(input);
+                  input.select();
+                  document.execCommand('copy');
+                  document.body.removeChild(input);
+                  setCopiedGroupLink(true);
+                  setTimeout(() => setCopiedGroupLink(false), 3000);
+                }
+              }}
+              className={`px-4 py-2 rounded-lg font-bold text-xs transition-all flex items-center gap-1.5 flex-shrink-0 ${
+                copiedGroupLink 
+                  ? 'bg-[#10B981] text-white shadow-md shadow-[#10B981]/20' 
+                  : 'bg-[#1877f2] hover:bg-[#166fe5] text-white active:scale-95'
+              }`}
+            >
+              <i className={`fas ${copiedGroupLink ? 'fa-check' : 'fa-copy'}`}></i>
+              <span>{copiedGroupLink ? 'Copied!' : 'Copy link'}</span>
+            </button>
+          </div>
+          {copiedGroupLink && (
+            <p className="text-xs text-[#10B981] font-semibold mt-2 flex items-center gap-1 animate-fade-in">
+              <i className="fas fa-check-circle"></i> Group link copied to clipboard successfully!
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
+  </div>
+)}
+
+    
+      {/* Full Post View for Groups */}
+      {showPostView && selectedPost && selectedPostAuthor && currentUser && (
+        <CommentsSheet 
+          post={selectedPost} 
+          currentUser={currentUser} 
+          users={users} 
+          onClose={() => { 
+            setShowPostView(false); 
+            setSelectedPost(null); 
+            setSelectedPostAuthor(null); 
+          }} 
+          onComment={onComment} 
+          onLikeComment={onLikeComment} 
+          onCommentAdded={selectedPost?.onCommentAdded} 
+          getCommentAuthor={(id) => users.find(u => u.id === id)} 
+          onProfileClick={onProfileClick} 
+          onHashtagClick={onHashtagClick} 
+          onFollow={onFollow} 
+          checkIsFollowing={checkIsFollowing} 
+        />
+      )}
+    </>
+  );
+};

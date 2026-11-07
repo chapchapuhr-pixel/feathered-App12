@@ -1,0 +1,4152 @@
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+
+// -------------------- ADDED: Import ranking utility --------------------
+import { rankStoriesForReel } from '../utils/ranking';
+import { apiFetch, avatarFrom, formatRelativeTime, RichText, ReactionsSheet } from './Feed';
+
+// -------------------- ADDED: Import filters --------------------
+import Filters, { 
+  UneraFilter, 
+  buildUneraFilterStyle, 
+  UneraFilterOverlay, 
+  getUneraFilterById 
+} from './filters';
+import {
+  getCachedComments,
+  setCachedComments,
+  updateCachedComment,
+  removeCachedComment,
+} from '../utils/dataCache';
+import { CommentActionModal, useCommentLongPress } from './CommentActionModal';
+
+// -------------------- NATIVE APP HELPERS --------------------
+const isUneraNativeApp = (): boolean => {
+  return Boolean(
+    (window as any).UneraNative ||
+    (window as any).UNERA_IS_NATIVE_APP ||
+    (window as any).flutter_inappwebview
+  );
+};
+
+const callUneraNative = (payload: any): boolean => {
+  if (!isUneraNativeApp()) return false;
+  if ((window as any).UneraNative?.postMessage) {
+    (window as any).UneraNative.postMessage(JSON.stringify(payload));
+    return true;
+  }
+  return false;
+};
+
+type NativeMediaMeta = {
+  thumb?: string | null;
+  feed?: string | null;
+  full?: string | null;
+  url?: string | null;
+  type?: 'image' | 'video' | 'audio' | string;
+  mimeType?: string;
+  fileName?: string;
+};
+
+// -------------------- STORY COMMENTS CACHE --------------------
+const storyCommentsCache = new Map<number, any[]>();
+
+export const setStoryCommentsCache = (storyId: number, comments: any[]) => {
+  const arr = Array.isArray(comments) ? comments : [];
+  storyCommentsCache.set(Number(storyId), arr);
+  setCachedComments('story', storyId, arr);
+};
+
+export const getStoryCommentsCache = (storyId: number) => {
+  const inMem = storyCommentsCache.get(Number(storyId));
+  if (inMem && inMem.length > 0) return inMem;
+  const stored = getCachedComments('story', storyId);
+  if (stored?.data && stored.data.length > 0) {
+    storyCommentsCache.set(Number(storyId), stored.data);
+    return stored.data;
+  }
+  return null;
+};
+
+// -------------------- TYPES --------------------
+export interface User {
+  id: number;
+  username: string;
+  name: string;
+  email: string;
+  profile_image_url: string;
+  cover_image_url: string;
+  followers: number[];
+  following: number[];
+  is_verified: boolean;
+  role: 'user' | 'creator' | 'admin';
+  is_online: boolean;
+  location: string;
+  bio: string;
+  created_at: string | null;
+}
+
+export interface Song {
+  id: number;
+  title: string;
+  artist_name: string;
+  audio_url: string;
+  cover_image_url: string;
+  duration: number;
+}
+
+export interface StoryViewer {
+  id: number;
+  user_id: number;
+  story_id: number;
+  viewed_at: string;
+  reaction?: 'like' | 'love' | 'wow' | 'haha' | 'sad' | 'angry' | null;
+  user?: User;
+}
+
+export interface StoryAnalytics {
+  total_views: number;
+  unique_viewers: number;
+  views_with_reactions: number;
+  reaction_breakdown: Record<string, number>;
+  completion_rate?: number;
+  average_view_time?: number;
+}
+
+export interface StoryType {
+  id: number;
+  user_id: number;
+  type: 'image' | 'video' | 'text';
+  media_url: string | null;
+  media_urls?: string[];
+  media_types?: string[];
+  media_meta?: Array<{
+    thumb?: string | null;
+    feed?: string | null;
+    full?: string | null;
+    type?: string;
+  }>;
+  text_content: string | null;
+  background_style: string | null;
+  music_url: string | null;
+  music_title: string | null;
+  music_start?: number | null;
+  music_end?: number | null;
+  music_duration?: number | null;
+  created_at: string;
+  expires_at?: string | null;
+  is_active?: boolean;
+  user?: User;
+  views?: StoryViewer[];
+  analytics?: StoryAnalytics;
+  liked_by_me?: boolean;
+  
+  views_count?: number;
+  reactions_count?: number;
+  comments_count?: number;
+  shares_count?: number;
+  my_reaction?: string | null;
+  reaction_breakdown?: Record<string, number>;
+}
+
+export interface CreateStoryData {
+  user_id: number;
+  type: 'image' | 'video' | 'text';
+  media_file?: File;
+  media_url?: string | null;
+  media_urls?: string[];
+  media_types?: string[];
+  media_meta?: Array<{
+    thumb?: string | null;
+    feed?: string | null;
+    full?: string | null;
+    type?: string;
+  }>;
+  text_content?: string;
+  background_style?: string;
+  music_url?: string;
+  music_title?: string;
+  music_start?: number;
+  music_end?: number;
+  music_duration?: number;
+  audio_file?: File;
+}
+
+// ==================== STORY UPLOAD HELPERS ====================
+const STORY_VIDEO_MAX_SECONDS = 90;
+
+const fileExtFromName = (name?: string) => {
+  const s = String(name || '').trim();
+  const i = s.lastIndexOf('.');
+  return i >= 0 ? s.slice(i + 1).toLowerCase() : '';
+};
+
+const isVideoFile = (file?: File | null) => 
+  !!file && (file.type.startsWith('video/') || ['mp4', 'webm', 'mov', 'm4v'].includes(fileExtFromName(file.name)));
+
+const loadImageElement = (src: string) =>
+  new Promise<HTMLImageElement>((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = src;
+  });
+
+const loadVideoElement = (src: string) =>
+  new Promise<HTMLVideoElement>((resolve, reject) => {
+    const v = document.createElement('video');
+    v.preload = 'metadata';
+    v.playsInline = true;
+    v.muted = true;
+    v.src = src;
+    const cleanup = () => {
+      v.onloadedmetadata = null;
+      v.onerror = null;
+    };
+    v.onloadedmetadata = () => {
+      cleanup();
+      resolve(v);
+    };
+    v.onerror = () => {
+      cleanup();
+      reject(new Error('Failed to load video'));
+    };
+  });
+
+const canvasToBlob = (canvas: HTMLCanvasElement, type: string, quality?: number) =>
+  new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error('Canvas export failed'));
+    }, type, quality);
+  });
+
+const makeImageVariants = async (file: File) => {
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const img = await loadImageElement(objectUrl);
+    
+    const calcSize = (w: number, h: number, max: number) => {
+      if (Math.max(w, h) <= max) return { width: w, height: h };
+      const scale = max / Math.max(w, h);
+      return {
+        width: Math.round(w * scale),
+        height: Math.round(h * scale),
+      };
+    };
+
+    const feedSize = calcSize(img.naturalWidth, img.naturalHeight, 1080);
+    const thumbSize = calcSize(img.naturalWidth, img.naturalHeight, 320);
+
+    const fullCanvas = document.createElement('canvas');
+    fullCanvas.width = img.naturalWidth;
+    fullCanvas.height = img.naturalHeight;
+    fullCanvas.getContext('2d')!.drawImage(img, 0, 0);
+
+    const feedCanvas = document.createElement('canvas');
+    feedCanvas.width = feedSize.width;
+    feedCanvas.height = feedSize.height;
+    feedCanvas.getContext('2d')!.drawImage(img, 0, 0, feedSize.width, feedSize.height);
+
+    const thumbCanvas = document.createElement('canvas');
+    thumbCanvas.width = thumbSize.width;
+    thumbCanvas.height = thumbSize.height;
+    thumbCanvas.getContext('2d')!.drawImage(img, 0, 0, thumbSize.width, thumbSize.height);
+
+    const fullBlob = file.type === 'image/jpeg' || file.type === 'image/png' || file.type === 'image/webp'
+      ? file
+      : new File([await canvasToBlob(fullCanvas, 'image/jpeg', 0.92)], `${Date.now()}-original.jpg`, { type: 'image/jpeg' });
+
+    const feedBlob = await canvasToBlob(feedCanvas, 'image/webp', 0.82);
+    const thumbBlob = await canvasToBlob(thumbCanvas, 'image/webp', 0.72);
+
+    const fullFile = fullBlob instanceof File ? fullBlob : new File([fullBlob], `${Date.now()}-original.jpg`, { type: 'image/jpeg' });
+    const feedFile = new File([feedBlob], `${Date.now()}-feed.webp`, { type: 'image/webp' });
+    const thumbFile = new File([thumbBlob], `${Date.now()}-thumbnail.webp`, { type: 'image/webp' });
+
+    return { fullFile, feedFile, thumbFile };
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+};
+
+const createVideoThumbnailFile = async (file: File) => {
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const video = await loadVideoElement(objectUrl);
+    
+    if (Number.isFinite(video.duration) && video.duration > STORY_VIDEO_MAX_SECONDS) {
+      throw new Error('Story videos must be 1 minute 30 seconds or less');
+    }
+
+    const seekTo = Math.min(Math.max(video.duration * 0.2, 0.1), Math.max(video.duration - 0.1, 0.1));
+    
+    await new Promise<void>((resolve, reject) => {
+      const onSeeked = () => {
+        video.removeEventListener('seeked', onSeeked);
+        resolve();
+      };
+      const onError = () => {
+        video.removeEventListener('error', onError);
+        reject(new Error('Could not seek video for thumbnail'));
+      };
+      video.addEventListener('seeked', onSeeked, { once: true });
+      video.addEventListener('error', onError, { once: true });
+      try {
+        video.currentTime = seekTo;
+      } catch {
+        resolve();
+      }
+    });
+
+    const max = 320;
+    const scale = max / Math.max(video.videoWidth || max, video.videoHeight || max);
+    const width = Math.max(1, Math.round((video.videoWidth || max) * Math.min(scale, 1)));
+    const height = Math.max(1, Math.round((video.videoHeight || max) * Math.min(scale, 1)));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    canvas.getContext('2d')!.drawImage(video, 0, 0, width, height);
+
+    const thumbBlob = await canvasToBlob(canvas, 'image/webp', 0.72);
+    return new File([thumbBlob], `${Date.now()}-thumbnail.webp`, { type: 'image/webp' });
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+};
+
+const uploadStoryImageSecret = async (file: File) => {
+  const { fullFile, feedFile, thumbFile } = await makeImageVariants(file);
+  const fd = new FormData();
+  fd.append('original', fullFile);
+  fd.append('feed', feedFile);
+  fd.append('thumbnail', thumbFile);
+  
+  const res = await fetch('/api/upload', { method: 'POST', body: fd });
+  const data = await res.json().catch(() => null);
+  
+  if (!res.ok || !data?.success) {
+    throw new Error(data?.error || 'Story image upload failed');
+  }
+  
+  return {
+    media_url: data?.uploaded?.feed?.url || data?.uploaded?.original?.url || null,
+    media_urls: [data?.uploaded?.feed?.url || data?.uploaded?.original?.url].filter(Boolean),
+    media_types: ['image'],
+    media_meta: [
+      {
+        thumb: data?.uploaded?.thumbnail?.url || null,
+        feed: data?.uploaded?.feed?.url || data?.uploaded?.original?.url || null,
+        full: data?.uploaded?.feed?.url || data?.uploaded?.original?.url || null,
+        type: 'image',
+      },
+    ],
+  };
+};
+
+const uploadStoryVideoSecret = async (file: File) => {
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const video = await loadVideoElement(objectUrl);
+    if (Number.isFinite(video.duration) && video.duration > STORY_VIDEO_MAX_SECONDS) {
+      throw new Error('Story videos must be 1 minute 30 seconds or less');
+    }
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+  
+  const thumbFile = await createVideoThumbnailFile(file);
+  const fd = new FormData();
+  fd.append('original', file);
+  fd.append('thumbnail', thumbFile);
+  
+  const res = await fetch('/api/upload', { method: 'POST', body: fd });
+  const data = await res.json().catch(() => null);
+  
+  if (!res.ok || !data?.success) {
+    throw new Error(data?.error || 'Story video upload failed');
+  }
+  
+  return {
+    media_url: data?.uploaded?.original?.url || null,
+    media_urls: [data?.uploaded?.original?.url].filter(Boolean),
+    media_types: ['video'],
+    media_meta: [
+      {
+        thumb: data?.uploaded?.thumbnail?.url || null,
+        feed: null,
+        full: data?.uploaded?.original?.url || null,
+        type: 'video',
+      },
+    ],
+  };
+};
+
+// -------------------- HELPER FUNCTIONS --------------------
+const parseServerTime = (value?: string): number => {
+  const s = String(value ?? '').trim();
+  if (!s) return Date.now();
+
+  if (/[zZ]|[+-]\d{2}:?\d{2}$/.test(s)) {
+    const t = Date.parse(s);
+    return Number.isFinite(t) ? t : Date.now();
+  }
+
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(s)) {
+    const iso = s.replace(' ', 'T') + 'Z';
+    const t = Date.parse(iso);
+    return Number.isFinite(t) ? t : Date.now();
+  }
+
+  const t = Date.parse(s);
+  return Number.isFinite(t) ? t : Date.now();
+};
+
+const formatStoryTime = (created_at?: string): string => {
+  const t = parseServerTime(created_at);
+  const diff = Date.now() - t;
+
+  if (diff < 60_000) return 'Just now';
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}min`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}hrs`;
+  return `${Math.floor(diff / 86_400_000)}days`;
+};
+
+const safeText = (v: any): string => String(v ?? '').trim();
+
+const isPlaceholderName = (v: any): boolean => {
+  const s = String(v ?? '').trim().toLowerCase();
+  return !s || s === 'user' || s === 'unknown' || s === 'un';
+};
+
+const pickBestName = (...vals: any[]): string => {
+  for (const v of vals) if (!isPlaceholderName(v)) return String(v);
+  return 'User';
+};
+
+const pickBestImage = (...vals: any[]): string => {
+  for (const v of vals) {
+    const s = safeText(v);
+    if (s && s !== 'null' && s !== 'undefined') return s;
+  }
+  return '';
+};
+
+const getDefaultProfilePicture = (name: string, userId: number): string => {
+  const colors = ['1877F2', '45BD62', 'F3425F', 'F7B928', '9360F7'];
+  const color = colors[Math.abs(userId) % colors.length];
+  const initials = safeText(name).slice(0, 1).toUpperCase() || 'U';
+  return `https://ui-avatars.com/api/?name=${encodeURIComponent(
+    initials
+  )}&background=${color}&color=fff&size=128&font-size=0.5&bold=true&rounded=true`;
+};
+
+const mergeUserSafe = (prev: User | undefined, patch: Partial<User> | undefined): User => {
+  if (!prev && !patch) {
+    return {
+      id: 0,
+      username: 'user',
+      name: 'User',
+      email: '',
+      profile_image_url: getDefaultProfilePicture('User', 0),
+      cover_image_url: '',
+      followers: [],
+      following: [],
+      is_verified: false,
+      role: 'user',
+      is_online: false,
+      location: '',
+      bio: '',
+      created_at: null,
+    };
+  }
+
+  if (!prev && patch) {
+    return {
+      id: patch.id || 0,
+      username: patch.username || 'user',
+      name: patch.name || 'User',
+      email: patch.email || '',
+      profile_image_url:
+        patch.profile_image_url || getDefaultProfilePicture(patch.name || 'User', patch.id || 0),
+      cover_image_url: patch.cover_image_url || '',
+      followers: Array.isArray(patch.followers) ? patch.followers : [],
+      following: Array.isArray(patch.following) ? patch.following : [],
+      is_verified: patch.is_verified || false,
+      role: patch.role || 'user',
+      is_online: patch.is_online || false,
+      location: patch.location || '',
+      bio: patch.bio || '',
+      created_at: patch.created_at || null,
+    };
+  }
+
+  if (prev && !patch) return prev;
+
+  return {
+    ...prev!,
+    ...patch,
+    id: patch?.id ?? prev!.id,
+    username: patch?.username ?? prev!.username,
+    name: patch?.name ?? prev!.name,
+    followers: Array.isArray(patch?.followers) ? (patch as any).followers : prev!.followers,
+    following: Array.isArray(patch?.following) ? (patch as any).following : prev!.following,
+    profile_image_url:
+      patch?.profile_image_url &&
+      safeText(patch.profile_image_url) &&
+      !patch.profile_image_url.includes('ui-avatars.com/api/?name=User') &&
+      !patch.profile_image_url.includes('ui-avatars.com/api/?name=UN')
+        ? patch.profile_image_url
+        : prev!.profile_image_url,
+  } as User;
+};
+
+const isVideoUrl = (url?: string): boolean => {
+  const s = safeText(url).toLowerCase();
+  return s.endsWith('.mp4') || s.endsWith('.webm') || s.endsWith('.mov') || s.includes('video');
+};
+
+const isBlob = (url?: string): boolean => safeText(url).startsWith('blob:');
+
+const clamp = (v: number, min: number, max: number): number => Math.max(min, Math.min(max, v));
+
+const getReactionEmoji = (reaction?: string | null): string => {
+  switch (reaction) {
+    case 'like': return '👍';
+    case 'love': return '❤️';
+    case 'wow': return '😮';
+    case 'haha': return '😂';
+    case 'sad': return '😢';
+    case 'angry': return '😠';
+    default: return '👁️';
+  }
+};
+
+const getReactionColor = (reaction?: string | null): string => {
+  switch (reaction) {
+    case 'like': return 'text-blue-400';
+    case 'love': return 'text-red-400';
+    case 'wow': return 'text-yellow-400';
+    case 'haha': return 'text-yellow-500';
+    case 'sad': return 'text-blue-300';
+    case 'angry': return 'text-red-500';
+    default: return 'text-white/60';
+  }
+};
+
+const getReactionName = (reaction?: string | null): string => {
+  switch (reaction) {
+    case 'like': return 'Like';
+    case 'love': return 'Love';
+    case 'wow': return 'Wow';
+    case 'haha': return 'Haha';
+    case 'sad': return 'Sad';
+    case 'angry': return 'Angry';
+    default: return 'Viewed';
+  }
+};
+
+const dedupeViewers = (arr: StoryViewer[]): StoryViewer[] => {
+  const map = new Map<number, StoryViewer>();
+
+  for (const v of arr || []) {
+    const uid = Number(v.user?.id ?? v.user_id ?? 0);
+    if (!uid) continue;
+
+    const prev = map.get(uid);
+    if (!prev) {
+      map.set(uid, v);
+      continue;
+    }
+
+    const prevHasReaction = !!prev.reaction;
+    const nextHasReaction = !!v.reaction;
+
+    if (!prevHasReaction && nextHasReaction) {
+      map.set(uid, v);
+    } else {
+      const a = parseServerTime(prev.viewed_at);
+      const b = parseServerTime(v.viewed_at);
+      if (b > a) map.set(uid, v);
+    }
+  }
+
+  return Array.from(map.values()).sort((a, b) =>
+    parseServerTime(b.viewed_at) - parseServerTime(a.viewed_at)
+  );
+};
+
+// ==================== ICONS ====================
+const SparkReactIcon: React.FC<{ size?: number }> = ({ size = 28 }) => (
+  <svg width={size} height={size} viewBox="0 0 64 64" aria-hidden="true">
+    <defs>
+      <linearGradient id="storySparkGrad" x1="12" y1="52" x2="52" y2="12">
+        <stop offset="0%" stopColor="#FF7A45" />
+        <stop offset="55%" stopColor="#FF5A6A" />
+        <stop offset="100%" stopColor="#FF8A3D" />
+      </linearGradient>
+      <filter id="storySparkGlow" x="-40%" y="-40%" width="180%" height="180%">
+        <feGaussianBlur stdDeviation="2.2" result="blur" />
+        <feMerge>
+          <feMergeNode in="blur" />
+          <feMergeNode in="SourceGraphic" />
+        </feMerge>
+      </filter>
+    </defs>
+    <circle cx="32" cy="32" r="18" fill="url(#storySparkGrad)" opacity="0.14" />
+    <g stroke="url(#storySparkGrad)" strokeWidth="5.2" strokeLinecap="round" filter="url(#storySparkGlow)">
+      <line x1="32" y1="10" x2="32" y2="18" />
+      <line x1="32" y1="46" x2="32" y2="54" />
+      <line x1="10" y1="32" x2="18" y2="32" />
+      <line x1="46" y1="32" x2="54" y2="32" />
+      <line x1="17" y1="17" x2="22.8" y2="22.8" />
+      <line x1="41.2" y1="41.2" x2="47" y2="47" />
+      <line x1="47" y1="17" x2="41.2" y2="22.8" />
+      <line x1="22.8" y1="41.2" x2="17" y2="47" />
+    </g>
+    <circle cx="32" cy="32" r="6.2" fill="url(#storySparkGrad)" />
+  </svg>
+);
+
+const DiscussSignalIcon: React.FC<{ size?: number; color?: string }> = ({
+  size = 28,
+  color = '#1877F2',
+}) => (
+  <svg width={size} height={size} viewBox="0 0 64 64" aria-hidden="true">
+    <g fill="none" stroke={color} strokeWidth="4.5" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M14 20c0-5 4-9 9-9h18c7 0 13 6 13 13v6c0 7-6 13-13 13H30l-9 7v-7h-1c-6 0-10-4-10-10V20z" />
+      <circle cx="27" cy="30" r="2.2" />
+      <circle cx="33" cy="30" r="2.2" />
+      <circle cx="39" cy="30" r="2.2" />
+      <path d="M48 18c3 2 5 5 6 9" />
+      <path d="M44 22c2 1 3 3 4 6" />
+    </g>
+  </svg>
+);
+
+const reactionEmoji = (t: string) => {
+  switch (t) {
+    case 'like': return '👍';
+    case 'love': return '❤️';
+    case 'haha': return '😂';
+    case 'wow': return '😮';
+    case 'sad': return '😢';
+    case 'angry': return '😡';
+    default: return '👍';
+  }
+};
+
+const fmtCount = (n: number) => {
+  const num = Number(n || 0);
+  if (num >= 1_000_000) return (num / 1_000_000).toFixed(num % 1_000_000 === 0 ? 0 : 1) + 'M';
+  if (num >= 1_000) return (num / 1_000).toFixed(num % 1_000 === 0 ? 0 : 1) + 'K';
+  return String(num);
+};
+
+// ==================== STORY COMMENTS SHEET ====================
+interface StoryCommentsSheetProps {
+  isOpen: boolean;
+  onClose: () => void;
+  storyId: number;
+  currentUser: User | null;
+  users: User[];
+  onProfileClick: (id: number) => void;
+  onHashtagClick?: (tag: string) => void;
+  onFollow?: (id: number) => void;
+  checkIsFollowing?: (id: number) => boolean;
+  followLoading?: { [key: number]: boolean };
+  onCountChange?: (count: number) => void;
+}
+
+export const StoryCommentsSheet: React.FC<StoryCommentsSheetProps> = ({
+  isOpen,
+  onClose,
+  storyId,
+  currentUser,
+  users,
+  onProfileClick,
+  onHashtagClick,
+  onFollow,
+  checkIsFollowing,
+  followLoading = {},
+  onCountChange,
+}) => {
+  const [comments, setComments] = useState<any[]>([]);
+  const [text, setText] = useState('');
+  const [replyTo, setReplyTo] = useState<any | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [expandedThreads, setExpandedThreads] = useState<Record<string, boolean>>({});
+  const inputRef = useRef<HTMLInputElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+
+  const fetchComments = useCallback(async (force = false) => {
+    if (!storyId) return;
+    const cached = getStoryCommentsCache(storyId);
+    if (!force && cached) {
+      setComments(cached);
+      onCountChange?.(cached.length);
+      return;
+    }
+    setLoading(true);
+    try {
+      const viewerParam = currentUser?.id ? `?viewerId=${currentUser.id}` : '';
+      const data = await apiFetch(`/api/stories/${storyId}/comments${viewerParam}`, {
+        headers: currentUser?.id ? { 'x-user-id': String(currentUser.id) } : undefined,
+      });
+      const commentsList = Array.isArray(data?.comments) ? data.comments : (Array.isArray(data) ? data : []);
+      setComments(commentsList);
+      setStoryCommentsCache(storyId, commentsList);
+      onCountChange?.(commentsList.length);
+    } catch (error) {
+      console.error('Failed to fetch story discussions:', error);
+    } finally {
+      setLoading(false);
+    }
+  }, [storyId, currentUser, onCountChange]);
+
+  useEffect(() => {
+    if (isOpen && storyId) {
+      fetchComments();
+    }
+  }, [isOpen, storyId, fetchComments]);
+
+  const resolveAuthor = (comment: any) => {
+    const uid = Number(comment?.user_id ?? comment?.userId ?? 0);
+    const user = users.find(u => Number(u.id) === uid);
+    const name = comment?.name || comment?.author_name || user?.name || user?.username || 'User';
+    const image = comment?.profile_image_url || comment?.author_image || user?.profile_image_url || avatarFrom(user || { name });
+    return { uid, name, image };
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!text.trim() || !currentUser || !storyId) return;
+
+    setSubmitting(true);
+    const parentId = replyTo?.id || null;
+    const finalText = text.trim();
+
+    const optimisticComment = {
+      id: `tmp-${Date.now()}`,
+      story_id: storyId,
+      user_id: currentUser.id,
+      parent_id: parentId,
+      content: finalText,
+      created_at: new Date().toISOString(),
+      updated_at: null,
+      likes_count: 0,
+      liked_by_me: false,
+      replies_count: 0,
+      name: currentUser.name,
+      username: currentUser.username,
+      profile_image_url: currentUser.profile_image_url,
+    };
+
+    setComments(prev => {
+      const next = [optimisticComment, ...prev];
+      setStoryCommentsCache(storyId, next);
+      onCountChange?.(next.length);
+      return next;
+    });
+    setText('');
+    setReplyTo(null);
+
+    try {
+      const data = await apiFetch(`/api/stories/${storyId}/comments`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-user-id': String(currentUser.id),
+        },
+        body: JSON.stringify({
+          user_id: currentUser.id,
+          content: finalText,
+          image_url: null,
+          parent_id: parentId,
+        }),
+      });
+      
+      const newComment = data?.comment || optimisticComment;
+      setComments(prev => {
+        const next = prev.map(c => c.id === optimisticComment.id ? newComment : c);
+        setStoryCommentsCache(storyId, next);
+        onCountChange?.(next.length);
+        return next;
+      });
+    } catch (error) {
+      console.error('Failed to post comment:', error);
+      setComments(prev => {
+        const next = prev.filter(c => c.id !== optimisticComment.id);
+        setStoryCommentsCache(storyId, next);
+        onCountChange?.(next.length);
+        return next;
+      });
+      const toast = document.createElement('div');
+      toast.className = 'fixed bottom-24 left-1/2 -translate-x-1/2 bg-[#F3425F] text-white px-6 py-2 rounded-full font-bold shadow-lg animate-fade-in z-[300]';
+      toast.innerText = 'Failed to post comment';
+      document.body.appendChild(toast);
+      setTimeout(() => toast.remove(), 2000);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleLikeComment = async (commentId: number) => {
+    if (!currentUser) return;
+
+    setComments(prev => {
+      const next = prev.map(c => {
+        if (c.id === commentId) {
+          const liked = !c.liked_by_me;
+          return {
+            ...c,
+            liked_by_me: liked,
+            likes_count: liked ? (c.likes_count || 0) + 1 : Math.max(0, (c.likes_count || 0) - 1),
+          };
+        }
+        return c;
+      });
+      setStoryCommentsCache(storyId, next);
+      return next;
+    });
+
+    try {
+      await apiFetch(`/api/stories/comments/${commentId}/like`, {
+        method: 'POST',
+        body: JSON.stringify({ user_id: currentUser.id }),
+      });
+    } catch (error) {
+      console.error('Failed to like comment:', error);
+      fetchComments(true);
+    }
+  };
+
+  // Story Comment Hold / Actions Handlers
+  const [actionModalComment, setActionModalComment] = useState<any | null>(null);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  const showToast = (msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => {
+      setToastMessage((curr) => (curr === msg ? null : curr));
+    }, 2500);
+  };
+
+  const { getHandlers: getCommentPressHandlers } = useCommentLongPress((comment: any) => {
+    setActionModalComment(comment);
+  });
+
+  const isCommentHidden = (comment: any): boolean => {
+    return Boolean(
+      comment?.is_hidden ||
+      comment?.hidden ||
+      comment?.hidden_scope ||
+      comment?.hidden_by
+    );
+  };
+
+  const isCommentAuthor = (comment: any): boolean => {
+    if (!currentUser) return false;
+    const authorId = Number(comment?.user_id ?? comment?.userId ?? 0);
+    return authorId > 0 && authorId === Number(currentUser.id);
+  };
+
+  const isPlatformAdmin = (): boolean => {
+    const role = String((currentUser as any)?.role || '').toLowerCase();
+    return ['admin', 'superadmin', 'moderator', 'owner'].includes(role);
+  };
+
+  const canHideComment = (comment: any): boolean => {
+    return isCommentAuthor(comment) || isPlatformAdmin();
+  };
+
+  const canDeleteComment = (comment: any): boolean => {
+    return isCommentAuthor(comment) || isPlatformAdmin();
+  };
+
+  const handleToggleHide = async (comment: any) => {
+    if (!currentUser || !comment || !storyId) return;
+    const commentId = comment.id;
+    const currentlyHidden = isCommentHidden(comment);
+    const nextAction: 'hide' | 'unhide' = currentlyHidden ? 'unhide' : 'hide';
+
+    // Optimistic UI update
+    setComments((prev) => {
+      const next = prev.map((c) =>
+        c.id === commentId
+          ? { ...c, is_hidden: !currentlyHidden, hidden_by: !currentlyHidden ? currentUser.id : null }
+          : c
+      );
+      setStoryCommentsCache(storyId, next);
+      return next;
+    });
+
+    showToast(nextAction === 'hide' ? 'Discussion hidden' : 'Discussion unhidden');
+
+    try {
+      await apiFetch(`/api/stories/${storyId}/comments`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-user-id': String(currentUser.id),
+        },
+        body: JSON.stringify({
+          user_id: currentUser.id,
+          comment_id: commentId,
+          action: nextAction,
+        }),
+      });
+    } catch (error) {
+      console.error(`Failed to ${nextAction} story comment:`, error);
+      showToast(`Failed to ${nextAction} discussion`);
+      fetchComments(true);
+    }
+  };
+
+  const handleDeleteComment = async (commentId: any) => {
+    if (!currentUser || !storyId) return;
+    const cid = typeof commentId === 'object' ? commentId?.id : commentId;
+
+    setComments((prev) => {
+      const next = prev.filter((c) => c.id !== cid && c.parent_id !== cid);
+      setStoryCommentsCache(storyId, next);
+      onCountChange?.(next.length);
+      return next;
+    });
+
+    showToast('Discussion deleted');
+
+    try {
+      await apiFetch(`/api/stories/${storyId}/comments?comment_id=${cid}&user_id=${currentUser.id}`, {
+        method: 'DELETE',
+        headers: {
+          'x-user-id': String(currentUser.id),
+        },
+      });
+    } catch (error) {
+      console.error('Failed to delete comment:', error);
+      showToast('Failed to delete discussion');
+      fetchComments(true);
+    }
+  };
+
+  const buildThreads = (list: any[]) => {
+    const roots = list.filter(c => !c.parent_id);
+    const repliesByParent = new Map<number, any[]>();
+    
+    list.forEach(c => {
+      if (c.parent_id) {
+        if (!repliesByParent.has(c.parent_id)) repliesByParent.set(c.parent_id, []);
+        repliesByParent.get(c.parent_id)!.push(c);
+      }
+    });
+    
+    repliesByParent.forEach(arr => {
+      arr.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+    });
+    
+    roots.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    
+    return roots.map(root => ({
+      root,
+      replies: repliesByParent.get(root.id) || [],
+    }));
+  };
+
+  const threads = useMemo(() => buildThreads(comments), [comments]);
+
+  const formatCount = (count: number): string => {
+    if (count >= 1000000) return `${(count / 1000000).toFixed(1)}M`;
+    if (count >= 1000) return `${(count / 1000).toFixed(1)}k`;
+    return count.toString();
+  };
+
+  const toggleThread = (rootId: number, open: boolean) => {
+    setExpandedThreads(prev => ({ ...prev, [String(rootId)]: open }));
+  };
+
+  const renderComment = (comment: any, isReply: boolean = false, depth: number = 0) => {
+    const author = resolveAuthor(comment);
+    const isAuthor = currentUser && Number(author.uid) === Number(currentUser.id);
+    const isHidden = isCommentHidden(comment);
+    const pressHandlers = getCommentPressHandlers(comment);
+    const MAX_DEPTH = 3;
+    const actualDepth = Math.min(depth, MAX_DEPTH);
+    
+    return (
+      <div key={comment.id} className={`flex gap-3 group/storycomment ${isReply ? 'mt-3' : ''}`} style={{ marginLeft: isReply ? `${actualDepth * 24}px` : 0 }}>
+        <img
+          src={author.image}
+          className="w-9 h-9 rounded-full object-cover cursor-pointer flex-shrink-0"
+          alt=""
+          onClick={() => author.uid && onProfileClick(author.uid)}
+        />
+        <div className="flex-1 min-w-0">
+          <div
+            {...pressHandlers}
+            className={`border rounded-2xl px-3.5 py-2.5 transition-all cursor-pointer select-none ${
+              isHidden
+                ? 'bg-[#162137]/35 hover:bg-[#1E293B]/45 border-amber-500/30 opacity-75'
+                : 'bg-[#162137]/65 hover:bg-[#1E293B]/70 border-[#1E293B]/60'
+            }`}
+            title="Hold for discussion options"
+          >
+            <div className="flex items-center justify-between gap-2 flex-wrap mb-1">
+              <div className="flex items-center gap-2">
+                <span
+                  className="text-[#F8FAFC] font-bold text-[21px] cursor-pointer hover:underline"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (author.uid) onProfileClick(author.uid);
+                  }}
+                >
+                  {author.name}
+                </span>
+                <span className="text-[#B0B3B8] text-[12px]">
+                  {formatRelativeTime(comment.created_at)}
+                </span>
+              </div>
+              <div className="flex items-center gap-1.5 shrink-0">
+                {isHidden && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-semibold border border-amber-500/30">
+                    Hidden
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setActionModalComment(comment);
+                  }}
+                  className="opacity-0 group-hover/storycomment:opacity-100 p-1 text-[#94A3B8] hover:text-[#F8FAFC] rounded-full hover:bg-[#1E293B] transition-opacity"
+                  title="Discussion options"
+                >
+                  <i className="fas fa-ellipsis-h text-xs" />
+                </button>
+              </div>
+            </div>
+            <div className={`text-[#CBD5E1] ${isReply ? 'text-[19.5px]' : 'text-[20.5px]'} leading-[1.38] break-words`}>
+              <RichText
+                text={String(comment.content || comment.text || '')}
+                users={users}
+                onProfileClick={onProfileClick}
+                onHashtagClick={onHashtagClick}
+              />
+            </div>
+          </div>
+          <div className="flex items-center gap-4 mt-1 ml-2">
+            <button
+              onClick={() => handleLikeComment(comment.id)}
+              className={`text-[12px] ${comment.liked_by_me ? 'text-[#1877F2] font-bold' : 'text-[#B0B3B8] hover:text-[#E4E6EB]'}`}
+            >
+              {comment.liked_by_me ? 'Liked' : 'Like'}
+            </button>
+            <button
+              onClick={() => {
+                setReplyTo(comment);
+                inputRef.current?.focus();
+              }}
+              className="text-[12px] text-[#B0B3B8] hover:text-[#E4E6EB]"
+            >
+              Reply
+            </button>
+            {isHidden && (
+              <span className="text-amber-400/90 font-medium text-[11px] inline-flex items-center gap-1">
+                <i className="far fa-eye-slash text-[10px]" />
+                <span>Hidden</span>
+              </span>
+            )}
+            {comment.likes_count > 0 && (
+              <span className="text-[12px] text-[#B0B3B8]">
+                {formatCount(comment.likes_count)} {comment.likes_count === 1 ? 'like' : 'likes'}
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  if (!isOpen) return null;
+
+  return (
+    <div
+      className="fixed inset-0 z-[600] bg-black/75 backdrop-blur-sm flex items-end justify-center transition-opacity"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-2xl h-[72vh] sm:h-[65vh] bg-[#0B1120] rounded-t-3xl border-t border-x border-[#1E293B] shadow-2xl flex flex-col overflow-hidden animate-slide-up"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Pull Handle */}
+        <div className="pt-2.5 pb-1 flex justify-center bg-[#0B1120] cursor-grab">
+          <div className="w-12 h-1.5 rounded-full bg-[#334155]/80 hover:bg-[#475569] transition-colors"></div>
+        </div>
+
+        {/* Header */}
+        <div className="px-4 py-3 border-b border-[#1E293B] flex items-center justify-between bg-[#0B1120] sticky top-0 z-30">
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded-full bg-[#1E293B] flex items-center justify-center text-[#38BDF8]">
+              <i className="far fa-comments text-sm"></i>
+            </div>
+            <div>
+              <div className="text-[#E4E6EB] font-bold text-[16px] leading-tight">Story Discussions</div>
+              <div className="text-[#94A3B8] text-[12px]">
+                {formatCount(comments.length)} {comments.length === 1 ? 'discussion' : 'discussions'}
+              </div>
+            </div>
+          </div>
+          <button
+            type="button"
+            className="w-8 h-8 rounded-full bg-[#1E293B]/70 hover:bg-[#1E293B] text-[#94A3B8] hover:text-white flex items-center justify-center transition-colors text-sm"
+            onClick={onClose}
+            aria-label="Close"
+          >
+            <i className="fas fa-times"></i>
+          </button>
+        </div>
+
+        <div ref={scrollContainerRef} className="flex-1 overflow-y-auto p-4">
+          {loading ? (
+            <div className="text-center py-10 text-[#B0B3B8]">
+              <i className="fas fa-spinner fa-spin text-2xl text-[#1877F2]"></i>
+              <p className="mt-2 text-sm">Loading discussions...</p>
+            </div>
+          ) : threads.length === 0 ? (
+            <div className="text-center py-10">
+              <div className="text-[#B0B3B8] text-[16px] mb-1 font-semibold">No discussions yet</div>
+              <p className="text-[#64748B] text-[13px]">Be the first to share your thoughts!</p>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {threads.map(({ root, replies }) => {
+                const rootId = root.id;
+                const isExpanded = !!expandedThreads[String(rootId)];
+                const MAX_PREVIEW = 2;
+                const hiddenCount = Math.max(0, replies.length - MAX_PREVIEW);
+                const visibleReplies = isExpanded ? replies : replies.slice(-MAX_PREVIEW);
+                
+                return (
+                  <div key={rootId} className="space-y-2">
+                    {renderComment(root, false, 0)}
+                    
+                    {!isExpanded && hiddenCount > 0 && (
+                      <button
+                        type="button"
+                        className="ml-12 text-[#1877F2] font-bold text-[13px] hover:underline"
+                        onClick={() => toggleThread(rootId, true)}
+                      >
+                        View previous {hiddenCount} repl{hiddenCount === 1 ? 'y' : 'ies'}
+                      </button>
+                    )}
+                    
+                    {visibleReplies.map((reply) => (
+                      <div key={reply.id} className="ml-12 relative">
+                        <div className="absolute -left-6 top-0 bottom-0 w-[2px] bg-[#1E293B] rounded-full" />
+                        {renderComment(reply, true, 1)}
+                      </div>
+                    ))}
+                    
+                    {isExpanded && replies.length > MAX_PREVIEW && (
+                      <button
+                        type="button"
+                        className="ml-12 text-[#B0B3B8] text-[12px] hover:text-[#E4E6EB]"
+                        onClick={() => toggleThread(rootId, false)}
+                      >
+                        Hide replies
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {replyTo && (
+          <div className="mx-4 mb-2 p-2 px-3 bg-[#0F172A] border border-[#1E293B] rounded-xl flex items-center justify-between shadow-sm">
+            <div className="flex items-center gap-2 text-xs">
+              <span className="text-[#94A3B8]">Replying to</span>
+              <span className="text-[#38BDF8] font-bold">
+                @{resolveAuthor(replyTo).name}
+              </span>
+            </div>
+            <button
+              onClick={() => setReplyTo(null)}
+              className="text-[#94A3B8] hover:text-[#E4E6EB] p-1"
+              aria-label="Cancel reply"
+            >
+              <i className="fas fa-times text-xs"></i>
+            </button>
+          </div>
+        )}
+
+        <div className="p-3 sm:p-4 border-t border-[#1E293B] bg-[#0B1120] sticky bottom-0 z-20">
+          <form className="flex gap-2.5 items-center" onSubmit={handleSubmit}>
+            <img
+              src={avatarFrom(currentUser)}
+              className="w-9 h-9 rounded-full object-cover flex-shrink-0 border border-[#1E293B]"
+              alt=""
+            />
+            <div className="flex-1 relative">
+              <input
+                ref={inputRef}
+                type="text"
+                className="w-full bg-[#070D1D] border border-[#1E293B] text-white placeholder-[#64748B] rounded-full px-4 py-2.5 outline-none focus:border-[#1877F2] focus:ring-1 focus:ring-[#1877F2] transition-all text-[14px]"
+                placeholder={replyTo ? `Reply to ${resolveAuthor(replyTo).name}...` : "Write a discussion..."}
+                value={text}
+                onChange={(e) => setText(e.target.value)}
+              />
+            </div>
+            <button
+              type="submit"
+              className="px-4 py-2 rounded-full bg-[#1877F2] hover:bg-[#166FE5] text-white font-bold text-[14px] disabled:opacity-40 disabled:hover:bg-[#1877F2] transition-all flex items-center gap-1.5 flex-shrink-0 shadow-sm active:scale-95"
+              disabled={!text.trim() || submitting}
+            >
+              {submitting ? <i className="fas fa-spinner fa-spin text-xs"></i> : 'Post'}
+            </button>
+          </form>
+        </div>
+      </div>
+
+      {/* Discussion Hold Action Modal */}
+      {actionModalComment && (
+        <CommentActionModal
+          isOpen={Boolean(actionModalComment)}
+          onClose={() => setActionModalComment(null)}
+          comment={actionModalComment}
+          authorName={resolveAuthor(actionModalComment).name}
+          authorAvatar={resolveAuthor(actionModalComment).image}
+          commentText={String(actionModalComment.content || actionModalComment.text || '')}
+          isHidden={isCommentHidden(actionModalComment)}
+          canHide={canHideComment(actionModalComment)}
+          canDelete={canDeleteComment(actionModalComment)}
+          onToggleHide={handleToggleHide}
+          onDelete={handleDeleteComment}
+          onReply={(c) => {
+            setReplyTo(c);
+            inputRef.current?.focus();
+          }}
+        />
+      )}
+
+      {/* Floating Action Feedback Toast */}
+      {toastMessage && (
+        <div className="fixed bottom-24 left-1/2 -translate-x-1/2 z-[100000] px-4 py-2 rounded-full bg-[#1E293B] border border-[#334155] text-white text-xs font-semibold shadow-2xl flex items-center gap-2 animate-in fade-in zoom-in-95 duration-150">
+          <span>{toastMessage}</span>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ==================== STORY VIEWER COMPONENT ====================
+interface StoryViewerProps {
+  story: StoryType;
+  user: User;
+  currentUser: User | null;
+  onClose: () => void;
+  onNext?: () => void;
+  onPrev?: () => void;
+  onReply?: (storyId: number, text: string) => void;
+  onLike?: (storyId: number) => void;
+  onReaction?: (storyId: number, reaction: string) => void;
+  onShare?: (storyOrId: any) => void;
+  onComment?: (storyId: number) => void;
+  onFetchReactions?: (storyId: number) => Promise<{ reactions: any[]; counts: Record<string, number> }>;
+  
+  onFollow?: (userId: number) => void;
+  isFollowing?: boolean;
+  
+  allStories?: StoryType[];
+  
+  onFetchViewers?: (storyId: number) => Promise<StoryViewer[]>;
+  viewersCount?: number;
+  
+  onProfileClick?: (id: number) => void;
+  
+  muted?: boolean;
+  onToggleMute?: () => void;
+  
+  onDeleteStory?: (storyId: number) => Promise<void> | void;
+  deleteLoading?: boolean;
+}
+
+export const StoryViewer: React.FC<StoryViewerProps> = ({
+  story,
+  user,
+  currentUser,
+  onClose,
+  onNext,
+  onPrev,
+  onReply,
+  onLike,
+  onReaction,
+  onShare,
+  onComment,
+  onFetchReactions,
+  onFollow,
+  isFollowing,
+  allStories = [],
+  onFetchViewers,
+  viewersCount,
+  onProfileClick,
+  muted = true,
+  onToggleMute,
+  onDeleteStory,
+  deleteLoading = false,
+}) => {
+  const [progress, setProgress] = useState(0);
+  const [isPaused, setIsPaused] = useState(false);
+  const [replyText, setReplyText] = useState('');
+  const [showHeartAnim, setShowHeartAnim] = useState(false);
+  const [storyDurationMs, setStoryDurationMs] = useState<number>(5000);
+  
+  const [mediaReady, setMediaReady] = useState(false);
+  
+  const [showViewers, setShowViewers] = useState(false);
+  const [loadingViewers, setLoadingViewers] = useState(false);
+  const [viewers, setViewers] = useState<StoryViewer[]>([]);
+  const [viewersError, setViewersError] = useState('');
+  
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [deletingStory, setDeletingStory] = useState(false);
+  const [downloadingStory, setDownloadingStory] = useState(false);
+  
+  const [showReactions, setShowReactions] = useState(false);
+  const [showReactionsSheet, setShowReactionsSheet] = useState(false);
+  const [userReaction, setUserReaction] = useState<string | null>(
+    story.my_reaction ?? story.views?.find(v => v.user_id === currentUser?.id)?.reaction ?? null
+  );
+  
+  const [reactionCount, setReactionCount] = useState<number>(story.reactions_count || 0);
+  const [commentCount, setCommentCount] = useState<number>(Number((story as any).comments_count || (story as any).discussions_count || 0));
+  const [shareCount, setShareCount] = useState<number>(story.shares_count || 0);
+  const [reactionList, setReactionList] = useState<any[]>([]);
+  const [loadingReactions, setLoadingReactions] = useState(false);
+
+  const lastMediaUrlRef = useRef<string | null>(null);
+  const cachedViewsCountRef = useRef<number>(0);
+  
+  const isNavigatingRef = useRef(false);
+  const navigationTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  const navLockRef = useRef(0);
+  const pointerDownRef = useRef<{ x: number; y: number; t: number } | null>(null);
+  
+  const lastNavAtRef = useRef(0);
+  
+  const holdTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const pausedByHoldRef = useRef(false);
+  const pauseWasAlreadyOnRef = useRef(false);
+  
+  const viewersResumeRef = useRef<'resume' | 'keepPaused'>('resume');
+
+  const progressIntervalRef = useRef<number | null>(null);
+
+  const preloadReadyRef = useRef<Map<string, boolean>>(new Map());
+
+  const inputRef = useRef<HTMLInputElement>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+
+  const isAuthor = currentUser && currentUser.id === user.id;
+
+  const frozenUserStoriesRef = useRef<StoryType[]>([]);
+  const didAdvanceRef = useRef(false);
+  const frozenAuthorRef = useRef<{ name: string; image: string; id: number }>({
+    name: 'User',
+    image: '',
+    id: Number(story.user_id) || 0,
+  });
+
+  // Update comment count and fetch real-time comments when story changes
+  useEffect(() => {
+    const initialCount = Number((story as any).comments_count || (story as any).discussions_count || 0);
+    setCommentCount(initialCount);
+
+    if (!story.id) return;
+    const cached = getStoryCommentsCache(story.id);
+    if (cached) {
+      setCommentCount(cached.length);
+    }
+    const viewerParam = currentUser?.id ? `?viewerId=${currentUser.id}` : '';
+    apiFetch(`/api/stories/${story.id}/comments${viewerParam}`, {
+      headers: currentUser?.id ? { 'x-user-id': String(currentUser.id) } : undefined,
+    }).then((data: any) => {
+      const list = Array.isArray(data?.comments) ? data.comments : (Array.isArray(data) ? data : []);
+      const count = typeof data?.count === 'number' ? data.count : list.length;
+      setCommentCount(count);
+      setStoryCommentsCache(story.id, list);
+    }).catch(() => {});
+  }, [story.id, (story as any).comments_count, (story as any).discussions_count, currentUser?.id]);
+
+  const getDisplayMediaUrl = useCallback((story: StoryType): string => {
+    const meta = story.media_meta?.[0];
+    if (meta?.feed) return meta.feed;
+    if (meta?.full) return meta.full;
+    if (meta?.thumb) return meta.thumb;
+    if (story.media_url) return story.media_url;
+    return '';
+  }, []);
+
+  // Lock page scroll when story viewer is open
+  useEffect(() => {
+    const prevBodyOverflow = document.body.style.overflow;
+    const prevHtmlOverflow = document.documentElement.style.overflow;
+    const prevBodyTouchAction = document.body.style.touchAction;
+    const prevHtmlTouchAction = document.documentElement.style.touchAction;
+    
+    document.body.style.overflow = 'hidden';
+    document.documentElement.style.overflow = 'hidden';
+    document.body.style.touchAction = 'none';
+    document.documentElement.style.touchAction = 'none';
+    
+    return () => {
+      document.body.style.overflow = prevBodyOverflow;
+      document.documentElement.style.overflow = prevHtmlOverflow;
+      document.body.style.touchAction = prevBodyTouchAction;
+      document.documentElement.style.touchAction = prevHtmlTouchAction;
+    };
+  }, []);
+
+  // Block wheel scrolling for desktop and some Android webviews
+  useEffect(() => {
+    const preventWheel = (e: WheelEvent) => {
+      e.preventDefault();
+    };
+    window.addEventListener('wheel', preventWheel, { passive: false });
+    return () => {
+      window.removeEventListener('wheel', preventWheel);
+    };
+  }, []);
+
+  const fetchReactions = useCallback(async () => {
+    if (!onFetchReactions) return;
+    
+    setLoadingReactions(true);
+    try {
+      const data = await onFetchReactions(story.id);
+      setReactionList(data.reactions || []);
+      setReactionCount(data.counts?.total || Object.values(data.counts || {}).reduce((a: number, b: number) => a + b, 0) || story.reactions_count || 0);
+    } catch (error) {
+      console.error('Failed to fetch reactions:', error);
+    } finally {
+      setLoadingReactions(false);
+    }
+  }, [story.id, onFetchReactions, story.reactions_count]);
+
+  useEffect(() => {
+    fetchReactions();
+  }, [story.id, fetchReactions]);
+
+  const topReactionEmojis = useMemo(() => {
+    if (!reactionList.length) return [];
+    
+    const counts = new Map<string, number>();
+    for (const r of reactionList) {
+      const type = String(r?.type || '').trim();
+      if (!type) continue;
+      counts.set(type, (counts.get(type) || 0) + 1);
+    }
+    
+    return [...counts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 2)
+      .map(([type]) => reactionEmoji(type));
+  }, [reactionList]);
+
+  const getReactorName = useMemo(() => {
+    if (!reactionList.length) return '';
+    const firstReaction = reactionList[0];
+    const name = firstReaction?.user?.name || firstReaction?.name || '';
+    return name;
+  }, [reactionList]);
+
+  const reactionText = useMemo(() => {
+    if (reactionCount === 0) return '';
+    if (reactionCount === 1) {
+      return `${fmtCount(reactionCount)} · ${getReactorName}`;
+    }
+    const othersCount = reactionCount - 1;
+    return `${fmtCount(reactionCount)} · ${getReactorName} and ${fmtCount(othersCount)} other${othersCount !== 1 ? 's' : ''}`;
+  }, [reactionCount, getReactorName]);
+
+  const lockNav = () => {
+    const now = Date.now();
+    if (now - navLockRef.current < 450) return false;
+    navLockRef.current = now;
+    return true;
+  };
+
+  const isInteractiveTarget = (el: EventTarget | null) => {
+    const node = el as HTMLElement | null;
+    if (!node) return false;
+    return !!node.closest('button,a,input,textarea,select,[role="button"],[data-no-nav="true"]');
+  };
+
+  const handlePointerDown = (e: React.PointerEvent) => {
+    if (isInteractiveTarget(e.target)) return;
+
+    pointerDownRef.current = { x: e.clientX, y: e.clientY, t: Date.now() };
+
+    if (holdTimerRef.current) clearTimeout(holdTimerRef.current);
+
+    pauseWasAlreadyOnRef.current = isPaused;
+
+    holdTimerRef.current = setTimeout(() => {
+      pausedByHoldRef.current = true;
+      setIsPaused(true);
+    }, 220);
+  };
+
+  const handlePointerMove = (e: React.PointerEvent) => {
+    const start = pointerDownRef.current;
+    if (!start) return;
+
+    const dx = e.clientX - start.x;
+    const dy = e.clientY - start.y;
+
+    const DRAG_CANCEL = 12;
+    if (Math.abs(dx) > DRAG_CANCEL || Math.abs(dy) > DRAG_CANCEL) {
+      if (holdTimerRef.current) {
+        clearTimeout(holdTimerRef.current);
+        holdTimerRef.current = null;
+      }
+    }
+  };
+
+  const handlePointerUp = (e: React.PointerEvent) => {
+    const start = pointerDownRef.current;
+    pointerDownRef.current = null;
+
+    if (holdTimerRef.current) {
+      clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+    }
+
+    if (pausedByHoldRef.current) {
+      pausedByHoldRef.current = false;
+      if (!pauseWasAlreadyOnRef.current) setIsPaused(false);
+    }
+
+    if (!start) return;
+    if (isInteractiveTarget(e.target)) return;
+
+    const dx = e.clientX - start.x;
+    const dy = e.clientY - start.y;
+    const dt = Date.now() - start.t;
+
+    const SWIPE_X = 40;
+    
+    if (Math.abs(dx) > SWIPE_X && Math.abs(dy) < 28) {
+      if (dx < 0) safeNavigate('next');
+      else safeNavigate('prev');
+      return;
+    }
+
+    const TAP_MOVE = 12;
+    const TAP_TIME = 350;
+    if (Math.abs(dx) <= TAP_MOVE && Math.abs(dy) <= TAP_TIME && dt <= TAP_TIME) {
+      const box = (e.currentTarget as HTMLElement).getBoundingClientRect();
+      const x = e.clientX - box.left;
+      const ratio = x / box.width;
+
+      if (ratio < 0.35) safeNavigate('prev');
+      else if (ratio > 0.65) safeNavigate('next');
+      else setIsPaused(p => !p);
+    }
+  };
+
+  const handlePointerCancel = () => {
+    if (holdTimerRef.current) {
+      clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+    }
+    if (pausedByHoldRef.current) {
+      pausedByHoldRef.current = false;
+      if (!pauseWasAlreadyOnRef.current) setIsPaused(false);
+    }
+    pointerDownRef.current = null;
+  };
+
+  const closeViewers = () => {
+    setShowViewers(false);
+    if (viewersResumeRef.current === 'resume') setIsPaused(false);
+  };
+
+  const openViewers = async () => {
+    if (!onFetchViewers) return;
+
+    const wasPaused = isPaused;
+    setIsPaused(true);
+
+    setShowViewers(true);
+    setLoadingViewers(true);
+    setViewersError('');
+
+    try {
+      const data = await onFetchViewers(story.id);
+      const list = Array.isArray(data) ? data : [];
+      setViewers(dedupeViewers(list));
+    } catch (e: any) {
+      setViewersError(e?.message || 'Failed to load viewers');
+      setViewers([]);
+    } finally {
+      setLoadingViewers(false);
+      viewersResumeRef.current = wasPaused ? 'keepPaused' : 'resume';
+    }
+  };
+
+  useEffect(() => {
+    const totalViews = story.views_count || viewersCount || story.analytics?.total_views || 0;
+    if (totalViews > 0) {
+      cachedViewsCountRef.current = totalViews;
+    }
+  }, [story.id, story.views_count, viewersCount, story.analytics?.total_views]);
+
+  useEffect(() => {
+    const displayUrl = getDisplayMediaUrl(story);
+    if (displayUrl && !isBlob(displayUrl)) {
+      lastMediaUrlRef.current = displayUrl;
+    }
+  }, [story.id, story, getDisplayMediaUrl]);
+
+  useEffect(() => {
+    return () => {
+      if (navigationTimeoutRef.current) {
+        clearTimeout(navigationTimeoutRef.current);
+      }
+      if (holdTimerRef.current) {
+        clearTimeout(holdTimerRef.current);
+      }
+      if (progressIntervalRef.current) {
+        window.clearInterval(progressIntervalRef.current);
+      }
+    };
+  }, []);
+
+  const safeNavigate = (direction: 'next' | 'prev') => {
+    const now = Date.now();
+
+    if (now - lastNavAtRef.current < 650) return;
+    lastNavAtRef.current = now;
+
+    if (isNavigatingRef.current) return;
+    if (!lockNav()) return;
+    
+    didAdvanceRef.current = true;
+    if (progressIntervalRef.current) {
+      window.clearInterval(progressIntervalRef.current);
+      progressIntervalRef.current = null;
+    }
+
+    isNavigatingRef.current = true;
+
+    if (direction === 'next' && onNext) onNext();
+    else if (direction === 'prev' && onPrev) onPrev();
+
+    navigationTimeoutRef.current = setTimeout(() => {
+      isNavigatingRef.current = false;
+    }, 300);
+  };
+
+  const handleDownloadStory = async () => {
+    if (downloadingStory) return;
+    
+    const url = getDisplayMediaUrl(story);
+    if (!url) return;
+    
+    setDownloadingStory(true);
+    
+    try {
+      if (isUneraNativeApp()) {
+        callUneraNative({
+          action: 'download_file',
+          url,
+          fileName: `unera-story-${story.id}.${storyIsVideo ? 'mp4' : 'jpg'}`,
+          folder: 'UNERA',
+        });
+      } else {
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `unera-story-${story.id}.${storyIsVideo ? 'mp4' : 'jpg'}`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      }
+    } finally {
+      setTimeout(() => setDownloadingStory(false), 1200);
+    }
+  };
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.target === inputRef.current) return;
+      
+      switch (e.key) {
+        case 'ArrowRight':
+        case ' ':
+          e.preventDefault();
+          safeNavigate('next');
+          break;
+        case 'ArrowLeft':
+          e.preventDefault();
+          safeNavigate('prev');
+          break;
+        case 'Escape':
+          e.preventDefault();
+          onClose();
+          break;
+        case 'm':
+        case 'M':
+          e.preventDefault();
+          onToggleMute?.();
+          break;
+        case 'p':
+        case 'P':
+          e.preventDefault();
+          setIsPaused(p => !p);
+          break;
+        case 'r':
+        case 'R':
+          e.preventDefault();
+          if (!isAuthor) setShowReactions(p => !p);
+          break;
+        case 'Delete':
+        case 'Backspace':
+          e.preventDefault();
+          if (isAuthor && onDeleteStory) {
+            setShowDeleteConfirm(true);
+          }
+          break;
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onNext, onPrev, onClose, onToggleMute, isAuthor, onDeleteStory]);
+
+  useEffect(() => {
+    const r = story.my_reaction ?? story.views?.find(v => Number(v.user_id) === Number(currentUser?.id))?.reaction ?? null;
+    setUserReaction(r);
+  }, [story.id, currentUser?.id, story.views, story.my_reaction]);
+
+  useEffect(() => {
+    if (story.type === 'text') {
+      setMediaReady(true);
+      return;
+    }
+
+    const displayUrl = getDisplayMediaUrl(story);
+    if (!displayUrl || isBlob(displayUrl)) {
+      setMediaReady(true);
+      return;
+    }
+
+    if (preloadReadyRef.current.get(displayUrl)) {
+      setMediaReady(true);
+      return;
+    }
+
+    if (!isVideoUrl(displayUrl)) {
+      const img = new Image();
+      img.src = displayUrl;
+
+      const done = () => {
+        preloadReadyRef.current.set(displayUrl, true);
+        setMediaReady(true);
+      };
+
+      if (img.complete) {
+        done();
+        return;
+      }
+
+      img.onload = done;
+      img.onerror = done;
+      return;
+    }
+  }, [story.id, story.type, getDisplayMediaUrl, story]);
+
+  useEffect(() => {
+    if (story.type === 'video' || isVideoUrl(getDisplayMediaUrl(story))) {
+      const v = videoRef.current;
+      if (v && v.readyState >= 2) {
+        setMediaReady(true);
+      }
+    }
+  }, [story.type, getDisplayMediaUrl, story]);
+
+  useEffect(() => {
+    const userStories = frozenUserStoriesRef.current;
+    const currentIndex = userStories.findIndex((s) => Number(s.id) === Number(story.id));
+
+    const preload = async (url: string) => {
+      if (!url || isBlob(url)) return;
+      if (preloadReadyRef.current.get(url)) return;
+
+      if (isVideoUrl(url)) {
+        const v = document.createElement('video');
+        v.preload = 'auto';
+        v.src = url;
+
+        const mark = () => preloadReadyRef.current.set(url, true);
+        v.addEventListener('loadedmetadata', mark, { once: true });
+        v.addEventListener('canplay', mark, { once: true });
+        v.load();
+      } else {
+        const img = new Image();
+        img.src = url;
+        try {
+          if (img.decode) await img.decode();
+        } catch {}
+        preloadReadyRef.current.set(url, true);
+      }
+    };
+
+    if (currentIndex >= 0) {
+      const next1Story = userStories[currentIndex + 1];
+      const next2Story = userStories[currentIndex + 2];
+      const next1 = next1Story ? getDisplayMediaUrl(next1Story) : '';
+      const next2 = next2Story ? getDisplayMediaUrl(next2Story) : '';
+      if (next1) preload(next1);
+      if (next2) preload(next2);
+    }
+  }, [story.id, getDisplayMediaUrl]);
+
+  useEffect(() => {
+    const bestName = pickBestName(
+      (story as any)?.user?.name,
+      (story as any)?.author_name,
+      (story as any)?.author_username,
+      (user as any)?.name
+    );
+
+    const bestImage = pickBestImage(
+      (story as any)?.user?.profile_image_url,
+      (story as any)?.author_image,
+      (user as any)?.profile_image_url
+    );
+
+    const id = Number((story as any)?.user?.id ?? story.user_id ?? (user as any)?.id ?? 0);
+
+    frozenAuthorRef.current = {
+      id,
+      name: bestName,
+      image: bestImage || getDefaultProfilePicture(bestName, id),
+    };
+  }, [story.id, user]);
+
+  const sameIdList = (a: StoryType[], b: StoryType[]) => {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (Number(a[i]?.id) !== Number(b[i]?.id)) return false;
+    }
+    return true;
+  };
+
+  useEffect(() => {
+    const nextList = (allStories || [])
+      .filter((s) => Number(s.user_id) === Number(story.user_id))
+      .slice()
+      .sort((a, b) => parseServerTime(b.created_at) - parseServerTime(a.created_at));
+
+    const prevList = frozenUserStoriesRef.current;
+
+    if (!sameIdList(prevList, nextList)) {
+      frozenUserStoriesRef.current = nextList.length ? nextList : [story];
+    }
+
+    didAdvanceRef.current = false;
+    setProgress(0);
+    
+    if (progressIntervalRef.current) {
+      window.clearInterval(progressIntervalRef.current);
+      progressIntervalRef.current = null;
+    }
+
+    setMediaReady(story.type === 'text');
+  }, [story.id, story.user_id, allStories]);
+
+  const userStories = frozenUserStoriesRef.current;
+  const currentIndex = userStories.findIndex((s) => Number(s.id) === Number(story.id));
+
+  const storyIsText = story.type === 'text';
+  const storyIsVideo = story.type === 'video' || (!storyIsText && isVideoUrl(getDisplayMediaUrl(story)));
+  const storyIsImage = !storyIsText && !storyIsVideo;
+
+  const totalViews = story.views_count || viewersCount || story.analytics?.total_views || cachedViewsCountRef.current;
+
+  useEffect(() => {
+    if (storyIsVideo) {
+      setStoryDurationMs(7000);
+    } else {
+      setStoryDurationMs(5000);
+    }
+  }, [story.id, storyIsVideo]);
+
+  useEffect(() => {
+    if (!mediaReady) return;
+
+    setProgress(0);
+    didAdvanceRef.current = false;
+
+    const tickMs = 50;
+    const duration = clamp(storyDurationMs || 5000, 1000, 30_000);
+
+    if (progressIntervalRef.current) {
+      window.clearInterval(progressIntervalRef.current);
+      progressIntervalRef.current = null;
+    }
+
+    const timer = window.setInterval(() => {
+      if (isPaused) return;
+
+      setProgress((prev) => {
+        if (prev >= 100) return 100;
+
+        const increment = 100 / (duration / tickMs);
+        const next = Math.min(100, prev + increment);
+
+        if (next >= 100 && !didAdvanceRef.current) {
+          didAdvanceRef.current = true;
+
+          if (progressIntervalRef.current) {
+            window.clearInterval(progressIntervalRef.current);
+            progressIntervalRef.current = null;
+          }
+
+          safeNavigate('next');
+        }
+        return next;
+      });
+    }, tickMs);
+
+    progressIntervalRef.current = timer;
+
+    return () => {
+      if (progressIntervalRef.current) {
+        window.clearInterval(progressIntervalRef.current);
+        progressIntervalRef.current = null;
+      }
+    };
+  }, [story.id, isPaused, storyDurationMs, mediaReady]);
+
+  // Updated music playback with start/end times
+  useEffect(() => {
+    if (story.music_url && !isBlob(story.music_url)) {
+      const audio = new Audio(story.music_url);
+      audioRef.current = audio;
+      const start = Number((story as any).music_start || 0);
+      const end = Number((story as any).music_end || 0);
+      audio.volume = muted ? 0 : 0.5;
+      audio.currentTime = start;
+      
+      const onTimeUpdate = () => {
+        if (end > start && audio.currentTime >= end) {
+          audio.pause();
+          audio.currentTime = start;
+        }
+      };
+      
+      audio.addEventListener('timeupdate', onTimeUpdate);
+      audio.play().catch(() => {});
+      
+      return () => {
+        audio.removeEventListener('timeupdate', onTimeUpdate);
+        audio.pause();
+        audioRef.current = null;
+      };
+    }
+  }, [story.id, story.music_url, (story as any).music_start, (story as any).music_end]);
+
+  // Volume sync
+  useEffect(() => {
+    if (audioRef.current) {
+      audioRef.current.volume = muted ? 0 : 0.5;
+    }
+  }, [muted]);
+
+  useEffect(() => {
+    if (!storyIsVideo) return;
+    const v = videoRef.current;
+    if (!v) return;
+
+    if (isPaused) {
+      v.pause();
+    } else {
+      const forceMuteVideo = !!(story.music_url && !isBlob(story.music_url));
+      v.muted = forceMuteVideo ? true : muted;
+      v.play().catch(() => {});
+    }
+  }, [isPaused, storyIsVideo, muted, story.music_url]);
+
+  const handleShare = () => {
+    setIsPaused(true);
+    if (onShare) {
+      onShare(story);
+    }
+  };
+
+  const handleComment = () => {
+    setIsPaused(true);
+    if (onComment) {
+      onComment(story.id);
+    }
+  };
+
+  const handleReactionClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!currentUser) {
+      alert('Please login to react to stories.');
+      return;
+    }
+    if (!isAuthor) {
+      setShowReactions(!showReactions);
+    }
+  };
+
+  const handleReaction = async (reaction: string) => {
+    if (!currentUser) {
+      alert('Please login to react to stories.');
+      return;
+    }
+    if (!onReaction || isAuthor) return;
+
+    const wasPaused = isPaused;
+    setIsPaused(true);
+
+    const previousReaction = userReaction;
+    const previousCount = reactionCount;
+    
+    if (previousReaction === reaction) {
+      setUserReaction(null);
+      setReactionCount(prev => Math.max(0, prev - 1));
+    } else {
+      setUserReaction(reaction);
+      if (!previousReaction) {
+        setReactionCount(prev => prev + 1);
+      }
+    }
+    
+    setShowReactions(false);
+
+    try {
+      const maybePromise = onReaction(story.id, reaction);
+      if (maybePromise && typeof (maybePromise as any).then === 'function') {
+        await (maybePromise as any);
+      } else {
+        await new Promise(r => setTimeout(r, 250));
+      }
+      await fetchReactions();
+    } catch (error) {
+      setUserReaction(previousReaction);
+      setReactionCount(previousCount);
+      console.error('Failed to react:', error);
+    } finally {
+      if (!wasPaused) setIsPaused(false);
+    }
+  };
+
+  const handleDeleteStory = async () => {
+    if (!onDeleteStory || !isAuthor) return;
+    
+    setDeletingStory(true);
+    try {
+      await onDeleteStory(story.id);
+      setShowDeleteConfirm(false);
+      setTimeout(() => onClose(), 300);
+    } catch (error) {
+      console.error('Failed to delete story:', error);
+      const toast = document.createElement('div');
+      toast.className = 'fixed bottom-24 left-1/2 -translate-x-1/2 bg-[#F3425F] text-white px-6 py-2 rounded-full font-bold shadow-lg animate-fade-in z-[300]';
+      toast.innerText = 'Failed to delete story';
+      document.body.appendChild(toast);
+      setTimeout(() => toast.remove(), 2000);
+    } finally {
+      setDeletingStory(false);
+    }
+  };
+
+  const frozenAuthor = frozenAuthorRef.current;
+  const uniqueViewers = story.analytics?.unique_viewers || viewers.length || 0;
+
+  const activeReaction = userReaction ? {
+    emoji: reactionEmoji(userReaction),
+    color: userReaction === 'like' ? '#1877F2' : userReaction === 'love' ? '#F3425F' : '#F7B928'
+  } : null;
+
+  const displayMediaUrl = getDisplayMediaUrl(story);
+
+  const normalizedStoryPost = useMemo(() => ({
+    ...story,
+    id: story.id,
+    story_id: story.id,
+    item_type: 'story',
+    type: 'story',
+    post_type: 'story',
+    shares: shareCount,
+    shares_count: shareCount,
+    reactions_count: reactionCount,
+    comments_count: commentCount,
+    author: user?.name || (story as any).author_name || 'Creator',
+    user: user,
+  }), [story, user, shareCount, reactionCount, commentCount]);
+
+  return (
+    <div className="fixed inset-0 z-[250] bg-[#050B18] animate-fade-in flex items-center justify-center">
+      <button
+        className="absolute top-[max(env(safe-area-inset-top,16px),16px)] right-4 z-[300] cursor-pointer w-10 h-10 flex items-center justify-center bg-[#0F172A]/80 hover:bg-[#1E293B] border border-[#1E293B] rounded-full transition-colors"
+        onClick={(e) => {
+          e.stopPropagation();
+          onClose();
+        }}
+        aria-label="Close story viewer"
+      >
+        <i className="fas fa-times text-[#F8FAFC] text-xl"></i>
+      </button>
+
+      <div
+        className="relative w-full h-full max-w-[480px] bg-[#0B1120] sm:rounded-2xl sm:border sm:border-[#1E293B] sm:shadow-2xl overflow-hidden flex flex-col touch-none"
+        style={{ touchAction: 'none', overscrollBehavior: 'contain' }}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerCancel}
+      >
+        {/* Horizontal Navigation Buttons - Same User */}
+        <button
+          type="button"
+          aria-label="Previous story (same user)"
+          className="absolute left-2 top-1/2 -translate-y-1/2 z-[120] w-10 h-10 rounded-full bg-white/10 hover:bg-white/15 active:bg-white/20 backdrop-blur-md flex items-center justify-center"
+          onClick={(e) => {
+            e.stopPropagation();
+            safeNavigate('prev');
+          }}
+          onPointerDown={(e) => e.stopPropagation()}
+          onPointerUp={(e) => e.stopPropagation()}
+        >
+          <i className="fas fa-chevron-left text-white/90"></i>
+        </button>
+
+        <button
+          type="button"
+          aria-label="Next story (same user)"
+          className="absolute right-2 top-1/2 -translate-y-1/2 z-[120] w-10 h-10 rounded-full bg-white/10 hover:bg-white/15 active:bg-white/20 backdrop-blur-md flex items-center justify-center"
+          onClick={(e) => {
+            e.stopPropagation();
+            safeNavigate('next');
+          }}
+          onPointerDown={(e) => e.stopPropagation()}
+          onPointerUp={(e) => e.stopPropagation()}
+        >
+          <i className="fas fa-chevron-right text-white/90"></i>
+        </button>
+
+        <div className="absolute top-0 left-0 right-0 pt-[max(env(safe-area-inset-top,0px),8px)] px-3 z-30 flex gap-1.5">
+          {userStories.map((_, i) => (
+            <div key={i} className="h-1 bg-white/20 flex-1 rounded-full overflow-hidden">
+              <div
+                className={`h-full bg-white transition-all duration-75 ease-linear ${
+                  !mediaReady && i === currentIndex ? 'animate-pulse' : ''
+                }`}
+                style={{
+                  width: i < currentIndex ? '100%' : i === currentIndex ? `${progress}%` : '0%',
+                }}
+              />
+            </div>
+          ))}
+        </div>
+
+        <div 
+          className="absolute top-0 left-0 right-0 px-4 pt-[calc(max(env(safe-area-inset-top,0px),8px)+16px)] pb-4 z-30 flex items-center justify-between bg-gradient-to-b from-[#0B1120]/90 via-[#0B1120]/40 to-transparent" 
+          data-no-nav="true"
+        >
+          <div className="flex items-center gap-3">
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onProfileClick?.(frozenAuthor.id);
+              }}
+              className="flex items-center gap-3 hover:opacity-90 transition-opacity"
+            >
+              <img
+                src={frozenAuthor.image}
+                alt={frozenAuthor.name}
+                className="w-12 h-12 rounded-full border-2 border-[#1877F2] object-cover shadow-lg"
+              />
+              <div className="flex flex-col items-start">
+                <span className="text-white font-bold text-[17px] drop-shadow-md">
+                  {frozenAuthor.name}
+                </span>
+                <span className="text-white/70 text-[12px] drop-shadow-md">
+                  {formatStoryTime((story as any).created_at)}
+                </span>
+              </div>
+            </button>
+            
+            {currentUser &&
+              frozenAuthor.id > 0 &&
+              frozenAuthor.id !== currentUser.id &&
+              onFollow && (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onFollow(frozenAuthor.id);
+                  }}
+                  className={`px-3 py-1.5 rounded-full text-xs font-bold ${
+                    isFollowing ? 'bg-[#1E293B] text-white' : 'bg-[#1877F2] text-white'
+                  } hover:opacity-90 transition-all active:scale-95 border-none`}
+                >
+                  {isFollowing ? 'Following' : 'Follow'}
+                </button>
+              )}
+          </div>
+
+          <div className="flex gap-2">
+            {onToggleMute && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onToggleMute();
+                }}
+                className="w-10 h-10 flex items-center justify-center bg-white/10 hover:bg-white/15 rounded-full"
+                aria-label={muted ? "Unmute" : "Mute"}
+              >
+                <i className={`fas ${muted ? 'fa-volume-mute' : 'fa-volume-up'} text-white/80`}></i>
+              </button>
+            )}
+            
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                handleDownloadStory();
+              }}
+              className="w-10 h-10 flex items-center justify-center bg-white/10 hover:bg-white/15 rounded-full"
+              aria-label="Download story"
+              disabled={downloadingStory}
+            >
+              <i className={`fas ${downloadingStory ? 'fa-spinner fa-spin' : 'fa-download'} text-white/80`}></i>
+            </button>
+            
+            {isAuthor ? (
+              <>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    openViewers();
+                  }}
+                  className="flex items-center gap-2 bg-[#1877F2] hover:bg-[#166FE5] transition-all px-4 py-2 rounded-full shadow-lg"
+                  aria-label="View viewers"
+                >
+                  <i className="fas fa-eye text-white/90"></i>
+                  <span className="text-white font-black text-xs">
+                    {uniqueViewers > 0 ? uniqueViewers : cachedViewsCountRef.current || 0}
+                  </span>
+                </button>
+                
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setShowDeleteConfirm(true);
+                  }}
+                  className="flex items-center gap-2 bg-[#F3425F] hover:bg-[#E41E3F] transition-all px-3 py-2 rounded-full shadow-lg"
+                  aria-label="Delete story"
+                  disabled={deleteLoading || deletingStory}
+                >
+                  <i className={`fas ${deletingStory ? 'fa-spinner fa-spin' : 'fa-trash'} text-white/90`}></i>
+                </button>
+              </>
+            ) : (
+              onFetchViewers && (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    openViewers();
+                  }}
+                  className="flex items-center gap-2 bg-white/10 hover:bg-white/15 transition-all px-3 py-2 rounded-full border border-white/10"
+                  aria-label="View viewers"
+                >
+                  <i className="fas fa-eye text-white/80"></i>
+                  <span className="text-white font-bold text-xs">
+                    {Number.isFinite(Number(viewersCount)) ? viewersCount : ''}
+                  </span>
+                </button>
+              )
+            )}
+          </div>
+        </div>
+
+        <div className="flex-1 bg-[#0B1120] relative">
+          <div
+            className="absolute inset-0 z-[5]"
+            onDoubleClick={isAuthor ? undefined : () => handleReaction('like')}
+          />
+
+          <div className="absolute inset-0 z-[10] flex items-center justify-center">
+            {storyIsText ? (
+              <div
+                className="w-full h-full flex items-center justify-center p-10 text-center"
+                style={{ background: (story as any).background_style || '#0B1120' }}
+              >
+                <span className="text-white font-bold text-4xl drop-shadow-[0_2px_4px_rgba(0,0,0,0.5)] whitespace-pre-wrap">
+                  {(story as any).text_content}
+                </span>
+              </div>
+            ) : displayMediaUrl && !isBlob(displayMediaUrl) ? (
+              storyIsVideo ? (
+                <video
+                  ref={videoRef}
+                  src={displayMediaUrl}
+                  className="w-full h-full object-cover z-10"
+                  playsInline
+                  autoPlay
+                  preload="auto"
+                  muted={!!(story.music_url && !isBlob(story.music_url)) ? true : muted}
+                  controls={false}
+                  onCanPlay={() => setMediaReady(true)}
+                  onLoadedMetadata={(e) => {
+                    const v = e.currentTarget;
+                    const ms = Number.isFinite(v.duration) ? v.duration * 1000 : 7000;
+                    setStoryDurationMs(clamp(ms, 5000, 15000));
+                    setMediaReady(true);
+                    const forceMuteVideo = !!(story.music_url && !isBlob(story.music_url));
+                    v.muted = forceMuteVideo ? true : muted;
+                    v.play().catch(() => {});
+                  }}
+                  onEnded={() => {
+                    safeNavigate('next');
+                  }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setIsPaused((p) => !p);
+                  }}
+                  onError={(e) => {
+                    console.error('Video playback failed:', e);
+                    setMediaReady(true);
+                  }}
+                />
+              ) : (
+                <div className="absolute inset-0 z-10 flex items-center justify-center bg-[#0B1120]">
+                  <img
+                    src={displayMediaUrl}
+                    alt="Story"
+                    className="relative w-full h-full object-contain"
+                    loading="eager"
+                    decoding="async"
+                    onLoad={() => setMediaReady(true)}
+                    onError={() => setMediaReady(true)}
+                  />
+                </div>
+              )
+            ) : (
+              <div 
+                className="w-full h-full flex items-center justify-center p-10 text-center bg-[#0B1120] z-10"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setIsPaused(p => !p);
+                }}
+              >
+                <span className="text-white font-bold text-3xl whitespace-pre-wrap">
+                  {(story as any).text_content || 'Story'}
+                </span>
+              </div>
+            )}
+          </div>
+
+          {showHeartAnim && (
+            <div className="absolute inset-0 flex items-center justify-center z-[40] pointer-events-none">
+              <i className="fas fa-heart text-white text-9xl drop-shadow-lg animate-pop-heart"></i>
+            </div>
+          )}
+
+          {storyIsVideo && isPaused && (
+            <div className="absolute inset-0 flex items-center justify-center z-[30] pointer-events-none">
+              <div className="w-20 h-20 bg-black/50 rounded-full flex items-center justify-center">
+                <i className="fas fa-pause text-white text-3xl"></i>
+              </div>
+            </div>
+          )}
+
+          {showReactions && !isAuthor && (
+            <div
+              className="absolute bottom-24 left-1/2 -translate-x-1/2 bg-[#0F172A]/90 backdrop-blur-lg rounded-full p-2 flex gap-2 z-[200] border border-[#1E293B] pointer-events-auto"
+              data-no-nav="true"
+            >
+              {['like', 'love', 'wow', 'haha', 'sad', 'angry'].map((reaction) => (
+                <button
+                  key={reaction}
+                  onClick={() => handleReaction(reaction)}
+                  className="w-12 h-12 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center text-2xl transition-transform hover:scale-125 active:scale-110"
+                  aria-label={`React with ${reaction}`}
+                  data-no-nav="true"
+                >
+                  {reactionEmoji(reaction)}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Horizontal Bottom Actions - React, Discuss, Share */}
+        <div 
+          className="absolute bottom-0 left-0 right-0 p-3 pb-[max(env(safe-area-inset-bottom,0px),12px)] z-20 bg-gradient-to-t from-[#0B1120] via-[#0B1120]/80 to-transparent pt-10"
+          data-no-nav="true"
+        >
+          {/* Reaction and discussion row with counts */}
+          {(reactionCount > 0 || commentCount > 0 || shareCount > 0) && (
+            <div 
+              className="flex items-center justify-between px-2 mb-2 cursor-pointer"
+              onClick={() => {
+                setShowReactionsSheet(true);
+                setIsPaused(true);
+              }}
+            >
+              <div className="flex items-center gap-2">
+                {reactionCount > 0 && (
+                  <div className="flex -space-x-2">
+                    {topReactionEmojis.slice(0, 2).map((emoji, i) => (
+                      <span
+                        key={i}
+                        className="w-[22px] h-[22px] rounded-full bg-[#0F172A] border border-[#1E293B] flex items-center justify-center text-[14px]"
+                        style={{ zIndex: 10 - i }}
+                      >
+                        {emoji}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                {reactionText && (
+                  <span className="text-[15px] text-white font-bold">
+                    {reactionText}
+                  </span>
+                )}
+              </div>
+              <div className="flex gap-3 text-white/60 text-[13px]">
+                {commentCount > 0 && (
+                  <span className="hover:underline cursor-pointer" onClick={(e) => { e.stopPropagation(); handleComment(); }}>
+                    {fmtCount(commentCount)} {commentCount === 1 ? 'Discussion' : 'Discussions'}
+                  </span>
+                )}
+                {shareCount > 0 && (
+                  <span className="hover:underline cursor-pointer" onClick={(e) => { e.stopPropagation(); handleShare(); }}>
+                    {fmtCount(shareCount)} {shareCount === 1 ? 'Share' : 'Shares'}
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Reaction, Discuss, Share icons grouped together like other posts */}
+          <div className="flex items-center gap-4 sm:gap-5 px-2">
+            <button
+              onClick={handleReactionClick}
+              className="flex items-center gap-1.5 h-10 px-2 rounded-lg hover:bg-white/10 transition-all duration-200 active:scale-95 focus:outline-none"
+              aria-label="React to story"
+            >
+              {activeReaction ? (
+                userReaction === 'love' || userReaction === 'like' ? (
+                  <i className="fas fa-heart text-[22px] text-[#F43F5E]"></i>
+                ) : (
+                  <span className="text-[22px]">{activeReaction.emoji}</span>
+                )
+              ) : userReaction ? (
+                <i className="fas fa-heart text-[22px] text-[#F43F5E]"></i>
+              ) : (
+                <i className="far fa-heart text-[22px] text-white"></i>
+              )}
+              {reactionCount > 0 && (
+                <span className="text-[15px] font-semibold text-white">
+                  {fmtCount(reactionCount)}
+                </span>
+              )}
+            </button>
+
+            <button
+              onClick={handleComment}
+              className="flex items-center gap-1.5 h-10 px-2 rounded-lg hover:bg-white/10 transition-all duration-200 active:scale-95 text-white hover:text-[#38BDF8] focus:outline-none"
+              aria-label="Discuss & Comments"
+            >
+              <i className="far fa-comment text-[22px]"></i>
+              {commentCount > 0 && (
+                <span className="text-[15px] font-semibold text-white">
+                  {fmtCount(commentCount)}
+                </span>
+              )}
+            </button>
+
+            <button
+              onClick={handleShare}
+              className="flex items-center gap-1.5 h-10 px-2 rounded-lg hover:bg-white/10 transition-all duration-200 active:scale-95 text-white hover:text-[#38BDF8] focus:outline-none"
+              aria-label="Share story"
+            >
+              <i className="far fa-paper-plane text-[21px]"></i>
+              {shareCount > 0 && (
+                <span className="text-[15px] font-semibold text-white">
+                  {fmtCount(shareCount)}
+                </span>
+              )}
+            </button>
+          </div>
+        </div>
+
+        {/* Viewers Modal */}
+        {showViewers && (
+          <div className="absolute inset-0 z-[500] bg-black/70 backdrop-blur-sm">
+            <div className="absolute inset-0" onClick={closeViewers} />
+
+            <div className="relative w-full h-full flex items-center justify-center p-4 sm:p-8">
+              <div className="w-full max-w-[560px] bg-[#0F172A] rounded-2xl border border-[#1E293B] shadow-2xl overflow-hidden">
+                <div className="flex items-center justify-between px-4 py-3 border-b border-[#1E293B]">
+                  <div className="flex items-center gap-2">
+                    <i className="fas fa-eye text-[#1877F2]"></i>
+                    <h3 className="text-white font-black text-[16px]">Story Viewers</h3>
+                    <span className="text-white/60 text-xs font-bold">({viewers.length})</span>
+                  </div>
+
+                  <button
+                    onClick={closeViewers}
+                    className="w-10 h-10 rounded-full bg-white/10 hover:bg-white/15 flex items-center justify-center"
+                    aria-label="Close viewers modal"
+                  >
+                    <i className="fas fa-times text-white/80"></i>
+                  </button>
+                </div>
+
+                {loadingViewers ? (
+                  <div className="py-10 flex items-center justify-center text-white/70">
+                    <i className="fas fa-spinner fa-spin mr-2"></i> Loading viewers...
+                  </div>
+                ) : viewersError ? (
+                  <div className="py-10 text-center text-red-300 font-bold">{viewersError}</div>
+                ) : viewers.length === 0 ? (
+                  <div className="py-10 text-center text-white/60 font-bold">No viewers yet</div>
+                ) : (
+                  <div className="max-h-[70vh] overflow-y-auto p-2">
+                    {viewers.map((v) => {
+                      const id = Number(v?.user?.id || v?.user_id || 0);
+                      const name = pickBestName(v?.user?.name, v?.user?.username, `User ${id || ''}`);
+                      const img = v?.user?.profile_image_url || getDefaultProfilePicture(name, id);
+                      
+                      const reaction =
+                        (v as any)?.reaction ??
+                        (v as any)?.reaction_type ??
+                        (v as any)?.my_reaction ??
+                        v.reaction ??
+                        null;
+
+                      return (
+                        <div
+                          key={`${id}-${v.viewed_at}`}
+                          className="flex items-center gap-3 p-3 rounded-2xl hover:bg-white/5 transition-all cursor-pointer"
+                          onClick={() => id && onProfileClick?.(id)}
+                        >
+                          <img src={img} className="w-12 h-12 rounded-full object-cover border border-white/10" alt="" />
+                          <div className="flex-1 min-w-0">
+                            <p className="text-white font-black truncate">{name}</p>
+                            <p className="text-white/60 text-xs font-bold">{formatStoryTime(v.viewed_at)}</p>
+                          </div>
+
+                          <div className="flex flex-col items-end gap-1">
+                            <div className={`text-2xl ${getReactionColor(reaction)}`}>
+                              {getReactionEmoji(reaction)}
+                            </div>
+                            {reaction && (
+                              <span className="text-white/60 text-[10px] font-bold">
+                                {getReactionName(reaction)}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                <div className="p-4 border-t border-[#1E293B] flex justify-end">
+                  <button
+                    onClick={closeViewers}
+                    className="px-6 py-2 rounded-full bg-[#1877F2] hover:bg-[#166FE5] text-white font-black"
+                  >
+                    Done
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Delete Confirmation Modal */}
+        {showDeleteConfirm && (
+          <div className="absolute inset-0 z-[500] bg-black/70 backdrop-blur-sm">
+            <div className="absolute inset-0" onClick={() => setShowDeleteConfirm(false)} />
+
+            <div className="relative w-full h-full flex items-center justify-center p-4">
+              <div className="w-full max-w-[400px] bg-[#0F172A] rounded-2xl border border-[#1E293B] shadow-2xl overflow-hidden">
+                <div className="flex items-center justify-between px-4 py-3 border-b border-[#1E293B]">
+                  <div className="flex items-center gap-2">
+                    <i className="fas fa-trash text-[#F3425F]"></i>
+                    <h3 className="text-white font-black text-[16px]">Delete Story</h3>
+                  </div>
+
+                  <button
+                    onClick={() => setShowDeleteConfirm(false)}
+                    className="w-10 h-10 rounded-full bg-white/10 hover:bg-white/15 flex items-center justify-center"
+                    aria-label="Cancel delete"
+                    disabled={deletingStory}
+                  >
+                    <i className="fas fa-times text-white/80"></i>
+                  </button>
+                </div>
+
+                <div className="p-6">
+                  <div className="flex items-center justify-center mb-4">
+                    <div className="w-16 h-16 bg-[#F3425F]/20 rounded-full flex items-center justify-center">
+                      <i className="fas fa-trash text-[#F3425F] text-2xl"></i>
+                    </div>
+                  </div>
+                  
+                  <p className="text-white font-bold text-center text-lg mb-2">
+                    Delete this story?
+                  </p>
+                  
+                  <p className="text-white/60 text-center text-sm mb-6">
+                    This story will be permanently deleted. This action cannot be undone.
+                  </p>
+
+                  <div className="flex gap-3">
+                    <button
+                      onClick={() => setShowDeleteConfirm(false)}
+                      className="flex-1 py-3 rounded-xl bg-white/10 hover:bg-white/15 text-white font-bold transition-all"
+                      disabled={deletingStory}
+                    >
+                      Cancel
+                    </button>
+                    
+                    <button
+                      onClick={handleDeleteStory}
+                      className="flex-1 py-3 rounded-xl bg-[#F3425F] hover:bg-[#E41E3F] text-white font-bold transition-all flex items-center justify-center gap-2"
+                      disabled={deletingStory}
+                    >
+                      {deletingStory ? (
+                        <>
+                          <i className="fas fa-spinner fa-spin"></i>
+                          Deleting...
+                        </>
+                      ) : (
+                        <>
+                          <i className="fas fa-trash"></i>
+                          Delete
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Reactions Sheet for Story */}
+        {showReactionsSheet && (
+          <ReactionsSheet
+            isOpen={showReactionsSheet}
+            onClose={() => {
+              setShowReactionsSheet(false);
+              setIsPaused(false);
+            }}
+            post={normalizedStoryPost}
+            onProfileClick={onProfileClick || (() => {})}
+            onOpenComments={() => {
+              setShowReactionsSheet(false);
+              handleComment();
+            }}
+            currentUser={currentUser}
+          />
+        )}
+      </div>
+    </div>
+  );
+};
+
+// ==================== STORY REEL COMPONENT ====================
+interface StoryReelProps {
+  stories: StoryType[];
+  onProfileClick: (id: number) => void;
+  onCreateStory?: () => void;
+  onViewStory: (story: StoryType) => void;
+  currentUser: User | null;
+  onRequestLogin: () => void;
+
+  onFollow?: (userId: number) => void;
+  checkIsFollowing?: (userId: number) => boolean;
+  followLoading?: { [key: number]: boolean };
+
+  onFetchViewers?: (storyId: number) => Promise<StoryViewer[]>;
+  onReaction?: (storyId: number, reaction: string) => void;
+  onReply?: (storyId: number, text: string) => void;
+  onToggleMute?: () => void;
+  muted?: boolean;
+
+  storyCreateLoading?: boolean;
+}
+
+export const StoryReel: React.FC<StoryReelProps> = ({
+  stories,
+  onProfileClick,
+  onCreateStory,
+  onViewStory,
+  currentUser,
+  onRequestLogin,
+  onFollow,
+  checkIsFollowing,
+  followLoading,
+  onFetchViewers,
+  onReaction,
+  onReply,
+  onToggleMute,
+  muted = true,
+  storyCreateLoading = false,
+}) => {
+
+  const toTime = (d: any) => parseServerTime(d);
+
+  const sortedStories = useMemo(() => 
+    [...stories].sort((a, b) => toTime(b.created_at) - toTime(a.created_at)), 
+    [stories]
+  );
+
+  // ✅ FIXED: Ranking with user's own story first
+  const uniqueUserStories: StoryType[] = useMemo(() => {
+    const meId = Number(currentUser?.id || 0);
+    const myStories = stories
+      .filter((s) => meId && Number(s.user_id) === meId)
+      .slice()
+      .sort((a, b) => toTime(b.created_at) - toTime(a.created_at));
+    const otherStories = stories.filter((s) => !meId || Number(s.user_id) !== meId);
+    const rankedOthers = rankStoriesForReel(otherStories, currentUser) || [];
+    const myLatest = myStories[0] ? [myStories[0]] : [];
+    return [...myLatest, ...rankedOthers];
+  }, [stories, currentUser?.id, (currentUser as any)?.following]);
+
+  const userStoryCounts = useMemo(() => {
+    const m = new Map<number, number>();
+    for (const s of sortedStories) m.set(Number(s.user_id), (m.get(Number(s.user_id)) || 0) + 1);
+    return m;
+  }, [sortedStories]);
+
+  const getDisplayThumbnail = (story: StoryType): string => {
+    const meta = story.media_meta?.[0];
+    if (meta?.thumb) return meta.thumb;
+    if (meta?.feed) return meta.feed;
+    if (meta?.full) return meta.full;
+    if (story.media_url) return story.media_url;
+    return '';
+  };
+
+  const renderCountDots = (count: number) => {
+    const maxDots = 5;
+    const dots = Math.min(count, maxDots);
+    const extra = count - maxDots;
+
+    return (
+      <div className="flex items-center gap-1">
+        {Array.from({ length: dots }).map((_, i) => (
+          <span key={i} className="w-1.5 h-1.5 rounded-full bg-white/80" />
+        ))}
+        {extra > 0 && <span className="text-white/80 text-[10px] font-black ml-1">+{extra}</span>}
+      </div>
+    );
+  };
+
+  return (
+    <div className="w-full bg-[#0F172A] border-b-[8px] border-[#050B18] py-3.5 px-3 overflow-x-auto flex gap-2.5 scrollbar-hide">
+      <div
+        className="min-w-[110px] sm:min-w-[135px] h-[200px] sm:h-[240px] bg-[#0F172A] rounded-2xl shadow-sm overflow-hidden cursor-pointer relative group flex-shrink-0 border border-[#1E293B]"
+        onClick={() => (currentUser ? onCreateStory?.() : onRequestLogin())}
+        aria-label="Create new story"
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            currentUser ? onCreateStory?.() : onRequestLogin();
+          }
+        }}
+      >
+        <img
+          src={
+            currentUser?.profile_image_url ||
+            (currentUser as any)?.avatar_url ||
+            getDefaultProfilePicture(currentUser?.name || 'User', currentUser?.id || 0)
+          }
+          alt="Create"
+          className="h-[75%] w-full object-cover group-hover:scale-105 transition-transform duration-500 opacity-80"
+        />
+        <div className="absolute bottom-0 w-full h-[25%] bg-[#0F172A] flex flex-col items-center justify-end pb-2.5">
+          <div className="absolute -top-5 w-10 h-10 flex items-center justify-center">
+            <div className="relative w-10 h-10">
+              <div className="absolute inset-0 bg-gradient-to-tr from-[#166FE5] to-[#1877F2] rounded-full border-4 border-[#0F172A] text-white shadow-md flex items-center justify-center">
+                <i className="fas fa-plus text-sm"></i>
+              </div>
+              {storyCreateLoading && (
+                <div className="absolute inset-[-3px] rounded-full border-[3px] border-white/15 border-t-[#38BDF8] border-r-[#1877F2] animate-spin" />
+              )}
+            </div>
+          </div>
+          <span className="text-[11px] font-bold text-[#F8FAFC] mt-4">Create Story</span>
+        </div>
+      </div>
+
+      {uniqueUserStories.map((story) => {
+        const bestName = pickBestName(
+          story.user?.name,
+          (story as any).author_name,
+          (story as any).author_username,
+          (story as any).username
+        );
+
+        const bestUsername = pickBestName(
+          story.user?.username,
+          (story as any).author_username,
+          (story as any).username,
+          bestName.toLowerCase().replace(/\s+/g, '_')
+        );
+
+        const authorImage =
+          pickBestImage(story.user?.profile_image_url, (story as any).author_image) ||
+          getDefaultProfilePicture(bestName, story.user_id);
+
+        const storyUser = story.user || {
+          id: story.user_id,
+          name: bestName,
+          username: bestUsername,
+          profile_image_url: authorImage,
+        };
+
+        const author = mergeUserSafe(storyUser as any, story.user || {});
+        const isMe = !!currentUser && Number(currentUser.id) === Number(author.id);
+        const isFollowing = author.id && checkIsFollowing ? checkIsFollowing(Number(author.id)) : false;
+        const isLoading = author.id && followLoading ? followLoading[Number(author.id)] : false;
+
+        const count = userStoryCounts.get(Number(story.user_id)) || 1;
+        const isText = story.type === 'text';
+        const thumbnailUrl = getDisplayThumbnail(story);
+        const isVid = story.type === 'video' || (!isText && isVideoUrl(thumbnailUrl));
+
+        return (
+          <div
+            key={story.id}
+            className="min-w-[110px] sm:min-w-[140px] h-[210px] sm:h-[250px] relative rounded-2xl overflow-hidden cursor-pointer flex-shrink-0 group shadow-lg border border-[#1E293B]"
+            onClick={() => onViewStory(story)}
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                onViewStory(story);
+              }
+            }}
+            aria-label={`View ${author.name}'s story`}
+          >
+            {isText ? (
+              <div
+                className="absolute w-full h-full flex items-center justify-center p-3 text-center"
+                style={{ background: (story as any).background_style }}
+              >
+                <span className="text-white font-bold text-[10px] line-clamp-4 leading-tight">
+                  {(story as any).text_content}
+                </span>
+              </div>
+            ) : thumbnailUrl && !isBlob(thumbnailUrl) ? (
+              isVid ? (
+                <div className="absolute w-full h-full">
+                  {thumbnailUrl ? (
+                    <img src={thumbnailUrl} alt="Video story" className="absolute w-full h-full object-cover group-hover:scale-110 transition-transform duration-700" />
+                  ) : (
+                    <div className="absolute w-full h-full bg-[#050B18] flex items-center justify-center">
+                      <i className="fas fa-play text-white text-3xl"></i>
+                    </div>
+                  )}
+                  <div className="absolute bottom-0 right-0 m-3 bg-black/40 border border-white/10 rounded-full px-2 py-1 text-white text-[10px] font-black flex items-center gap-1">
+                    <i className="fas fa-play text-[9px]"></i> Video
+                  </div>
+                </div>
+              ) : (
+                <img
+                  src={thumbnailUrl}
+                  alt="Story"
+                  className="absolute w-full h-full object-cover group-hover:scale-110 transition-transform duration-700"
+                />
+              )
+            ) : (
+              <div className="absolute w-full h-full bg-gradient-to-br from-blue-600 to-sky-500 flex items-center justify-center">
+                <span className="text-white font-bold text-sm">Story</span>
+              </div>
+            )}
+
+            <div className="absolute inset-0 bg-black/20 group-hover:bg-black/10 transition-colors"></div>
+
+            <button
+              className="absolute top-3 left-3 w-9 h-9 rounded-full border-4 border-[#1877F2] overflow-hidden z-10 shadow-md"
+              onClick={(e) => {
+                e.stopPropagation();
+                onProfileClick(story.user_id);
+              }}
+              aria-label={`Go to ${author.name}'s profile`}
+            >
+              <img src={author.profile_image_url} alt="" className="w-full h-full object-cover" />
+            </button>
+
+            {currentUser && !isMe && author.id > 0 && onFollow && (
+              <div
+                className="absolute top-3 right-3 z-20"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  e.preventDefault();
+                  onFollow(Number(author.id));
+                }}
+              >
+                <button
+                  disabled={isLoading}
+                  className={`w-7 h-7 rounded-full flex items-center justify-center text-white text-xs border ${
+                    isFollowing ? 'bg-[#1E293B] border-[#1E293B]' : 'bg-[#1877F2] border-[#1877F2]'
+                  } ${isLoading ? 'opacity-60' : 'hover:opacity-90'}`}
+                  aria-label={isFollowing ? `Unfollow ${author.name}` : `Follow ${author.name}`}
+                >
+                  {isLoading ? (
+                    <i className="fas fa-spinner fa-spin"></i>
+                  ) : isFollowing ? (
+                    <i className="fas fa-check"></i>
+                  ) : (
+                    <i className="fas fa-plus"></i>
+                  )}
+                </button>
+              </div>
+            )}
+
+            <div className="absolute bottom-10 left-3 z-20">{renderCountDots(count)}</div>
+
+            <p className="absolute bottom-3 left-3 text-white font-bold text-xs drop-shadow-md truncate w-[85%]">
+              {author.name}
+            </p>
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
+// ==================== CREATE STORY MODAL ====================
+const STORY_COLORS = [
+  'linear-gradient(45deg, #1877F2, #0055FF)',
+  'linear-gradient(45deg, #F3425F, #E41E3F)',
+  'linear-gradient(45deg, #45BD62, #31A24C)',
+  'linear-gradient(45deg, #F7B928, #E3A300)',
+  'linear-gradient(45deg, #A033FF, #7B1FA2)',
+  'linear-gradient(45deg, #FF7E5F, #FEB47B)',
+  'linear-gradient(45deg, #00C6FF, #0072FF)',
+  'linear-gradient(45deg, #2193b0, #6dd5ed)',
+  'linear-gradient(45deg, #ee9ca7, #ffdde1)',
+  'linear-gradient(45deg, #42275a, #734b6d)',
+  'linear-gradient(45deg, #BDC3C7, #2C3E50)',
+  'linear-gradient(45deg, #000000, #434343)',
+];
+
+interface CreateStoryModalProps {
+  currentUser: User;
+  songs: Song[];
+  onClose: () => void;
+  onCreate: (story: any) => Promise<void> | void;
+}
+
+type MediaPick = { file?: File; url: string; kind: 'image' | 'video'; thumbUrl?: string; effectId?: string; nativeMeta?: NativeMediaMeta; };
+
+export const CreateStoryModal: React.FC<CreateStoryModalProps> = ({
+  currentUser,
+  songs,
+  onClose,
+  onCreate,
+}) => {
+  const [mode, setMode] = useState<'text' | 'media'>('media');
+  const [text, setText] = useState('');
+  const [background, setBackground] = useState(STORY_COLORS[0]);
+  const [picks, setPicks] = useState<MediaPick[]>([]);
+  const [activePick, setActivePick] = useState(0);
+  const [selectedMusic, setSelectedMusic] = useState<{ url: string; title: string; artist: string; cover?: string; start?: number; end?: number; duration?: number; } | null>(null);
+  const [audioFile, setAudioFile] = useState<File | null>(null);
+  const [showMusicPicker, setShowMusicPicker] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [nativeUploading, setNativeUploading] = useState(false);
+  
+  // Camera state
+  const [cameraMode, setCameraMode] = useState(false);
+  const [cameraReady, setCameraReady] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
+  const [recordedChunks, setRecordedChunks] = useState<BlobPart[]>([]);
+  const [cameraModeType, setCameraModeType] = useState<'photo' | 'video'>('photo');
+  const [showEffects, setShowEffects] = useState(false);
+  const [previewSongId, setPreviewSongId] = useState<number | null>(null);
+  const [selectedFilterId, setSelectedFilterId] = useState('none');
+  const [cameraFacingMode, setCameraFacingMode] = useState<'user' | 'environment'>('user');
+  const [recordSeconds, setRecordSeconds] = useState(0);
+  const recordTimerRef = useRef<number | null>(null);
+  
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
+  const musicPreviewRef = useRef<HTMLAudioElement | null>(null);
+  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const audioInputRef = useRef<HTMLInputElement>(null);
+
+  const togglePreviewSong = (song: any) => {
+    if (previewSongId === song.id) {
+      previewAudioRef.current?.pause();
+      previewAudioRef.current = null;
+      setPreviewSongId(null);
+    } else {
+      if (previewAudioRef.current) {
+        previewAudioRef.current.pause();
+      }
+      const audio = new Audio(song.audio_url || song.audio_fetch_url || song.url);
+      previewAudioRef.current = audio;
+      setPreviewSongId(song.id);
+      audio.play().catch(console.error);
+      audio.onended = () => {
+        setPreviewSongId(null);
+        previewAudioRef.current = null;
+      };
+    }
+  };
+
+  const canShare = (mode === 'text' && !!text.trim()) || (mode === 'media' && picks.length > 0);
+
+  const canvasToBlobLocal = (canvas: HTMLCanvasElement, type: string, quality?: number) =>
+    new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob((blob) => {
+        if (blob) resolve(blob);
+        else reject(new Error('Canvas export failed'));
+      }, type, quality);
+    });
+
+  const createLocalVideoThumbnail = async (file: File) => {
+    const thumbFile = await createVideoThumbnailFile(file);
+    return { file: thumbFile, url: URL.createObjectURL(thumbFile) };
+  };
+
+  const openCamera = async (facing: 'user' | 'environment' = cameraFacingMode) => {
+    try {
+      setCameraReady(false);
+      setCameraMode(true);
+      try {
+        cameraStream?.getTracks().forEach((t) => t.stop());
+      } catch {}
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: facing,
+          width: { ideal: 1080 },
+          height: { ideal: 1920 },
+        },
+        audio: true,
+      });
+      setCameraFacingMode(facing);
+      setCameraStream(stream);
+      setTimeout(() => {
+        if (cameraVideoRef.current) {
+          cameraVideoRef.current.srcObject = stream;
+          cameraVideoRef.current.muted = true;
+          cameraVideoRef.current.playsInline = true;
+          cameraVideoRef.current.play().catch(() => {});
+        }
+      }, 80);
+    } catch (e: any) {
+      alert('Camera failed: ' + (e?.message || 'Permission denied'));
+      setCameraMode(false);
+    }
+  };
+
+  const flipCamera = async () => {
+    const next = cameraFacingMode === 'user' ? 'environment' : 'user';
+    await openCamera(next);
+  };
+
+  const takeStoryPhoto = async () => {
+    const video = cameraVideoRef.current;
+    if (!video) return;
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth || 720;
+    canvas.height = video.videoHeight || 1280;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.filter = getUneraFilterById(selectedFilterId).cssFilter || 'none';
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const blob = await canvasToBlobLocal(canvas, 'image/jpeg', 0.92);
+    const file = new File([blob], `story-camera-${Date.now()}.jpg`, { type: 'image/jpeg' });
+    const url = URL.createObjectURL(file);
+    setPicks((prev) => {
+      const next = [
+        ...prev,
+        { file, url, kind: 'image' as const, thumbUrl: url, effectId: selectedFilterId },
+      ];
+      setActivePick(next.length - 1);
+      return next;
+    });
+    setMode('media');
+    closeCamera();
+  };
+
+  const startStoryRecording = () => {
+    if (!cameraStream) return;
+    const chunks: BlobPart[] = [];
+    setRecordedChunks([]);
+    setRecordSeconds(0);
+    const recorder = new MediaRecorder(cameraStream, {
+      mimeType: MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')
+        ? 'video/webm;codecs=vp8,opus'
+        : 'video/webm',
+    });
+    mediaRecorderRef.current = recorder;
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) chunks.push(e.data);
+    };
+    recorder.onstop = async () => {
+      try {
+        const blob = new Blob(chunks, { type: recorder.mimeType || 'video/webm' });
+        const file = new File([blob], `story-camera-${Date.now()}.webm`, {
+          type: recorder.mimeType || 'video/webm',
+        });
+        const url = URL.createObjectURL(file);
+        // ✅ Web-created thumbnail, prevents player from showing in story reel/card
+        const thumb = await createLocalVideoThumbnail(file);
+        setPicks((prev) => {
+          const next = [
+            ...prev,
+            { file, url, kind: 'video' as const, thumbUrl: thumb.url, effectId: selectedFilterId },
+          ];
+          setActivePick(next.length - 1);
+          return next;
+        });
+        setMode('media');
+        closeCamera();
+      } catch (e) {
+        console.error('Failed to finish recording:', e);
+        closeCamera();
+      }
+    };
+    if (selectedMusic?.url) {
+      musicPreviewRef.current = new Audio(selectedMusic.url);
+      musicPreviewRef.current.currentTime = selectedMusic.start ?? 5;
+      musicPreviewRef.current.volume = 0.8;
+      musicPreviewRef.current.muted = false;
+      musicPreviewRef.current.play().catch(() => {});
+    }
+    recorder.start(250);
+    setIsRecording(true);
+    if (recordTimerRef.current) window.clearInterval(recordTimerRef.current);
+    recordTimerRef.current = window.setInterval(() => {
+      setRecordSeconds((s) => {
+        const next = s + 1;
+        if (next >= 90) stopStoryRecording();
+        return next;
+      });
+    }, 1000);
+  };
+
+  const stopStoryRecording = () => {
+    if (recordTimerRef.current) {
+      window.clearInterval(recordTimerRef.current);
+      recordTimerRef.current = null;
+    }
+    mediaRecorderRef.current?.stop();
+    setIsRecording(false);
+    if (musicPreviewRef.current) {
+      musicPreviewRef.current.pause();
+      musicPreviewRef.current = null;
+    }
+  };
+
+  const closeCamera = () => {
+    try {
+      cameraStream?.getTracks().forEach((t) => t.stop());
+    } catch {}
+    if (recordTimerRef.current) {
+      window.clearInterval(recordTimerRef.current);
+      recordTimerRef.current = null;
+    }
+    setCameraStream(null);
+    setCameraMode(false);
+    setCameraReady(false);
+    setIsRecording(false);
+    setRecordSeconds(0);
+    setCameraModeType('photo');
+    setShowEffects(false);
+    if (musicPreviewRef.current) {
+      musicPreviewRef.current.pause();
+      musicPreviewRef.current = null;
+    }
+  };
+
+  // Native upload listener
+  useEffect(() => {
+    const handleNativeUpload = (event: any) => {
+      const media: NativeMediaMeta = event.detail;
+      if (!media) return;
+
+      // Handle audio upload
+      if (
+        media.type === 'audio' ||
+        String(media.mimeType || '').startsWith('audio/')
+      ) {
+        const audioUrl = media.full || media.url || media.feed || '';
+        if (!audioUrl) return;
+        setSelectedMusic({
+          url: audioUrl,
+          title: media.fileName || 'Uploaded Music',
+          artist: 'Local Upload',
+          start: 0,
+          end: 15,
+          duration: 0,
+        });
+        setAudioFile(null);
+        setShowMusicPicker(false);
+        setNativeUploading(false);
+        return;
+      }
+
+      // Handle image/video upload
+      const mediaUrl = media.feed || media.full || media.url || media.thumb || '';
+      if (!mediaUrl) return;
+
+      const kind: 'image' | 'video' = media.type === 'video' || String(media.mimeType || '').startsWith('video/') ? 'video' : 'image';
+      const pick: MediaPick = {
+        url: media.thumb || media.feed || media.full || mediaUrl,
+        kind,
+        nativeMeta: {
+          thumb: media.thumb || null,
+          feed: media.feed || null,
+          full: media.full || media.url || media.feed || null,
+          url: media.url || media.full || media.feed || null,
+          type: kind,
+          mimeType: media.mimeType,
+          fileName: media.fileName,
+        },
+      };
+      setPicks(prev => {
+        const next = [...prev, pick].slice(0, 30);
+        if (prev.length === 0) setActivePick(0);
+        return next;
+      });
+      setMode('media');
+      setNativeUploading(false);
+    };
+
+    const handleStart = () => setNativeUploading(true);
+    const handleDone = () => setNativeUploading(false);
+
+    window.addEventListener('uneraNativeUpload', handleNativeUpload);
+    window.addEventListener('uneraNativeUploadStart', handleStart);
+    window.addEventListener('uneraNativeUploadCancel', handleDone);
+    window.addEventListener('uneraNativeUploadError', handleDone);
+
+    return () => {
+      window.removeEventListener('uneraNativeUpload', handleNativeUpload);
+      window.removeEventListener('uneraNativeUploadStart', handleStart);
+      window.removeEventListener('uneraNativeUploadCancel', handleDone);
+      window.removeEventListener('uneraNativeUploadError', handleDone);
+    };
+  }, []);
+
+  const cleanupPickUrls = useCallback((arr: MediaPick[]) => {
+    for (const p of arr) if (p.url && p.url.startsWith('blob:') && !p.nativeMeta) URL.revokeObjectURL(p.url);
+  }, []);
+
+  const handleCreate = async () => {
+    if (!canShare || creating) return;
+    setCreating(true);
+    
+    onClose();
+    
+    const run = async () => {
+      try {
+        if (mode === 'text') {
+          await onCreate({
+            user_id: currentUser.id,
+            type: 'text',
+            text_content: text,
+            background_style: background,
+            music_url: selectedMusic?.url,
+            music_title: selectedMusic ? `${selectedMusic.title} - ${selectedMusic.artist}` : undefined,
+            music_start: selectedMusic?.start ?? 5,
+            music_end: selectedMusic?.end ?? null,
+            music_duration: selectedMusic?.duration ?? 0,
+            effect_id: selectedFilterId || 'none',
+            duration: 90,
+          });
+          return;
+        }
+        
+        for (const p of picks) {
+          if (p.nativeMeta) {
+            const meta = p.nativeMeta;
+            const fullUrl = meta.full || meta.url || meta.feed || meta.thumb || null;
+            const feedUrl = meta.feed || fullUrl;
+            const thumbUrl = p.thumbUrl || meta.thumb || feedUrl || fullUrl;
+            await onCreate({
+              user_id: currentUser.id,
+              type: p.kind,
+              media_url: p.kind === 'image' ? feedUrl : fullUrl,
+              media_urls: [p.kind === 'image' ? feedUrl : fullUrl].filter(Boolean),
+              media_types: [p.kind],
+              media_meta: [
+                {
+                  thumb: thumbUrl,
+                  feed: p.kind === 'image' ? feedUrl : null,
+                  full: p.kind === 'image' ? feedUrl : fullUrl,
+                  type: p.kind,
+                },
+              ],
+              music_url: selectedMusic?.url,
+              music_title: selectedMusic ? `${selectedMusic.title} - ${selectedMusic.artist}` : undefined,
+              music_start: selectedMusic?.start ?? 5,
+              music_end: selectedMusic?.end ?? null,
+              music_duration: selectedMusic?.duration ?? 0,
+              effect_id: p.effectId || selectedFilterId || 'none',
+              duration: 90,
+            });
+            continue;
+          }
+          if (!p.file) continue;
+          if (p.kind === 'image') {
+            const uploaded = await uploadStoryImageSecret(p.file);
+            await onCreate({
+              user_id: currentUser.id,
+              type: 'image',
+              media_url: uploaded.media_url,
+              media_urls: uploaded.media_urls,
+              media_types: uploaded.media_types,
+              media_meta: uploaded.media_meta,
+              music_url: selectedMusic?.url,
+              music_title: selectedMusic ? `${selectedMusic.title} - ${selectedMusic.artist}` : undefined,
+              music_start: selectedMusic?.start ?? 5,
+              music_end: selectedMusic?.end ?? null,
+              music_duration: selectedMusic?.duration ?? 0,
+              effect_id: p.effectId || selectedFilterId || 'none',
+              duration: 90,
+            });
+          } else {
+            const uploaded = await uploadStoryVideoSecret(p.file);
+            await onCreate({
+              user_id: currentUser.id,
+              type: 'video',
+              media_url: uploaded.media_url,
+              media_urls: uploaded.media_urls,
+              media_types: uploaded.media_types,
+              media_meta: uploaded.media_meta.map((m: any) => ({
+                ...m,
+                thumb: m.thumb || p.thumbUrl || null,
+                type: 'video',
+              })),
+              music_url: selectedMusic?.url,
+              music_title: selectedMusic ? `${selectedMusic.title} - ${selectedMusic.artist}` : undefined,
+              music_start: selectedMusic?.start ?? 5,
+              music_end: selectedMusic?.end ?? null,
+              music_duration: selectedMusic?.duration ?? 0,
+              effect_id: p.effectId || selectedFilterId || 'none',
+              duration: 90,
+            });
+          }
+        }
+      } catch (error: any) {
+        console.error('Failed to create story:', error);
+        const toast = document.createElement('div');
+        toast.className = 'fixed bottom-24 left-1/2 -translate-x-1/2 bg-[#F3425F] text-white px-6 py-2 rounded-full font-bold shadow-lg z-[400]';
+        toast.innerText = error?.message || 'Failed to create story';
+        document.body.appendChild(toast);
+        setTimeout(() => toast.remove(), 2200);
+      } finally {
+        setCreating(false);
+      }
+    };
+    
+    void run();
+  };
+
+  const addFiles = (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const newItems: MediaPick[] = [];
+
+    Array.from(files).forEach((file) => {
+      const kind: 'image' | 'video' = file.type.startsWith('video/') ? 'video' : 'image';
+      const url = URL.createObjectURL(file);
+      newItems.push({ file, url, kind });
+    });
+
+    setPicks(prev => {
+      const merged = [...prev, ...newItems].slice(0, 30);
+      if (prev.length === 0) setActivePick(0);
+      return merged;
+    });
+    setMode('media');
+  };
+
+  const removePick = (index: number) => {
+    setPicks(prev => {
+      const next = prev.slice();
+      const removed = next.splice(index, 1);
+      cleanupPickUrls(removed);
+      
+      const newLength = next.length;
+      setActivePick(current => {
+        if (newLength === 0) return 0;
+        if (current >= newLength) return newLength - 1;
+        if (current > index) return current - 1;
+        return current;
+      });
+      
+      return next;
+    });
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    addFiles(e.target.files);
+    e.currentTarget.value = '';
+  };
+
+  const handleAudioUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      setAudioFile(file);
+      setSelectedMusic({
+        url: URL.createObjectURL(file),
+        title: file.name.split('.')[0],
+        artist: 'Local Upload',
+        start: 0,
+        end: 15,
+        duration: 0,
+      });
+      setShowMusicPicker(false);
+      e.currentTarget.value = '';
+    }
+  };
+
+  const handlePickStoryImage = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handlePickStoryVideo = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handlePickStoryMedia = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handlePickStoryAudio = () => {
+    audioInputRef.current?.click();
+  };
+
+  const openMusicPicker = () => {
+    setShowMusicPicker(true);
+  };
+
+  const renderMusicPicker = () => (
+    <div className="fixed inset-0 z-[900] bg-[#050B18] animate-slide-up flex flex-col font-sans">
+      <div className="p-4 border-b border-[#1E293B] flex justify-between items-center bg-[#0B1120]">
+        <button onClick={() => setShowMusicPicker(false)} className="text-[#B0B3B8] font-bold">
+          <i className="fas fa-chevron-down mr-2"></i>Close
+        </button>
+        <h3 className="font-bold text-white">Add Music</h3>
+        <div className="w-10"></div>
+      </div>
+
+      <div className="p-4 flex flex-col gap-4 overflow-y-auto flex-1">
+        {/* Upload Music button - uses native picker */}
+        <button
+          onClick={handlePickStoryAudio}
+          className="p-4 bg-[#0F172A] rounded-xl flex items-center gap-4 cursor-pointer hover:bg-[#1E293B] transition-all border border-[#1E293B]"
+          aria-label="Upload music"
+        >
+          <div className="w-12 h-12 bg-[#1877F2] rounded-full flex items-center justify-center shadow-lg">
+            <i className="fas fa-cloud-upload-alt text-white"></i>
+          </div>
+          <div>
+            <p className="text-white font-bold">Upload Music</p>
+            <p className="text-[#B0B3B8] text-xs">Choose a file from your device</p>
+          </div>
+        </button>
+
+        <input
+          type="file"
+          ref={audioInputRef}
+          className="hidden"
+          accept="audio/*"
+          onChange={handleAudioUpload}
+          aria-label="Select audio file"
+        />
+
+        <div className="h-px bg-[#1E293B] my-2"></div>
+        <p className="text-[#B0B3B8] text-xs font-bold uppercase tracking-widest px-1">
+          F-Music Trends
+        </p>
+
+        <div className="flex flex-col gap-2">
+          {songs.map((song) => (
+            <div
+              key={song.id}
+              className="p-3 bg-[#0F172A] hover:bg-[#1E293B] rounded-xl flex items-center gap-4 cursor-pointer transition-all border border-[#1E293B]"
+            >
+              <img src={song.cover_image_url} className="w-14 h-14 rounded-lg object-cover shadow-md" alt="" />
+              <div className="flex-1 overflow-hidden">
+                <p className="text-white font-bold truncate">{song.title}</p>
+                <p className="text-[#B0B3B8] text-sm truncate">{song.artist_name}</p>
+              </div>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => togglePreviewSong(song)}
+                  className="w-10 h-10 rounded-full bg-[#1877F2] flex items-center justify-center"
+                >
+                  <i className={`fas ${previewSongId === song.id ? 'fa-pause' : 'fa-play'} text-white`}></i>
+                </button>
+                <button
+                  onClick={() => {
+                    previewAudioRef.current?.pause();
+                    previewAudioRef.current = null;
+                    setPreviewSongId(null);
+                    setSelectedMusic({
+                      url: song.audio_url,
+                      title: song.title,
+                      artist: song.artist_name,
+                      cover: song.cover_image_url,
+                      start: 0,
+                      end: 15,
+                      duration: song.duration || 0,
+                    });
+                    setAudioFile(null);
+                    setShowMusicPicker(false);
+                  }}
+                  className="px-4 py-2 rounded-full bg-[#45BD62] text-white font-bold text-sm"
+                >
+                  Add
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+
+  useEffect(() => {
+    return () => {
+      cleanupPickUrls(picks);
+      if (selectedMusic?.url && selectedMusic.url.startsWith('blob:')) {
+        URL.revokeObjectURL(selectedMusic.url);
+      }
+      if (previewAudioRef.current) {
+        previewAudioRef.current.pause();
+        previewAudioRef.current = null;
+      }
+    };
+  }, [picks, selectedMusic?.url, audioFile, cleanupPickUrls]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (cameraMode) closeCamera();
+        else if (showMusicPicker) setShowMusicPicker(false);
+        else if (showEffects) setShowEffects(false);
+        else onClose();
+      }
+      if (e.key === 'Enter' && canShare && !cameraMode && !showMusicPicker && !showEffects) handleCreate();
+    };
+    
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onClose, canShare, handleCreate, cameraMode, showMusicPicker, showEffects]);
+
+  const active = picks[activePick];
+
+  // Camera screen
+  if (cameraMode) {
+    return (
+      <div className="fixed inset-0 z-[500] bg-[#050B18] flex flex-col overflow-hidden">
+        <div className="absolute top-0 left-0 right-0 z-30 p-4 flex items-center justify-between">
+          <button onClick={closeCamera} className="w-11 h-11 rounded-full bg-black/50 text-white flex items-center justify-center">
+            <i className="fas fa-times text-xl"></i>
+          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={() => setShowEffects(true)}
+              className="px-4 h-11 rounded-full flex items-center gap-2 font-bold bg-black/50 text-white"
+            >
+              <i className="fas fa-wand-magic-sparkles"></i> Effects
+            </button>
+            <button
+              onClick={openMusicPicker}
+              className={`px-4 h-11 rounded-full flex items-center gap-2 font-bold ${
+                selectedMusic ? 'bg-[#45BD62] text-white' : 'bg-black/50 text-white'
+              }`}
+            >
+              <i className="fas fa-music"></i>
+              {selectedMusic ? 'Music added' : 'Add Music'}
+            </button>
+          </div>
+        </div>
+
+        {/* TikTok-style right-side icons */}
+        <div className="absolute right-4 top-28 z-40 flex flex-col items-center gap-5">
+          <button onClick={flipCamera} className="w-12 h-12 rounded-full bg-black/35 flex items-center justify-center text-white active:scale-95" aria-label="Flip camera">
+            <i className="fas fa-sync-alt text-2xl"></i>
+          </button>
+          <button onClick={() => setShowEffects(true)} className="w-12 h-12 rounded-full bg-black/35 flex items-center justify-center text-white active:scale-95" aria-label="Effects">
+            <i className="fas fa-wand-magic-sparkles text-2xl"></i>
+          </button>
+          <button onClick={openMusicPicker} className="w-12 h-12 rounded-full bg-black/35 flex items-center justify-center text-white active:scale-95" aria-label="Add music">
+            <i className="fas fa-music text-2xl"></i>
+          </button>
+        </div>
+
+        <div className="absolute inset-0 bg-[#050B18]">
+          <video
+            ref={cameraVideoRef}
+            autoPlay
+            playsInline
+            muted
+            className={`w-full h-full object-cover transition-opacity duration-300 ${
+              cameraReady ? 'opacity-100' : 'opacity-0'
+            }`}
+            style={buildUneraFilterStyle(selectedFilterId)}
+            onLoadedMetadata={() => setCameraReady(true)}
+            onCanPlay={() => setCameraReady(true)}
+          />
+          <UneraFilterOverlay filterId={selectedFilterId} />
+        </div>
+
+        {!cameraReady && (
+          <div className="absolute inset-0 bg-gradient-to-b from-[#0B1120] via-[#050B18] to-[#050B18] flex flex-col items-center justify-center z-10">
+            <div className="w-20 h-20 rounded-full bg-white/10 flex items-center justify-center mb-4">
+              <i className="fas fa-camera text-white text-3xl animate-pulse"></i>
+            </div>
+
+            <div className="text-white font-black text-xl">Opening camera</div>
+            <div className="text-white/50 text-sm mt-1">Please wait...</div>
+
+            <div className="mt-6 w-40 h-1.5 bg-white/10 rounded-full overflow-hidden">
+              <div className="h-full w-1/2 bg-[#1877F2] rounded-full animate-pulse"></div>
+            </div>
+          </div>
+        )}
+
+        <div className="absolute bottom-32 left-0 right-0 z-30 flex items-center justify-center gap-3">
+          <button
+            onClick={() => setCameraModeType('photo')}
+            className={`px-5 py-2 rounded-full font-bold ${
+              cameraModeType === 'photo' ? 'bg-white text-black' : 'bg-black/50 text-white'
+            }`}
+          >
+            Photo
+          </button>
+          <button
+            onClick={() => setCameraModeType('video')}
+            className={`px-5 py-2 rounded-full font-bold ${
+              cameraModeType === 'video' ? 'bg-white text-black' : 'bg-black/50 text-white'
+            }`}
+          >
+            Video
+          </button>
+        </div>
+
+        <div className="absolute bottom-10 left-0 right-0 flex items-center justify-center">
+          <button
+            onClick={cameraModeType === 'photo' ? takeStoryPhoto : isRecording ? stopStoryRecording : startStoryRecording}
+            className={`w-20 h-20 rounded-full border-4 border-white flex items-center justify-center ${
+              isRecording ? 'bg-[#F3425F]' : 'bg-white/20'
+            }`}
+          >
+            <div className={`${
+              isRecording ? 'w-8 h-8 rounded-md bg-white' : 'w-14 h-14 rounded-full bg-[#F3425F]'
+            }`} />
+          </button>
+        </div>
+
+        {showEffects && (
+          <Filters
+            selectedFilterId={selectedFilterId}
+            onSelectFilter={(filter: UneraFilter) => {
+              setSelectedFilterId(filter.id);
+            }}
+            onClose={() => setShowEffects(false)}
+          />
+        )}
+
+        {showMusicPicker && renderMusicPicker()}
+      </div>
+    );
+  }
+
+  return (
+    <div className="fixed inset-0 z-[200] bg-[#050B18] flex flex-col font-sans animate-fade-in text-white overflow-hidden">
+      <div className="flex justify-between items-center p-4 bg-[#0B1120] absolute top-0 w-full z-40 border-b border-[#1E293B]">
+        <button
+          onClick={onClose}
+          className="text-white font-bold text-sm bg-[#1E293B] px-4 py-2 rounded-full hover:bg-[#141E33] border border-[#1E293B] transition-all"
+          aria-label="Discard and close"
+        >
+          Discard
+        </button>
+        <h3 className="font-black text-[18px]">Create Story</h3>
+        <button
+          onClick={handleCreate}
+          disabled={!canShare}
+          className="bg-[#1877F2] text-white px-6 py-2 rounded-full font-black text-sm disabled:opacity-50 disabled:bg-gray-600 transition-all"
+          aria-label="Share story"
+        >
+          Share
+        </button>
+      </div>
+
+      <div
+        className="flex-1 flex items-center justify-center relative overflow-hidden mt-16 mb-24"
+        style={{ background: mode === 'text' ? background : '#050B18' }}
+      >
+        {mode === 'text' ? (
+          <textarea
+            autoFocus
+            placeholder="Start typing..."
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            className="bg-transparent text-white text-4xl font-bold text-center w-full max-w-lg outline-none resize-none placeholder-white/40 px-10 h-[40vh] flex items-center justify-center"
+            aria-label="Story text"
+          />
+        ) : (
+          <div
+            className="w-full h-full flex items-center justify-center bg-[#050B18]"
+            onClick={() => picks.length === 0 && handlePickStoryMedia()}
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if ((e.key === 'Enter' || e.key === ' ') && picks.length === 0) {
+                handlePickStoryMedia();
+              }
+            }}
+          >
+            {picks.length > 0 && active ? (
+              <div className="relative w-full h-full">
+                {active.kind === 'video' ? (
+                  active.thumbUrl ? (
+                    <img src={active.thumbUrl} className="w-full h-full object-contain bg-black" alt="" />
+                  ) : (
+                    <video
+                      src={active.url}
+                      className="w-full h-full object-contain bg-black"
+                      playsInline
+                      controls
+                    />
+                  )
+                ) : (
+                  <img src={active.url} className="w-full h-full object-contain" alt="" />
+                )}
+
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    removePick(activePick);
+                  }}
+                  className="absolute top-4 left-4 w-10 h-10 bg-black/50 rounded-full flex items-center justify-center text-white"
+                  aria-label="Remove media"
+                >
+                  <i className="fas fa-trash-alt"></i>
+                </button>
+
+                <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-black/35 border border-white/10 backdrop-blur-md px-3 py-2 rounded-full flex items-center gap-1.5">
+                  {picks.map((_, i) => (
+                    <button
+                      key={i}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setActivePick(i);
+                      }}
+                      className={`w-2 h-2 rounded-full ${i === activePick ? 'bg-white' : 'bg-white/40'}`}
+                      aria-label={`Story ${i + 1}`}
+                    />
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="text-center cursor-pointer group">
+                <div className="w-20 h-20 bg-[#0F172A] border border-[#1E293B] rounded-full flex items-center justify-center mx-auto mb-4 group-hover:bg-[#1E293B] transition-all">
+                  <i className="fas fa-photo-video text-3xl text-white"></i>
+                </div>
+                <p className="font-black text-xl text-white">Select Photos / Videos</p>
+                <p className="text-white/60 text-sm mt-2">
+                  Choose multiple items like Facebook stories
+                </p>
+              </div>
+            )}
+
+            <input
+              type="file"
+              ref={fileInputRef}
+              className="hidden"
+              accept="image/*,video/*"
+              multiple
+              onChange={handleFileChange}
+              aria-label="Select media files"
+            />
+          </div>
+        )}
+
+        {selectedMusic && !cameraMode && (
+          <div className="absolute top-20 z-30 bg-white/10 backdrop-blur-xl px-4 py-2.5 rounded-2xl border border-white/20 flex items-center gap-3 shadow-2xl animate-pulse">
+            <div className="w-10 h-10 bg-[#1877F2] rounded-lg flex items-center justify-center">
+              <i className="fas fa-music text-white"></i>
+            </div>
+            <div>
+              <p className="text-xs font-black text-white leading-tight">{selectedMusic.title}</p>
+              <p className="text-[10px] text-white/70">{selectedMusic.artist}</p>
+            </div>
+            <button
+              onClick={() => {
+                if (selectedMusic.url.startsWith('blob:')) URL.revokeObjectURL(selectedMusic.url);
+                setSelectedMusic(null);
+                setAudioFile(null);
+              }}
+              className="text-white/50 hover:text-white"
+              aria-label="Remove music"
+            >
+              <i className="fas fa-times-circle"></i>
+            </button>
+          </div>
+        )}
+
+        {mode === 'media' && picks.length > 1 && !cameraMode && (
+          <div className="absolute bottom-16 left-0 right-0 px-4">
+            <div className="flex gap-2 overflow-x-auto scrollbar-hide">
+              {picks.map((p, i) => (
+                <button
+                  key={i}
+                  onClick={() => setActivePick(i)}
+                  className={`relative w-16 h-16 rounded-xl overflow-hidden flex-shrink-0 border ${
+                    i === activePick ? 'border-[#1877F2]' : 'border-white/10'
+                  }`}
+                  aria-label={`Select story ${i + 1}`}
+                >
+                  {p.kind === 'video' ? (
+                    <div className="relative w-full h-full">
+                      {p.thumbUrl ? (
+                        <img src={p.thumbUrl} className="w-full h-full object-cover" alt="" />
+                      ) : (
+                        <video src={p.url} className="w-full h-full object-cover" muted playsInline />
+                      )}
+                      <div className="absolute inset-0 flex items-center justify-center">
+                        <div className="w-8 h-8 rounded-full bg-black/50 flex items-center justify-center">
+                          <i className="fas fa-play text-white text-xs"></i>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <img src={p.url} className="w-full h-full object-cover" alt="" />
+                  )}
+                  {p.kind === 'video' && (
+                    <div className="absolute bottom-1 right-1 bg-black/50 rounded-full w-6 h-6 flex items-center justify-center">
+                      <i className="fas fa-play text-white text-[10px]"></i>
+                    </div>
+                  )}
+                </button>
+              ))}
+
+              <button
+                onClick={handlePickStoryMedia}
+                className="w-16 h-16 rounded-xl bg-white/10 hover:bg-white/15 border border-white/10 flex-shrink-0 flex items-center justify-center"
+                aria-label="Add more media"
+              >
+                <i className="fas fa-plus text-white"></i>
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="absolute bottom-0 w-full bg-[#0B1120] border-t border-[#1E293B] z-40 p-4 pb-8 flex flex-col gap-4">
+        {mode === 'text' && (
+          <div className="flex gap-3 overflow-x-auto scrollbar-hide px-2 py-1">
+            {STORY_COLORS.map((col, idx) => (
+              <button
+                key={idx}
+                onClick={() => setBackground(col)}
+                className={`w-10 h-10 rounded-full flex-shrink-0 cursor-pointer border-2 transition-transform hover:scale-110 ${
+                  background === col
+                    ? 'border-white scale-110 shadow-[0_0_15px_rgba(255,255,255,0.3)]'
+                    : 'border-transparent'
+                }`}
+                style={{ background: col }}
+                aria-label={`Background color ${idx + 1}`}
+              />
+            ))}
+          </div>
+        )}
+
+        <div className="flex items-center justify-between px-2">
+          <div className="flex gap-2 bg-[#070D1D] p-1 rounded-2xl border border-[#1E293B]">
+            <button
+              onClick={() => setMode('text')}
+              className={`px-6 py-2.5 rounded-xl text-sm font-black transition-all flex items-center gap-2 ${
+                mode === 'text' ? 'bg-[#1877F2] text-white shadow-lg' : 'text-white/60'
+              }`}
+              aria-label="Text story mode"
+            >
+              <i className="fas fa-font"></i> Text
+            </button>
+            <button
+              onClick={() => setMode('media')}
+              className={`px-6 py-2.5 rounded-xl text-sm font-black transition-all flex items-center gap-2 ${
+                mode === 'media' ? 'bg-[#1877F2] text-white shadow-lg' : 'text-white/60'
+              }`}
+              aria-label="Media story mode"
+            >
+              <i className="fas fa-photo-video"></i> Media
+            </button>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => openCamera()}
+              className="w-12 h-12 rounded-full flex items-center justify-center transition-all bg-white/10 text-white/80 hover:bg-white/20"
+              aria-label="Camera"
+            >
+              <i className="fas fa-camera text-lg"></i>
+            </button>
+            
+            <button
+              onClick={handlePickStoryMedia}
+              className="w-12 h-12 rounded-full flex items-center justify-center transition-all bg-white/10 text-white/80 hover:bg-white/20"
+              title="Add photos/videos"
+              aria-label="Add media"
+            >
+              <i className="fas fa-plus text-lg"></i>
+            </button>
+
+            {/* Music icon - opens music picker in React */}
+            <button
+              onClick={openMusicPicker}
+              className={`w-12 h-12 rounded-full flex items-center justify-center transition-all ${
+                selectedMusic
+                  ? 'bg-[#45BD62] text-white shadow-[0_0_15px_rgba(69,189,98,0.4)]'
+                  : 'bg-white/10 text-white/80 hover:bg-white/20'
+              }`}
+              aria-label="Add music"
+            >
+              <i className="fas fa-music text-lg"></i>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Music Picker - Web fallback */}
+      {showMusicPicker && renderMusicPicker()}
+    </div>
+  );
+};
+
+// ==================== STORY VIEWER MODAL ====================
+interface StoryViewerModalProps {
+  story: StoryType;
+  onClose: () => void;
+  onProfileClick: (id: number) => void;
+  currentUser?: User | null;
+  onFollow?: (userId: number) => void;
+  checkIsFollowing?: (userId: number) => boolean;
+  followLoading?: { [key: number]: boolean };
+  allStories?: StoryType[];
+  onFetchViewers?: (storyId: number) => Promise<StoryViewer[]>;
+  onFetchReactions?: (storyId: number) => Promise<{ reactions: any[]; counts: Record<string, number> }>;
+  viewersCount?: number;
+  onReply?: (storyId: number, text: string) => void;
+  onLike?: (storyId: number) => void;
+  onReaction?: (storyId: number, reaction: string) => void;
+  onShare?: (storyOrId: any) => void;
+  onComment?: (storyId: number) => void;
+  muted?: boolean;
+  onToggleMute?: () => void;
+  onDeleteStory?: (storyId: number) => Promise<void> | void;
+  deleteLoading?: boolean;
+}
+
+export const StoryViewerModal: React.FC<StoryViewerModalProps> = (props) => {
+  const {
+    story,
+    onClose,
+    onProfileClick,
+    currentUser,
+    onFollow,
+    checkIsFollowing,
+    followLoading,
+    allStories = [],
+    onFetchViewers,
+    onFetchReactions,
+    viewersCount,
+    onReply,
+    onLike,
+    onReaction,
+    onShare,
+    onComment,
+    muted = true,
+    onToggleMute,
+    onDeleteStory,
+    deleteLoading = false,
+  } = props;
+
+  const storyGroups = useMemo(() => {
+    const source = allStories?.length ? allStories : [story];
+    const map = new Map<number, StoryType[]>();
+    
+    source.forEach((s) => {
+      const uid = Number(s.user_id || 0);
+      if (!uid) return;
+      if (!map.has(uid)) map.set(uid, []);
+      map.get(uid)!.push(s);
+    });
+    
+    return Array.from(map.entries())
+      .map(([userId, stories]) => ({
+        userId,
+        stories: stories
+          .slice()
+          .sort((a, b) => parseServerTime(b.created_at) - parseServerTime(a.created_at)),
+      }))
+      .sort((a, b) => {
+        const aTime = parseServerTime(a.stories[0]?.created_at);
+        const bTime = parseServerTime(b.stories[0]?.created_at);
+        return bTime - aTime;
+      });
+  }, [allStories, story]);
+
+  const [groupIndex, setGroupIndex] = useState(() => {
+    const idx = storyGroups.findIndex((g) =>
+      g.stories.some((s) => Number(s.id) === Number(story.id))
+    );
+    return idx >= 0 ? idx : 0;
+  });
+
+  const [activeIndex, setActiveIndex] = useState(() => {
+    const initialGroup = storyGroups[
+      (() => {
+        const idx = storyGroups.findIndex((g) =>
+          g.stories.some((s) => Number(s.id) === Number(story.id))
+        );
+        return idx >= 0 ? idx : 0;
+      })()
+    ];
+    const idx = initialGroup?.stories?.findIndex((s) => Number(s.id) === Number(story.id)) ?? 0;
+    return idx >= 0 ? idx : 0;
+  });
+
+  const userStories = useMemo(() => {
+    return storyGroups[groupIndex]?.stories || [];
+  }, [storyGroups, groupIndex]);
+
+  const activeStory = userStories[activeIndex] || story;
+
+  const modalUser: User = useMemo(() => {
+    return mergeUserSafe(activeStory.user, {
+      id: activeStory.user_id,
+      name: pickBestName(
+        (activeStory as any)?.user?.name,
+        (activeStory as any)?.author_name,
+        (activeStory as any)?.author_username,
+        'User'
+      ),
+      username: pickBestName(
+        (activeStory as any)?.user?.username,
+        (activeStory as any)?.author_username,
+        'user'
+      ),
+      email: '',
+      profile_image_url:
+        pickBestImage(
+          (activeStory as any)?.user?.profile_image_url,
+          (activeStory as any)?.author_image
+        ) || getDefaultProfilePicture('User', activeStory.user_id),
+      cover_image_url: '',
+      followers: Array.isArray(activeStory.user?.followers) ? activeStory.user!.followers : [],
+      following: Array.isArray(activeStory.user?.following) ? activeStory.user!.following : [],
+      is_verified: false,
+      role: 'user',
+      is_online: false,
+      location: '',
+      bio: '',
+      created_at: null,
+    });
+  }, [activeStory]);
+
+  const handleNext = () => {
+    const nextStoryIndex = activeIndex + 1;
+    if (nextStoryIndex < userStories.length) {
+      setActiveIndex(nextStoryIndex);
+      return;
+    }
+    
+    const nextGroupIndex = groupIndex + 1;
+    if (nextGroupIndex < storyGroups.length) {
+      setGroupIndex(nextGroupIndex);
+      setActiveIndex(0);
+      return;
+    }
+    
+    onClose();
+  };
+
+  const handlePrev = () => {
+    const prevStoryIndex = activeIndex - 1;
+    if (prevStoryIndex >= 0) {
+      setActiveIndex(prevStoryIndex);
+      return;
+    }
+    
+    const prevGroupIndex = groupIndex - 1;
+    if (prevGroupIndex >= 0) {
+      const prevGroupStories = storyGroups[prevGroupIndex]?.stories || [];
+      setGroupIndex(prevGroupIndex);
+      setActiveIndex(Math.max(0, prevGroupStories.length - 1));
+      return;
+    }
+    
+    onClose();
+  };
+
+  const handleReply = (storyId: number, text: string) => onReply?.(storyId, text);
+  const handleLike = (storyId: number) => onLike?.(storyId);
+  const handleReaction = (storyId: number, reaction: string) => onReaction?.(storyId, reaction);
+  const handleShare = (storyOrId: any) => onShare?.(storyOrId || activeStory);
+  const handleComment = (storyId: number) => onComment?.(storyId);
+
+  const isFollowing = modalUser.id && checkIsFollowing ? checkIsFollowing(Number(modalUser.id)) : false;
+
+  return (
+    <StoryViewer
+      story={activeStory}
+      user={modalUser}
+      currentUser={currentUser || null}
+      onClose={onClose}
+      onNext={handleNext}
+      onPrev={handlePrev}
+      onReply={handleReply}
+      onLike={handleLike}
+      onReaction={handleReaction}
+      onShare={handleShare}
+      onComment={handleComment}
+      onFetchReactions={onFetchReactions}
+      onFollow={onFollow}
+      isFollowing={isFollowing}
+      allStories={userStories}
+      onFetchViewers={onFetchViewers}
+      viewersCount={viewersCount}
+      onProfileClick={onProfileClick}
+      muted={muted}
+      onToggleMute={onToggleMute}
+      onDeleteStory={onDeleteStory}
+      deleteLoading={deleteLoading}
+    />
+  );
+};

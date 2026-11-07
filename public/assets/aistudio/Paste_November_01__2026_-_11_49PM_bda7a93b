@@ -1,0 +1,922 @@
+The Story card is a standalone component. There is no standalone Music card: it lives inside Post, so I've copied the pieces out of Post exactly as they appear.
+1. Story card
+Helpers it depends on
+const getStoryAuthorName = (story: any, users?: any[]) => {
+  const userId = Number(story?.user_id || story?.user?.id || 0);
+  const matchedUser = userId && users ? users.find((u: any) => Number(u.id) === userId) : null;
+  const isValidName = (val: any) => {
+    if (!val || typeof val !== 'string') return false;
+    const s = val.trim();
+    return s.length > 0 && s.toLowerCase() !== 'user' && s.toLowerCase() !== 'un';
+  };
+  return (
+    (isValidName(matchedUser?.name) ? matchedUser!.name : null) ||
+    (isValidName(story?.author_full_name) ? story.author_full_name : null) ||
+    (isValidName(story?.user?.name) ? story.user.name : null) ||
+    (isValidName(story?.author_name) ? story.author_name : null) ||
+    matchedUser?.username ||
+    story?.author_username ||
+    story?.username ||
+    'User'
+  );
+};
+
+const getStoryAuthorImage = (story: any, users?: any[]) => {
+  const userId = Number(story?.user_id || story?.user?.id || 0);
+  const matchedUser = userId && users ? users.find((u: any) => Number(u.id) === userId) : null;
+  const name = getStoryAuthorName(story, users);
+  return (
+    matchedUser?.profile_image_url ||
+    matchedUser?.avatar_url ||
+    story?.author_image ||
+    story?.user?.profile_image_url ||
+    story?.user?.avatar_url ||
+    `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=1877F2&color=fff&size=128`
+  );
+};
+
+const getStoryMediaList = (story: any) => {
+  const out: Array<{
+    url: string;
+    thumb?: string;
+    feed?: string;
+    full?: string;
+    kind: 'image' | 'video' | 'audio';
+  }> = [];
+
+  const guessKind = (url: string, explicitType?: string) => {
+    const t = String(explicitType || '').toLowerCase();
+    const u = String(url || '').toLowerCase();
+
+    if (t.includes('video') || /\.(mp4|webm|mov|m4v)(\?|$)/i.test(u)) return 'video';
+    if (t.includes('audio') || /\.(mp3|wav|m4a|ogg|aac)(\?|$)/i.test(u)) return 'audio';
+    return 'image';
+  };
+
+  const safeParseArray = (value: any) => {
+    if (Array.isArray(value)) return value;
+    if (typeof value !== 'string') return [];
+    try {
+      const parsed = JSON.parse(value || '[]');
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  };
+
+  try {
+    const metaItems = safeParseArray(story?.media_meta);
+
+    if (metaItems.length > 0) {
+      metaItems.forEach((item: any) => {
+        let parsedItem = item;
+
+        if (typeof item === 'string') {
+          try {
+            parsedItem = JSON.parse(item);
+          } catch {
+            parsedItem = null;
+          }
+        }
+
+        if (parsedItem && typeof parsedItem === 'object') {
+          const thumbUrl = String(parsedItem.thumb || parsedItem.thumbnail_url || '').trim();
+          const feedUrl = String(parsedItem.feed || parsedItem.feed_url || '').trim();
+          const fullUrl = String(parsedItem.full || parsedItem.full_url || '').trim();
+
+          const displayUrl = feedUrl || fullUrl || thumbUrl;
+
+          if (displayUrl) {
+            out.push({
+              url: displayUrl,
+              thumb: thumbUrl || feedUrl || fullUrl,
+              feed: feedUrl || fullUrl || thumbUrl,
+              full: fullUrl || feedUrl || thumbUrl,
+              kind: guessKind(displayUrl, parsedItem.type || story?.type),
+            });
+          }
+        }
+      });
+
+      if (out.length > 0) return out;
+    }
+
+    const urls = safeParseArray(story?.media_urls);
+    const types = safeParseArray(story?.media_types);
+
+    if (urls.length > 0) {
+      urls.forEach((url: string, i: number) => {
+        const cleanUrl = String(url || '').trim();
+        if (cleanUrl) {
+          out.push({
+            url: cleanUrl,
+            thumb: cleanUrl,
+            feed: cleanUrl,
+            full: cleanUrl,
+            kind: guessKind(cleanUrl, types[i] || story?.type),
+          });
+        }
+      });
+    }
+
+    if (!out.length && story?.media_url) {
+      const single = String(story.media_url).trim();
+      if (single) {
+        out.push({
+          url: single,
+          thumb: single,
+          feed: single,
+          full: single,
+          kind: guessKind(single, story?.type),
+        });
+      }
+    }
+  } catch (error) {
+    console.warn('Failed to parse story media:', error);
+
+    if (story?.media_url) {
+      const single = String(story.media_url).trim();
+      if (single) {
+        out.push({
+          url: single,
+          thumb: single,
+          feed: single,
+          full: single,
+          kind: guessKind(single, story?.type),
+        });
+      }
+    }
+  }
+
+  return out;
+};
+
+Story card component
+//============ STORY CARD COMPONENTS =======
+
+interface FeedStoryCardProps {
+  story: any;
+  onOpen?: (story: any) => void;
+  currentUser?: User | null;
+  users?: User[];
+  groups?: Group[];
+  brands?: Brand[];
+  chats?: any[];
+  onReact?: (storyId: number, type: ReactionType) => void;
+  onOpenComments?: (story: any) => void;
+  onShare?: (story: any, destination?: string, data?: any) => void;
+  onProfileClick?: (userId: number) => void;
+}
+
+const FeedStoryCard: React.FC<FeedStoryCardProps> = ({
+  story,
+  onOpen,
+  currentUser,
+  users = [],
+  groups = [],
+  brands = [],
+  chats = [],
+  onReact,
+  onOpenComments,
+  onShare,
+  onProfileClick,
+}) => {
+  const storyId = Number(story?.id || story?.story_id || 0);
+  const authorId = Number(story?.user_id || story?.user?.id || 0);
+  const authorUser = useMemo(() => {
+    return (
+      (authorId ? users?.find((u) => Number(u.id) === authorId) : null) ||
+      (currentUser && Number(currentUser.id) === authorId ? currentUser : null) ||
+      (story?.user && typeof story.user === 'object' ? story.user : null)
+    );
+  }, [authorId, users, currentUser, story?.user]);
+
+  const isValidName = (val: any) => {
+    if (!val || typeof val !== 'string') return false;
+    const s = val.trim();
+    return s.length > 0 && s.toLowerCase() !== 'user' && s.toLowerCase() !== 'un';
+  };
+
+  const authorName =
+    (isValidName(authorUser?.name) ? authorUser!.name : null) ||
+    (isValidName(story?.author_full_name) ? story.author_full_name : null) ||
+    (isValidName(story?.author_name) ? story.author_name : null) ||
+    (isValidName(story?.user?.name) ? story.user.name : null) ||
+    authorUser?.username ||
+    story?.author_username ||
+    story?.username ||
+    getStoryAuthorName(story, users);
+
+  const authorImage =
+    authorUser?.profile_image_url ||
+    authorUser?.avatar_url ||
+    story?.author_image ||
+    story?.user?.profile_image_url ||
+    story?.user?.avatar_url ||
+    getStoryAuthorImage(story, users);
+
+  const storyMedia = getStoryMediaList(story);
+  const primaryMedia = storyMedia[0];
+
+  const isText = story?.type === 'text';
+  const isVideo = story?.type === 'video' || primaryMedia?.kind === 'video';
+  const isImage = !isText && !isVideo;
+
+  const storyLabel = isText ? 'Text story' : isVideo ? 'Video story' : 'Photo story';
+
+  const displayMediaUrl =
+    primaryMedia?.feed ||
+    primaryMedia?.full ||
+    primaryMedia?.url ||
+    String(story?.media_url || '').trim();
+
+  const thumbnailUrl =
+    primaryMedia?.thumb ||
+    primaryMedia?.feed ||
+    primaryMedia?.full ||
+    displayMediaUrl;
+
+  const viewsCount = Number(story?.views_count || 0);
+
+  const [currentReaction, setCurrentReaction] = useState<ReactionType | undefined>(
+    story?.my_reaction || (story?.liked_by_me ? 'like' : undefined)
+  );
+  const [reactionCount, setReactionCount] = useState<number>(
+    Number(story?.reactions_count || story?.reactions?.length || 0)
+  );
+  const [commentsCount, setCommentsCount] = useState<number>(
+    Number(story?.comments_count ?? story?.comments?.length ?? story?.discussions_count ?? 0)
+  );
+  const [sharesCount, setSharesCount] = useState<number>(
+    Number(story?.shares_count ?? story?.shares ?? 0)
+  );
+
+  const [showShareSheet, setShowShareSheet] = useState(false);
+  const [showReactionsSheet, setShowReactionsSheet] = useState(false);
+
+  useEffect(() => {
+    if (story?.my_reaction !== undefined) {
+      setCurrentReaction(story.my_reaction || (story.liked_by_me ? 'like' : undefined));
+    }
+    if (story?.reactions_count !== undefined) {
+      setReactionCount(Number(story.reactions_count));
+    }
+    if (story?.comments_count !== undefined) {
+      setCommentsCount(Number(story.comments_count));
+    }
+    if (story?.shares_count !== undefined) {
+      setSharesCount(Number(story.shares_count));
+    }
+
+    if (!storyId) return;
+    const viewerParam = currentUser?.id ? `?viewerId=${currentUser.id}` : '';
+    fetch(`/api/stories/${storyId}/comments${viewerParam}`, {
+      headers: currentUser?.id ? { 'x-user-id': String(currentUser.id) } : undefined,
+    })
+      .then((res) => res.json())
+      .then((data: any) => {
+        const list = Array.isArray(data?.comments) ? data.comments : (Array.isArray(data) ? data : []);
+        const count = typeof data?.count === 'number' ? data.count : list.length;
+        setCommentsCount(count);
+      })
+      .catch(() => {});
+  }, [storyId, story?.my_reaction, story?.liked_by_me, story?.reactions_count, story?.comments_count, story?.shares_count, currentUser?.id]);
+
+  const normalizedStoryPost = useMemo(() => {
+    const isVerified = Boolean(authorUser?.is_verified || story?.is_verified || story?.author_verified);
+    const authorObj = {
+      id: authorId,
+      name: authorName,
+      username: authorUser?.username || story?.author_username || story?.username || 'user',
+      user_name: authorUser?.username || story?.author_username || story?.username || 'user',
+      profile_image_url: authorImage,
+      avatar_url: authorImage,
+      is_verified: isVerified,
+      verified: isVerified,
+    };
+    return {
+      ...story,
+      id: storyId,
+      story_id: storyId,
+      item_type: 'story',
+      type: 'story',
+      post_type: 'story',
+      kind: 'story',
+      shares: sharesCount,
+      shares_count: sharesCount,
+      author: authorObj,
+      user: authorObj,
+      author_name: authorName,
+      author_full_name: authorName,
+      author_username: authorObj.username,
+      author_image: authorImage,
+    };
+  }, [story, storyId, authorId, authorUser, authorName, authorImage, sharesCount]);
+
+  const handleReact = async (type: ReactionType) => {
+    if (!currentUser) {
+      alert('Please login to react.');
+      return;
+    }
+
+    const isSameReaction = currentReaction === type;
+    const nextReaction = isSameReaction ? undefined : type;
+    const nextCount = isSameReaction
+      ? Math.max(0, reactionCount - 1)
+      : currentReaction
+      ? reactionCount
+      : reactionCount + 1;
+
+    setCurrentReaction(nextReaction);
+    setReactionCount(nextCount);
+
+    if (onReact) {
+      onReact(storyId, type);
+    }
+
+    try {
+      await fetch(`/api/stories/${storyId}/react`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-user-id': String(currentUser.id),
+        },
+        body: JSON.stringify({
+          user_id: currentUser.id,
+          type: type,
+        }),
+      });
+    } catch (err) {
+      console.error('Failed to react to story:', err);
+    }
+  };
+
+  const handleShareClick = () => {
+    if (!currentUser) {
+      alert('Please login to share.');
+      return;
+    }
+    setShowShareSheet(true);
+  };
+
+  const handleShareComplete = (destination: string, data?: any) => {
+    const nextShares = safeNumber(data?.shares ?? data?.share_count, NaN);
+    const finalShares = Number.isFinite(nextShares) ? nextShares : sharesCount + 1;
+    setSharesCount(finalShares);
+    onShare?.(normalizedStoryPost, destination, data);
+    setShowShareSheet(false);
+  };
+
+  return (
+    <div className="w-full bg-[#0F172A] border-b-[8px] border-[#050B18] overflow-hidden">
+      <div className="px-4 pt-3 pb-2 flex items-center justify-between gap-3">
+        <div className="flex items-center gap-3 min-w-0">
+          <button
+            type="button"
+            onClick={() => authorId && onProfileClick?.(authorId)}
+            className="flex-shrink-0 cursor-pointer"
+          >
+            <img
+              src={authorImage}
+              alt={authorName}
+              className="w-10 h-10 rounded-full object-cover border border-[#1E293B]"
+            />
+          </button>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => authorId && onProfileClick?.(authorId)}
+                className="text-[#F8FAFC] font-bold text-[21px] truncate hover:text-[#38BDF8] text-left cursor-pointer"
+              >
+                {authorName}
+              </button>
+              <span className="text-[#1877F2] text-[12px] font-bold">Story</span>
+            </div>
+            <p className="text-[#94A3B8] text-[12px]">
+              {storyLabel}
+              {viewsCount > 0 ? ` · ${viewsCount} views` : ''}
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <button
+        type="button"
+        onClick={() => onOpen?.(story)}
+        className="block w-full text-left cursor-pointer"
+      >
+        {isText ? (
+          <div
+            className="h-[420px] flex items-center justify-center text-center px-6"
+            style={{
+              background:
+                story?.background_style ||
+                'linear-gradient(45deg, #1877F2, #0055FF)',
+            }}
+          >
+            <div className="max-w-[85%]">
+              <p className="text-white font-bold text-2xl whitespace-pre-wrap break-words">
+                {story?.text_content || 'Story'}
+              </p>
+            </div>
+          </div>
+        ) : isVideo ? (
+          <div className="relative h-[420px] bg-[#0B1120]">
+            {thumbnailUrl ? (
+              <img
+                src={thumbnailUrl}
+                alt="Video story"
+                className="w-full h-full object-cover"
+                loading="lazy"
+              />
+            ) : displayMediaUrl ? (
+              <video
+                src={displayMediaUrl}
+                className="w-full h-full object-cover"
+                muted
+                playsInline
+                preload="metadata"
+              />
+            ) : (
+              <div className="w-full h-full bg-[#0B1120]" />
+            )}
+
+            <div className="absolute inset-0 bg-black/10" />
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+              <div className="w-16 h-16 rounded-full bg-black/45 border border-white/30 flex items-center justify-center">
+                <i className="fas fa-play text-white text-2xl ml-1"></i>
+              </div>
+            </div>
+          </div>
+        ) : isImage ? (
+          <div className="relative h-[420px] bg-[#0B1120]">
+            {primaryMedia ? (
+              <ProgressiveTileImage
+                item={{
+                  url: displayMediaUrl,
+                  thumb: primaryMedia.thumb || displayMediaUrl,
+                  feed: primaryMedia.feed || displayMediaUrl,
+                  full: primaryMedia.full || primaryMedia.feed || displayMediaUrl,
+                }}
+                className="absolute inset-0 w-full h-full object-cover"
+              />
+            ) : displayMediaUrl ? (
+              <img
+                src={displayMediaUrl}
+                alt="Story"
+                className="w-full h-full object-cover"
+                loading="lazy"
+              />
+            ) : (
+              <div className="w-full h-full bg-[#0B1120]" />
+            )}
+          </div>
+        ) : null}
+      </button>
+
+      {/* Social Feedback Bar (Reactions & Discussions Counts) */}
+      <div className="px-4 py-2 border-t border-[#1E293B] flex items-center justify-between text-[#94A3B8] text-sm">
+        <button
+          type="button"
+          onClick={() => setShowReactionsSheet(true)}
+          className="flex items-center gap-1.5 hover:text-[#F8FAFC] cursor-pointer"
+        >
+          <span className="flex items-center gap-1">
+            <i className="fas fa-heart text-[#EF4444] text-[13px]"></i>
+            <span className="font-semibold text-[#F8FAFC]">{reactionCount}</span>
+          </span>
+          {viewsCount > 0 && (
+            <span className="flex items-center gap-1 ml-2 text-xs text-[#94A3B8]">
+              <i className="fas fa-eye text-[12px]"></i>
+              {viewsCount}
+            </span>
+          )}
+        </button>
+
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => onOpenComments?.(normalizedStoryPost)}
+            className="hover:underline cursor-pointer text-[#CBD5E1] hover:text-[#F8FAFC] text-sm font-semibold"
+          >
+            {commentsCount} {commentsCount === 1 ? 'Discussion' : 'Discussions'}
+          </button>
+          {sharesCount > 0 && (
+            <span className="text-xs text-[#94A3B8]">
+              · {sharesCount} {sharesCount === 1 ? 'Share' : 'Shares'}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Main Action Buttons */}
+      <div className="px-3.5 py-2 border-t border-[#1E293B] flex items-center justify-between bg-[#0B1120]/60">
+        <div className="flex items-center gap-3">
+          <ReactionButton
+            currentUserReactions={currentReaction}
+            reactionCount={reactionCount}
+            onReact={handleReact}
+            isGuest={!currentUser}
+          />
+
+          <button
+            type="button"
+            className="flex items-center gap-1.5 text-[#F8FAFC] hover:text-[#38BDF8] transition-colors focus:outline-none p-1 rounded-lg hover:bg-[#1E293B]/60 cursor-pointer"
+            onClick={() => onOpenComments?.(normalizedStoryPost)}
+            aria-label="Discuss story"
+            title="Discuss"
+          >
+            <i className="far fa-comment text-[22px]"></i>
+            {commentsCount > 0 && (
+              <span className="text-[14px] font-semibold text-[#F8FAFC]">
+                {commentsCount}
+              </span>
+            )}
+          </button>
+
+          <button
+            type="button"
+            className="flex items-center gap-1.5 text-[#F8FAFC] hover:text-[#38BDF8] transition-transform active:scale-110 focus:outline-none p-1 rounded-lg hover:bg-[#1E293B]/60 cursor-pointer"
+            onClick={handleShareClick}
+            aria-label="Share story"
+            title="Share"
+          >
+            <i className="far fa-paper-plane text-[21px]"></i>
+            {sharesCount > 0 && (
+              <span className="text-[14px] font-semibold text-[#F8FAFC]">
+                {sharesCount}
+              </span>
+            )}
+          </button>
+        </div>
+
+        <button
+          type="button"
+          onClick={() => onOpen?.(story)}
+          className="px-3.5 py-1.5 rounded-full bg-[#1877F2] hover:bg-[#166FE5] text-white text-xs font-bold transition-all shadow-sm flex items-center gap-1.5 active:scale-95 cursor-pointer"
+        >
+          <i className="fas fa-play text-[10px]"></i>
+          <span>View story</span>
+        </button>
+      </div>
+
+      {/* Share Bottom Sheet for Story (Opens exactly as other posts in Feeds.tsx) */}
+      <ShareBottomSheet
+        isOpen={showShareSheet}
+        onClose={() => setShowShareSheet(false)}
+        post={normalizedStoryPost}
+        currentUser={currentUser || null}
+        users={users}
+        groups={groups}
+        brands={brands}
+        chats={chats}
+        onShareComplete={handleShareComplete}
+      />
+
+      {/* Reactions Sheet for Story */}
+      <ReactionsSheet
+        isOpen={showReactionsSheet}
+        onClose={() => setShowReactionsSheet(false)}
+        post={normalizedStoryPost}
+        onProfileClick={onProfileClick || (() => {})}
+        onOpenComments={() => onOpenComments?.(normalizedStoryPost)}
+        currentUser={currentUser}
+      />
+    </div>
+  );
+};
+
+It also uses ReactionButton, ShareBottomSheet, ReactionsSheet, ProgressiveTileImage and safeNumber, which are defined elsewhere in the same file.
+2. Music card (inside Post)
+Detection and data
+    const isMusic = Boolean(
+      meta?.kind === 'music' ||
+      meta?.type === 'music' ||
+      p?.type === 'music' ||
+      p?.type === 'song' ||
+      p?.post_type === 'music' ||
+      p?.post_type === 'song' ||
+      p?.kind === 'music' ||
+      p?.item_type === 'music' ||
+      p?.item_type === 'song' ||
+      p?.source === 'music' ||
+      p?.source === 'song' ||
+      p?.song_title ||
+      p?.song_id2 ||
+      p?.song_id ||
+      (p?.audio_url && !p?.podcast_id && meta?.kind !== 'podcast' && meta?.type !== 'podcast' && p?.item_type !== 'podcast' && p?.type !== 'podcast')
+    );
+    const isPodcast = meta?.kind === 'podcast' || meta?.type === 'podcast' || p?.item_type === 'podcast' || p?.type === 'podcast';
+    const song = meta?.song;
+    const podcast = meta?.podcast;
+
+    const regularSongData = useMemo(() => {
+      if (!isMusic) return null;
+      const target = song || p?.shared_song || (meta as any)?.song || p;
+      const coverUrl =
+        target.cover_image_url ||
+        target.song_cover_image_url ||
+        target.cover_url ||
+        target.cover ||
+        p.song_cover_image_url ||
+        p.cover_image_url ||
+        'https://media.unera.social/task_01kftb3024ed7bm84gy6j485fh_1769336848_img_0.webp';
+      const audioUrl = target.audio_url || target.url || p.audio_url || '';
+      const title = target.title || target.song_title || p.song_title || p.title || 'Untitled Track';
+      const artist = target.artist_name || target.song_artist_name || target.artist || (p as any).artist_name || a?.name || 'Artist';
+      const duration = target.duration_seconds || target.song_duration_seconds || p.song_duration_seconds || p.duration_seconds;
+      const songId = Number(target.id || target.song_id || target.song_id2 || p.song_id2 || p.song_id || p.id || 0);
+
+      return {
+        id: songId,
+        song_id: songId,
+        title,
+        artist_name: artist,
+        artist,
+        url: audioUrl,
+        album_name: target.album_name || target.song_album_name || p.song_album_name || p.album_name,
+        cover_image_url: coverUrl,
+        cover: coverUrl,
+        audio_url: audioUrl,
+        duration_seconds: duration,
+        genre: target.genre || target.song_genre || p.song_genre || p.genre,
+        type: 'music' as const,
+        uploader_id: target.uploader_id || target.user_id || p.uploader_id || a?.id,
+      };
+    }, [isMusic, song, meta, p, a]);
+
+Music card JSX
+            {isMusic && !isSharedPost && regularSongData && (
+              <div className="border-t border-[#1E293B] bg-[#0A101F]">
+                <div
+                  className="relative group cursor-pointer overflow-hidden bg-slate-950/70"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (onOpenAudio) onOpenAudio(regularSongData);
+                    else if (onPlayAudioTrack) onPlayAudioTrack(regularSongData);
+                  }}
+                >
+                  {/* Song Cover Art with Play Button Overlay */}
+                  <div className="w-full aspect-[16/9] sm:aspect-[2/1] max-h-[320px] relative overflow-hidden bg-black/60 flex items-center justify-center">
+                    <img
+                      src={regularSongData.cover_image_url}
+                      alt={regularSongData.title}
+                      className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                      onError={(e) => {
+                        (e.target as HTMLImageElement).src =
+                          'https://media.unera.social/task_01kftb3024ed7bm84gy6j485fh_1769336848_img_0.webp';
+                      }}
+                    />
+                    {/* Ambient Gradient */}
+                    <div className="absolute inset-0 bg-gradient-to-t from-[#0A101F] via-black/35 to-transparent" />
+
+                    {/* Centered Large Play Button Overlay */}
+                    <div className="absolute inset-0 flex items-center justify-center">
+                      <button
+                        type="button"
+                        aria-label="Play song"
+                        className="w-16 h-16 sm:w-20 sm:h-20 rounded-full bg-[#1877F2]/90 hover:bg-[#1877F2] text-white flex items-center justify-center shadow-xl shadow-[#1877F2]/40 backdrop-blur-sm transform group-hover:scale-110 active:scale-95 transition-all cursor-pointer border-2 border-white/20"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (onOpenAudio) onOpenAudio(regularSongData);
+                          else if (onPlayAudioTrack) onPlayAudioTrack(regularSongData);
+                        }}
+                      >
+                        <i className="fas fa-play text-2xl sm:text-3xl ml-1 text-white" />
+                      </button>
+                    </div>
+
+                    {/* Genre / Duration badge on cover */}
+                    {(regularSongData.genre || regularSongData.duration_seconds) && (
+                      <div className="absolute bottom-3 right-3 flex items-center gap-2">
+                        {regularSongData.genre && (
+                          <span className="bg-black/70 backdrop-blur-md text-white/90 text-xs px-2.5 py-1 rounded-full font-semibold border border-white/10">
+                            {regularSongData.genre}
+                          </span>
+                        )}
+                        {regularSongData.duration_seconds ? (
+                          <span className="bg-black/70 backdrop-blur-md text-white/90 text-xs px-2.5 py-1 rounded-full font-mono font-medium border border-white/10">
+                            {Math.floor(regularSongData.duration_seconds / 60)}:
+                            {String(regularSongData.duration_seconds % 60).padStart(2, '0')}
+                          </span>
+                        ) : null}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Song Info Bar with Play Button */}
+                  <div className="p-3 sm:p-3.5 flex items-center justify-between gap-3 border-t border-[#1E293B]/70 bg-[#0B1120]">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="w-12 h-12 rounded-xl overflow-hidden shrink-0 border border-[#1E293B] shadow-sm bg-black/40">
+                        <img
+                          src={regularSongData.cover_image_url}
+                          alt=""
+                          className="w-full h-full object-cover"
+                          onError={(e) => {
+                            (e.target as HTMLImageElement).src =
+                              'https://media.unera.social/task_01kftb3024ed7bm84gy6j485fh_1769336848_img_0.webp';
+                          }}
+                        />
+                      </div>
+                      <div className="min-w-0">
+                        <div className="text-[16px] sm:text-[17px] font-bold text-[#F8FAFC] truncate">
+                          {regularSongData.title}
+                        </div>
+                        <div className="text-[13px] sm:text-[14px] text-[#94A3B8] truncate flex items-center gap-1.5">
+                          <span>{regularSongData.artist_name}</span>
+                          {regularSongData.album_name && (
+                            <>
+                              <span>•</span>
+                              <span className="truncate">{regularSongData.album_name}</span>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      className="bg-[#1877F2] hover:bg-[#166FE5] active:scale-95 text-white font-bold px-4 sm:px-5 py-2 rounded-xl text-[14px] sm:text-[15px] shrink-0 flex items-center gap-2 shadow-sm transition-all cursor-pointer"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (onOpenAudio) onOpenAudio(regularSongData);
+                        else if (onPlayAudioTrack) onPlayAudioTrack(regularSongData);
+                      }}
+                    >
+                      <i className="fas fa-play text-xs text-white" />
+                      <span>Play</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+Shared-song version of the music card
+When a song is shared, the same card is rendered through a second code path.
+    const isSharedSong = Boolean(
+      p.shared_song ||
+      p.item_type === 'song_share' ||
+      p.source === 'song_share' ||
+      p.type === 'song_share' ||
+      p.post_type === 'song_share' ||
+      p.item_type === 'music_share' ||
+      p.source === 'music_share' ||
+      (p.shared_post && (
+        p.shared_post.is_song ||
+        p.shared_post.item_type === 'music' ||
+        p.shared_post.item_type === 'song' ||
+        p.shared_post.source === 'song' ||
+        p.shared_post.type === 'music' ||
+        p.shared_post.type === 'song' ||
+        !!p.shared_post.song_id ||
+        !!p.shared_post.song_id2 ||
+        (!!p.shared_post.audio_url && (!!p.shared_post.artist_name || !!p.shared_post.song_cover_image_url || !!p.shared_post.cover_image_url))
+      ))
+    );
+
+    const sharedSongData = useMemo(() => {
+      if (!isSharedSong) return null;
+      const target = p.shared_song || originalPost || p;
+      const coverUrl =
+        target.cover_image_url ||
+        target.song_cover_image_url ||
+        target.cover_url ||
+        target.cover ||
+        p.song_cover_image_url ||
+        p.cover_image_url ||
+        'https://media.unera.social/task_01kftb3024ed7bm84gy6j485fh_1769336848_img_0.webp';
+      const audioUrl = target.audio_url || p.audio_url || '';
+      const title = target.song_title || target.title || p.song_title || 'Untitled Track';
+      const artist = target.song_artist_name || target.artist_name || target.artist || ownerAuthor?.name || 'Artist';
+      const duration = target.song_duration_seconds || target.duration_seconds || p.song_duration_seconds;
+      const songId = Number(target.song_id || target.song_id2 || target.id || p.song_id2 || p.song_id || p.id || 0);
+
+      return {
+        id: songId,
+        song_id: songId,
+        title,
+        artist_name: artist,
+        artist,
+        url: audioUrl,
+        album_name: target.song_album_name || target.album_name || p.song_album_name,
+        cover_image_url: coverUrl,
+        cover: coverUrl,
+        audio_url: audioUrl,
+        duration_seconds: duration,
+        genre: target.song_genre || target.genre || p.song_genre,
+        type: 'music' as const,
+        uploader_id: target.uploader_id || target.user_id || ownerAuthor?.id,
+      };
+    }, [isSharedSong, p, originalPost, ownerAuthor]);
+
+    const isSongPost = Boolean(isSharedSong || isMusic);
+    const songData = isSharedSong ? sharedSongData : regularSongData;
+
+                    {/* Shared Song Card: Cover + Centered Play Button + Track Details & Action */}
+                    {isSharedSong && sharedSongData && (
+                      <div className="border-t border-[#1E293B] bg-[#0A101F]">
+                        <div
+                          className="relative group cursor-pointer overflow-hidden bg-slate-950/70"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (onOpenAudio) onOpenAudio(sharedSongData);
+                            else if (onPlayAudioTrack) onPlayAudioTrack(sharedSongData);
+                          }}
+                        >
+                          {/* Song Cover Art with Play Button Overlay */}
+                          <div className="w-full aspect-[16/9] sm:aspect-[2/1] max-h-[320px] relative overflow-hidden bg-black/60 flex items-center justify-center">
+                            <img
+                              src={sharedSongData.cover_image_url}
+                              alt={sharedSongData.title}
+                              className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                              onError={(e) => {
+                                (e.target as HTMLImageElement).src =
+                                  'https://media.unera.social/task_01kftb3024ed7bm84gy6j485fh_1769336848_img_0.webp';
+                              }}
+                            />
+                            {/* Ambient Gradient */}
+                            <div className="absolute inset-0 bg-gradient-to-t from-[#0A101F] via-black/35 to-transparent" />
+
+                            {/* Centered Large Play Button Overlay */}
+                            <div className="absolute inset-0 flex items-center justify-center">
+                              <button
+                                type="button"
+                                aria-label="Play song"
+                                className="w-16 h-16 sm:w-20 sm:h-20 rounded-full bg-[#1877F2]/90 hover:bg-[#1877F2] text-white flex items-center justify-center shadow-xl shadow-[#1877F2]/40 backdrop-blur-sm transform group-hover:scale-110 active:scale-95 transition-all cursor-pointer border-2 border-white/20"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  if (onOpenAudio) onOpenAudio(sharedSongData);
+                                  else if (onPlayAudioTrack) onPlayAudioTrack(sharedSongData);
+                                }}
+                              >
+                                <i className="fas fa-play text-2xl sm:text-3xl ml-1 text-white" />
+                              </button>
+                            </div>
+
+                            {/* Genre / Duration badge on cover */}
+                            {(sharedSongData.genre || sharedSongData.duration_seconds) && (
+                              <div className="absolute bottom-3 right-3 flex items-center gap-2">
+                                {sharedSongData.genre && (
+                                  <span className="bg-black/70 backdrop-blur-md text-white/90 text-xs px-2.5 py-1 rounded-full font-semibold border border-white/10">
+                                    {sharedSongData.genre}
+                                  </span>
+                                )}
+                                {sharedSongData.duration_seconds ? (
+                                  <span className="bg-black/70 backdrop-blur-md text-white/90 text-xs px-2.5 py-1 rounded-full font-mono font-medium border border-white/10">
+                                    {Math.floor(sharedSongData.duration_seconds / 60)}:
+                                    {String(sharedSongData.duration_seconds % 60).padStart(2, '0')}
+                                  </span>
+                                ) : null}
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Song Info Bar with Play Button */}
+                          <div className="p-3 sm:p-3.5 flex items-center justify-between gap-3 border-t border-[#1E293B]/70 bg-[#0B1120]">
+                            <div className="flex items-center gap-3 min-w-0">
+                              <div className="w-12 h-12 rounded-xl overflow-hidden shrink-0 border border-[#1E293B] shadow-sm bg-black/40">
+                                <img
+                                  src={sharedSongData.cover_image_url}
+                                  alt=""
+                                  className="w-full h-full object-cover"
+                                  onError={(e) => {
+                                    (e.target as HTMLImageElement).src =
+                                      'https://media.unera.social/task_01kftb3024ed7bm84gy6j485fh_1769336848_img_0.webp';
+                                  }}
+                                />
+                              </div>
+                              <div className="min-w-0">
+                                <div className="text-[16px] sm:text-[17px] font-bold text-[#F8FAFC] truncate">
+                                  {sharedSongData.title}
+                                </div>
+                                <div className="text-[13px] sm:text-[14px] text-[#94A3B8] truncate flex items-center gap-1.5">
+                                  <span>{sharedSongData.artist_name}</span>
+                                  {sharedSongData.album_name && (
+                                    <>
+                                      <span>•</span>
+                                      <span className="truncate">{sharedSongData.album_name}</span>
+                                    </>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+
+                            {/* Play Button */}
+                            <button
+                              type="button"
+                              className="bg-[#1877F2] hover:bg-[#166FE5] active:scale-95 text-white font-bold px-4 sm:px-5 py-2 rounded-xl text-[14px] sm:text-[15px] shrink-0 flex items-center gap-2 shadow-sm transition-all cursor-pointer"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (onOpenAudio) onOpenAudio(sharedSongData);
+                                else if (onPlayAudioTrack) onPlayAudioTrack(sharedSongData);
+                              }}
+                            >
+                              <i className="fas fa-play text-xs text-white" />
+                              <span>Play</span>
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+

@@ -1,0 +1,28 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Top loop -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.2"
+        android:strokeLineCap="round"
+        android:pathData="M10.5,4 C10.5,2.9 11.2,2 12,2 C12.8,2 13.5,2.9 13.5,4" />
+    <!-- Clapper (bottom) with bold white border and dark middle -->
+    <path
+        android:fillColor="#0B1120"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.2"
+        android:strokeLineCap="round"
+        android:pathData="M9.5,17 C9.5,18.6 10.6,20 12,20 C13.4,20 14.5,18.6 14.5,17" />
+    <!-- Bell body: Dark middle (#0B1120) with bold white border (#FFFFFF) -->
+    <path
+        android:fillColor="#0B1120"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M12,4 C9.2,4 7.5,6.2 7.5,9.5 C7.5,13.5 6,15.2 4.8,16.2 C4.3,16.7 4.7,17.5 5.4,17.5 L18.6,17.5 C19.3,17.5 19.7,16.7 19.2,16.2 C18,15.2 16.5,13.5 16.5,9.5 C16.5,6.2 14.8,4 12,4 Z" />
+</vector>

@@ -1,0 +1,1022 @@
+# Complete Chat System — Endpoints & Usage (from `Chat.tsx` + `ChatsList.tsx`)
+
+Every API endpoint, request method, payload, and how each is used — extracted exactly as it appears in the two files.
+
+---
+
+## 1. Auth headers helper (used by all endpoints)
+
+Both files define an identical `apiFetch`:
+
+```tsx
+const apiFetch = async (url: string, options: RequestInit = {}, userId?: number) => {
+  const token = localStorage.getItem("unera_token");
+  const headers: HeadersInit = {
+    "Content-Type": "application/json",
+    ...(options.headers || {}),
+  };
+
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  if (userId) headers["x-user-id"] = String(userId);
+
+  const res = await fetch(url, { ...options, headers });
+  if (!res.ok) {
+    let msg = "API Error";
+    try {
+      const j = await res.json();
+      msg = j?.error || j?.message || msg;
+    } catch {}
+    throw new Error(msg);
+  }
+  return res.json();
+};
+```
+
+Every chat request sends:
+- `Authorization: Bearer <unera_token>`
+- `x-user-id: <currentUserId>`
+- `Content-Type: application/json`
+
+---
+
+## 2. Messages — Send / Fetch / Read / Edit / Delete
+
+### 2.1 Send a message (`POST /api/messages/send`)
+
+**`Chat.tsx` — `send()` function:**
+
+```tsx
+const send = async (payload: any) => {
+  if (!currentUserId) throw new Error("User not authenticated");
+  const fullPayload = { sender_id: currentUserId, ...payload };
+  const data = await apiFetch("/api/messages/send", { method: "POST", body: JSON.stringify(fullPayload) }, currentUserId);
+  const msg = data?.message ? { ...data.message, attachments: Array.isArray(data.attachments) ? data.attachments : [] } : data;
+  setMsgs((prev) => {
+    const merged = mergeByIdPreserveRefs(prev, [msg]);
+    setCachedMessages(currentUserId, recipientId, merged);
+    return merged;
+  });
+  if (!conversationId) fetchHistory();
+  return msg;
+};
+```
+
+### Request body — text only
+
+```json
+POST /api/messages/send
+{
+  "sender_id": 42,
+  "recipient_id": 15,
+  "text_content": "Hello!"
+}
+```
+
+### Request body — reply
+
+```json
+POST /api/messages/send
+{
+  "sender_id": 42,
+  "recipient_id": 15,
+  "text_content": "Got it!",
+  "parent_message_id": 998
+}
+```
+
+### Request body — with attachments (photo/video/audio/file)
+
+```json
+POST /api/messages/send
+{
+  "sender_id": 42,
+  "recipient_id": 15,
+  "text_content": null,
+  "attachments": [
+    {
+      "url": "https://media.featheredsocial.site/chat/....webp",
+      "file_type": "image",
+      "mime_type": "image/webp",
+      "filename": "photo.webp",
+      "size_bytes": 184320,
+      "metadata": {}
+    }
+  ]
+}
+```
+
+### Request body — voice note
+
+```json
+POST /api/messages/send
+{
+  "sender_id": 42,
+  "recipient_id": 15,
+  "text_content": null,
+  "attachments": [
+    {
+      "url": "https://media.featheredsocial.site/chat/voice-1705xxx.webm",
+      "file_type": "audio",
+      "mime_type": "audio/webm",
+      "filename": "voice-1705xxx.webm",
+      "size_bytes": 24576,
+      "metadata": {}
+    }
+  ]
+}
+```
+
+### Request body — GIF (as text URL)
+
+```json
+POST /api/messages/send
+{
+  "sender_id": 42,
+  "recipient_id": 15,
+  "text_content": "https://media.tenor.com/xxxx/hearts.gif"
+}
+```
+
+### Response shape (consumed by `send`)
+
+```json
+{
+  "message": {
+    "id": 1234,
+    "sender_id": 42,
+    "recipient_id": 15,
+    "text_content": "Hello!",
+    "created_at": "2025-01-01T12:00:00.000Z",
+    "read_at": null,
+    "delivered_at": null
+  },
+  "attachments": []
+}
+```
+
+`send()` reads `data.message` and merges it into state + cache.
+
+### 2.2 Fetch conversations list (`GET /api/messages/conversations`)
+
+**`Chat.tsx` — inside `fetchHistory()`:**
+
+```tsx
+const conversations = await apiFetch("/api/messages/conversations", {}, currentUserId);
+const conv = Array.isArray(conversations)
+  ? conversations.find((c: any) => safeNum(c?.other_user_id) === recipientId)
+  : null;
+
+cid = safeNum(conv?.id, 0);
+if (cid) {
+  setConversationId(cid);
+  setCachedCid(currentUserId, recipientId, cid);
+}
+```
+
+**`ChatsList.tsx` — `fetchConversations()`:**
+
+```tsx
+const data = await apiFetch("/api/messages/conversations", {}, currentUserId);
+
+const arr: ConversationRow[] = Array.isArray(data)
+  ? data.map((c: any) => ({
+      id: safeNum(c?.id, 0),
+      other_user_id: safeNum(c?.other_user_id, 0),
+      other_name: safeStr(c?.other_name || "User"),
+      other_profile_image_url: safeStr(c?.other_profile_image_url) || null,
+      last_text_preview: safeStr(c?.last_text_preview || ""),
+      last_message_at: safeStr(c?.last_message_at || null),
+      unread_count: safeNum(c?.unread_count, 0),
+      is_online: safeNum(c?.is_online, 0) === 1,
+    }))
+  : [];
+```
+
+### Response shape (array)
+
+```json
+[
+  {
+    "id": 987,
+    "other_user_id": 15,
+    "other_name": "Jane Doe",
+    "other_profile_image_url": "https://media.featheredsocial.site/profiles/jane.webp",
+    "last_text_preview": "See you tomorrow!",
+    "last_message_at": "2025-01-01T12:00:00.000Z",
+    "unread_count": 3,
+    "is_online": 1
+  },
+  ...
+]
+```
+
+### 2.3 Fetch message history for a conversation (`GET /api/messages/conversations/{cid}`)
+
+**`Chat.tsx` — `fetchHistory()`:**
+
+```tsx
+if (cid) {
+  const history = await apiFetch(`/api/messages/conversations/${cid}`, {}, currentUserId);
+  const incoming = Array.isArray(history) ? history : [];
+  setMsgs((prev) => {
+    const merged = mergeByIdPreserveRefs(prev, incoming);
+    setCachedMessages(currentUserId, recipientId, merged);
+    return merged;
+  });
+  markRead(cid);
+}
+```
+
+### Response shape (array of messages)
+
+```json
+[
+  {
+    "id": 1230,
+    "sender_id": 15,
+    "recipient_id": 42,
+    "text_content": "Hey!",
+    "created_at": "2025-01-01T11:55:00.000Z",
+    "read_at": "2025-01-01T11:56:00.000Z",
+    "delivered_at": "2025-01-01T11:55:01.000Z",
+    "edited_at": null,
+    "parent_message_id": null,
+    "attachments": []
+  },
+  ...
+]
+```
+
+### 2.4 Mark messages as read (`POST /api/messages/mark-read`)
+
+**`Chat.tsx` — `markRead()`:**
+
+```tsx
+const markRead = useCallback(async (convId: number) => {
+  if (!convId || !currentUserId) return;
+  try {
+    await apiFetch(
+      "/api/messages/mark-read",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          conversation_id: convId,
+          user_id: currentUserId,
+        }),
+      },
+      currentUserId
+    );
+  } catch {}
+}, [currentUserId]);
+```
+
+### Request body
+
+```json
+POST /api/messages/mark-read
+{
+  "conversation_id": 987,
+  "user_id": 42
+}
+```
+
+### 2.5 Edit a message (`PUT /api/messages/{id}`)
+
+**`Chat.tsx` — `sendText()`:**
+
+```tsx
+if (editTarget?.id) {
+  const updated = await apiFetch(
+    `/api/messages/${editTarget.id}`,
+    {
+      method: "PUT",
+      body: JSON.stringify({ text_content: trimmed, user_id: currentUserId }),
+    },
+    currentUserId
+  );
+  const updatedMsg = updated?.message || null;
+  if (updatedMsg?.id) {
+    setMsgs((prev) => {
+      const merged = mergeByIdPreserveRefs(prev, [updatedMsg]);
+      setCachedMessages(currentUserId, recipientId, merged);
+      return merged;
+    });
+  }
+  setEditTarget(null); setInputText("");
+  return;
+}
+```
+
+### Request body
+
+```json
+PUT /api/messages/1234
+{
+  "text_content": "Edited message text",
+  "user_id": 42
+}
+```
+
+### Response shape
+
+```json
+{
+  "message": {
+    "id": 1234,
+    "sender_id": 42,
+    "text_content": "Edited message text",
+    "edited_at": "2025-01-01T12:05:00.000Z",
+    "created_at": "2025-01-01T12:00:00.000Z",
+    "attachments": []
+  }
+}
+```
+
+### 2.6 Delete a message (`DELETE /api/messages/{id}`)
+
+**`Chat.tsx` — `doDelete()`:**
+
+```tsx
+const doDelete = async (m: any, deleteForEveryone: boolean) => {
+  if (!currentUserId) return;
+  try {
+    await apiFetch(
+      `/api/messages/${safeNum(m?.id)}`,
+      {
+        method: "DELETE",
+        body: JSON.stringify({ delete_for_everyone: deleteForEveryone, user_id: currentUserId }),
+      },
+      currentUserId
+    );
+    setMsgs((prev) => {
+      const filtered = prev.filter((x: any) => safeNum(x?.id) !== safeNum(m?.id));
+      setCachedMessages(currentUserId, recipientId, filtered);
+      return filtered;
+    });
+  } catch (e: any) { alert(e?.message || "Failed to delete"); }
+};
+```
+
+### Request body
+
+```json
+DELETE /api/messages/1234
+{
+  "delete_for_everyone": false,
+  "user_id": 42
+}
+```
+
+Set `delete_for_everyone: true` for "Delete for everyone".
+
+---
+
+## 3. Presence — Heartbeat & Status
+
+### 3.1 Heartbeat (`POST /api/presence/heartbeat`)
+
+**`Chat.tsx` — `heartbeat()`:**
+
+```tsx
+const heartbeat = useCallback(async () => {
+  if (!currentUserId) return;
+  try {
+    await apiFetch(
+      "/api/presence/heartbeat",
+      { method: "POST", body: JSON.stringify({ user_id: currentUserId }) },
+      currentUserId
+    );
+  } catch {}
+}, [currentUserId]);
+```
+
+Called every **15s** when the tab is visible.
+
+### Request body
+
+```json
+POST /api/presence/heartbeat
+{
+  "user_id": 42
+}
+```
+
+### 3.2 Get recipient status (`GET /api/presence/status?user_id=`)
+
+**`Chat.tsx` — `fetchRecipientPresence()`:**
+
+```tsx
+const fetchRecipientPresence = useCallback(async () => {
+  const rid = safeNum((recipient as any)?.id);
+  if (!rid || !currentUserId) return;
+
+  try {
+    const s = await apiFetch(`/api/presence/status?user_id=${rid}`, {}, currentUserId);
+    setRecipientOnline(!!s?.online);
+    setRecipientLastSeen(s?.last_seen_at || "");
+  } catch {}
+}, [recipient, currentUserId]);
+```
+
+Called every **8s** when the tab is visible.
+
+### Response shape
+
+```json
+GET /api/presence/status?user_id=15
+{
+  "online": true,
+  "last_seen_at": "2025-01-01T12:00:00.000Z"
+}
+```
+
+---
+
+## 4. Files — Upload
+
+### 4.1 Upload attachment/voice note (`POST /api/upload`)
+
+**`Chat.tsx` — `uploadToR2()`:**
+
+```tsx
+const uploadToR2 = async (file: File, folder = "chat"): Promise<any> => {
+  const formData = new FormData();
+  formData.append("file", file);
+  formData.append("filename", file.name);
+  formData.append("type", file.type);
+  formData.append("folder", folder);
+  formData.append("timestamp", Date.now().toString());
+
+  const token = localStorage.getItem("unera_token");
+  const response = await fetch("/api/upload", {
+    method: "POST",
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    body: formData,
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error.error || `Upload failed: ${response.status}`);
+  }
+
+  const result = await response.json();
+  if (!result?.url) throw new Error("No URL returned from upload");
+
+  return {
+    url: result.url,
+    file_type: result.file_type || "other",
+    mime_type: result.mime_type || result.contentType || file.type || "",
+    filename: result.filename || file.name || "Attachment",
+    size_bytes: result.size_bytes ?? file.size ?? null,
+    metadata: result.metadata || {},
+  };
+};
+```
+
+### Request — multipart form-data
+
+```
+POST /api/upload
+Content-Type: multipart/form-data
+Authorization: Bearer <unera_token>
+
+Fields:
+- file: <File>
+- filename: "photo.webp"
+- type: "image/webp"
+- folder: "chat"
+- timestamp: "1705xxx"
+```
+
+### Response
+
+```json
+{
+  "url": "https://media.featheredsocial.site/chat/photo.webp",
+  "file_type": "image",
+  "mime_type": "image/webp",
+  "filename": "photo.webp",
+  "size_bytes": 184320,
+  "metadata": {}
+}
+```
+
+Used for:
+- **Photos / videos / audio / documents** — picked via `fileInputRef` in `handleFileSelect()`
+- **Voice notes** — after MediaRecorder produces a Blob, uploaded as `voice-xxx.webm`
+- **Native uploads** — Flutter posts back `uneraNativeUpload` event with `{ url, file_type, ... }`, then `Chat.tsx` skips `/api/upload` and directly calls `/api/messages/send`
+
+---
+
+## 5. Users — Fetch lightweight profile for call identification
+
+### 5.1 Get user profile (`GET /api/users/{id}`)
+
+**`Chat.tsx` — `fetchUserLite()`:**
+
+```tsx
+const fetchUserLite = async (id: number) => {
+  try {
+    const u = await apiFetch(`/api/users/${id}`, {}, currentUserId);
+    return {
+      name: safeStr(u?.name || u?.username || "User"),
+      avatar: (u?.profile_image_url || u?.avatar_url || null) as string | null,
+    };
+  } catch {
+    return { name: "User", avatar: null as string | null };
+  }
+};
+```
+
+Used when an incoming call arrives and the caller's name is missing from the payload — resolves name+avatar for the call screen.
+
+### Response shape
+
+```json
+GET /api/users/15
+{
+  "id": 15,
+  "name": "Jane Doe",
+  "username": "jane",
+  "profile_image_url": "https://media.featheredsocial.site/profiles/jane.webp"
+}
+```
+
+---
+
+## 6. Following — For "Active Now" tray & new chat picker
+
+### 6.1 Get followed users (`GET /api/messages/following`)
+
+**`ChatsList.tsx` — `fetchFollowing()`:**
+
+```tsx
+const fetchFollowing = useCallback(async () => {
+  if (!currentUserId) return;
+  try {
+    const data = await apiFetch("/api/messages/following", {}, currentUserId);
+    const users: User[] = Array.isArray(data)
+      ? data.map((u: any) => ({
+          id: safeNum(u?.id, 0),
+          name: safeStr(u?.name || "User"),
+          profile_image_url: safeStr(u?.profile_image_url) || safeStr(u?.profile_image_url_) || null,
+          profile_image_url_: safeStr(u?.profile_image_url) || safeStr(u?.profile_image_url_) || null,
+          is_online: safeNum(u?.is_online, 0) === 1,
+          last_seen: u?.last_seen ? safeStr(u.last_seen) : null,
+        }))
+      : [];
+    setFollowing(users);
+    setCachedFollowing(currentUserId, users);
+  } catch (e) {
+    console.error("Failed to fetch following:", e);
+  }
+}, [currentUserId]);
+```
+
+Called once on mount, then cached in `localStorage` under `unera_cached_following_v2_<userId>`.
+
+### Response shape
+
+```json
+GET /api/messages/following
+[
+  {
+    "id": 15,
+    "name": "Jane Doe",
+    "profile_image_url": "https://media.featheredsocial.site/profiles/jane.webp",
+    "is_online": 1,
+    "last_seen": "2025-01-01T12:00:00.000Z"
+  },
+  ...
+]
+```
+
+Used for:
+- "Active Now" horizontal tray
+- "New message" search picker
+
+---
+
+## 7. Voice / Video Calls — Full Signaling Protocol
+
+Calls use **WebRTC** with the server acting as a signal relay. There are **4 signaling endpoints** + polling.
+
+### 7.1 Create an outgoing call (`POST /api/calls/create`)
+
+**`Chat.tsx` — `startOutgoingCall()`:**
+
+```tsx
+const startOutgoingCall = async (mode: "voice" | "video") => {
+  const otherId = safeNum((recipient as any)?.id);
+  if (!otherId) return;
+  callInitiatorRef.current = "me"; callEndReasonRef.current = "none";
+  setCallPeer(otherId, safeStr((recipient as any)?.name || (recipient as any)?.username || "User"), ((recipient as any)?.profile_image_url || null) as string | null);
+  try {
+    const created = await apiFetch("/api/calls/create", { method: "POST", body: JSON.stringify({ callee_id: otherId, call_type: mode }) }, currentUserId);
+    const cid = String(created?.call_id || "");
+    if (!cid) throw new Error("No call_id");
+    setCallId(cid); callIdRef.current = cid; callCursorRef.current = 0; setCallCursor(0);
+    setCallMode(mode); setCallPhase("outgoing"); setCallOpen(true); startRingtone("outgoing");
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: mode === "video" });
+    setLocalStream(stream); setMicOn(true); setCamOn(mode === "video");
+    const pc = makePeerConnection(cid, otherId, stream);
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await sendSignal(cid, otherId, "offer", offer);
+    startPollingCallEvents(cid);
+  } catch (e: any) { stopRingtone(); alert(e?.message || "Call failed"); endCall(true); }
+};
+```
+
+### Request body
+
+```json
+POST /api/calls/create
+{
+  "callee_id": 15,
+  "call_type": "voice" | "video"
+}
+```
+
+### Response
+
+```json
+{
+  "call_id": "call_1705000000_42_15"
+}
+```
+
+The returned `call_id` is used for **all subsequent signaling**.
+
+---
+
+### 7.2 Send a call signal (`POST /api/calls/signal`)
+
+**`Chat.tsx` — `sendSignal()`:**
+
+```tsx
+const sendSignal = async (cid: string, toUserId: number, type: string, payload?: any) => {
+  await apiFetch(
+    "/api/calls/signal",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        call_id: cid,
+        to_user_id: toUserId,
+        type,
+        payload: payload ?? null,
+      }),
+    },
+    currentUserId
+  );
+};
+```
+
+### Request body
+
+```json
+POST /api/calls/signal
+{
+  "call_id": "call_1705000000_42_15",
+  "to_user_id": 15,
+  "type": "offer" | "answer" | "ice" | "accept" | "decline" | "hangup",
+  "payload": { ... }
+}
+```
+
+### Signal types and when they're sent
+
+| `type` | Sent when | `payload` |
+|---|---|---|
+| **`offer`** | Caller — right after creating the call & setting local description | WebRTC `RTCSessionDescription` (SDP offer) |
+| **`answer`** | Callee — after receiving offer & creating answer | WebRTC `RTCSessionDescription` (SDP answer) |
+| **`ice`** | Both peers — each time `pc.onicecandidate` fires with a candidate | `{ candidate, sdpMid, sdpMLineIndex, ... }` |
+| **`accept`** | Callee — the moment they tap "Accept" | `{ ok: true }` |
+| **`decline`** | Callee — the moment they tap "Decline" | `{ reason: "declined" }` |
+| **`hangup`** | Either party — when ending the call | `{ ok: true }` |
+
+---
+
+### 7.3 Poll for incoming signals (`GET /api/calls/poll?call_id=&after=`)
+
+**`Chat.tsx` — `startPollingCallEvents()`:**
+
+```tsx
+const startPollingCallEvents = (cid: string) => {
+  if (callPollRef.current) window.clearInterval(callPollRef.current);
+  callPollRef.current = window.setInterval(async () => {
+    try {
+      const after = callCursorRef.current || 0;
+      const res = await apiFetch(`/api/calls/poll?call_id=${encodeURIComponent(cid)}&after=${after}`, {}, currentUserId);
+      const events = Array.isArray(res?.events) ? res.events : [];
+      const cursor = Number(res?.cursor ?? after);
+      if (Number.isFinite(cursor)) {
+        callCursorRef.current = cursor;
+        setCallCursor(cursor);
+      }
+      for (const ev of events) await handleCallEvent(ev);
+    } catch {}
+  }, 900);
+};
+```
+
+Runs every **900ms** while a call is open. Uses a cursor (`after`) to receive only **new** events.
+
+### Response shape
+
+```json
+GET /api/calls/poll?call_id=call_1705000000_42_15&after=5
+{
+  "events": [
+    {
+      "seq": 6,
+      "type": "answer",
+      "payload": { "type": "answer", "sdp": "v=0\r\n..." }
+    },
+    {
+      "seq": 7,
+      "type": "ice",
+      "payload": { "candidate": "candidate:...", "sdpMid": "0", "sdpMLineIndex": 0 }
+    }
+  ],
+  "cursor": 7
+}
+```
+
+The client sets `callCursorRef.current = res.cursor` so the next poll asks for events after `7`.
+
+### `handleCallEvent()` — what the client does with each event
+
+```tsx
+const handleCallEvent = async (ev: any) => {
+  const type = String(ev?.type || "");
+  const payload = ev?.payload ?? null;
+  const pc = peerConnectionRef.current;
+
+  if (type === "accept") { setCallPhase("connecting"); return; }
+  if (type === "decline") {
+    callEndReasonRef.current = "declined";
+    if (callIdRef.current) await logMissedOnce(callIdRef.current, { mode: callMode, direction: "outgoing" });
+    stopRingtone(); setCallOpen(false); setCallPhase("ended"); endCall(true);
+    return;
+  }
+  if (type === "hangup") { stopRingtone(); endCall(true); return; }
+  if (!pc) return;
+
+  if (type === "offer") {
+    const otherId = safeNum(callPeerIdRef.current) || safeNum(incomingPopupRef.current?.caller_id) || safeNum(incomingPopupRef.current?.callee_id) || 0;
+    const cid = String(callIdRef.current || incomingPopupRef.current?.id || "");
+    if (!cid || !otherId) return;
+    await pc.setRemoteDescription(new RTCSessionDescription(payload));
+    remoteDescSetRef.current = true;
+    await flushPendingIce(pc);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await sendSignal(cid, otherId, "answer", answer);
+    setCallPhase("connecting");
+    return;
+  }
+
+  if (type === "answer") {
+    if (!pc.currentRemoteDescription) {
+      await pc.setRemoteDescription(new RTCSessionDescription(payload));
+      remoteDescSetRef.current = true;
+    }
+    await flushPendingIce(pc);
+    setCallPhase("connecting");
+    return;
+  }
+
+  if (type === "ice") {
+    if (!remoteDescSetRef.current) { pendingIceRef.current.push(payload); return; }
+    try { await pc.addIceCandidate(new RTCIceCandidate(payload)); } catch {}
+  }
+};
+```
+
+---
+
+### 7.4 Poll for an incoming call (`GET /api/calls/incoming`)
+
+**`Chat.tsx` — the ring loop:**
+
+```tsx
+useEffect(() => {
+  if (!currentUserId) return;
+  const t = window.setInterval(async () => {
+    try {
+      if (document.visibilityState !== "visible") return;
+      if (callOpen && callPhase !== "ended") return;
+      const res = await apiFetch("/api/calls/incoming", {}, currentUserId);
+      const c = res?.call || null;
+      if (c?.id && c?.status === "ringing") {
+        const cid = String(c.id);
+        if (lastIncomingShownRef.current === cid && callOpen) return;
+        lastIncomingShownRef.current = cid;
+        setIncomingPopup(c);
+        const callerId = safeNum(c.caller_id);
+        const callerName = safeStr(c.caller_name || c.caller_username || "");
+        const callerAvatar = (c.caller_avatar || c.caller_profile_image_url || null) as string | null;
+        setCallPeer(callerId, callerName || "User", callerAvatar);
+        if (!callerName) fetchUserLite(callerId).then((u) => setCallPeer(callerId, u.name || "User", u.avatar));
+        setCallMode(c.call_type === "video" ? "video" : "voice");
+        setCallPhase("incoming");
+        setCallOpen(true);
+        startRingtone("incoming");
+      }
+    } catch {}
+  }, 1200);
+  return () => window.clearInterval(t);
+}, [currentUserId, callOpen, callPhase]);
+```
+
+Runs every **1200ms** when the user is not already in a call. When it finds a ringing call, it opens the incoming-call UI and plays the ringtone.
+
+### Response shape
+
+```json
+GET /api/calls/incoming
+{
+  "call": {
+    "id": "call_1705000000_42_15",
+    "caller_id": 42,
+    "callee_id": 15,
+    "call_type": "voice" | "video",
+    "status": "ringing",
+    "caller_name": "Jane Doe",
+    "caller_username": "jane",
+    "caller_avatar": "https://media.featheredsocial.site/profiles/jane.webp"
+  }
+}
+```
+
+Returns `{ "call": null }` (or `{}`) if no incoming call is ringing.
+
+---
+
+## 8. Full call lifecycle — end-to-end
+
+### 8.1 Outgoing (caller side)
+
+```
+1. User taps ☎️ (voice) or 📹 (video)
+        ↓
+2. POST /api/calls/create  { callee_id, call_type }
+        → { call_id }
+        ↓
+3. getUserMedia({ audio: true, video: mode === 'video' })
+        ↓
+4. new RTCPeerConnection (STUN servers)
+        ↓
+5. pc.createOffer() → pc.setLocalDescription(offer)
+        ↓
+6. POST /api/calls/signal  { call_id, to_user_id, type: "offer", payload: offer }
+        ↓
+7. Start polling every 900ms:
+   GET /api/calls/poll?call_id=&after=
+        ↓
+8. Receives "accept" → setCallPhase("connecting")
+        ↓
+9. Receives "answer" → pc.setRemoteDescription(answer)
+        ↓
+10. Receives "ice" candidates → pc.addIceCandidate
+        ↓
+11. pc.connectionState === "connected" → setCallPhase("active"), start timer
+```
+
+### 8.2 Incoming (callee side)
+
+```
+1. Polling every 1200ms:
+   GET /api/calls/incoming
+        → { call: { id, caller_id, call_type, status: "ringing" } }
+        ↓
+2. Show incoming UI + play ringtone
+        ↓
+3. User taps "Accept":
+        ↓
+   POST /api/calls/signal  { call_id, to_user_id, type: "accept", payload: { ok: true } }
+        ↓
+   getUserMedia({ audio: true, video: mode === 'video' })
+        ↓
+   new RTCPeerConnection
+        ↓
+   Start polling every 900ms:
+   GET /api/calls/poll?call_id=&after=
+        ↓
+   Receives "offer" → pc.setRemoteDescription(offer) → pc.createAnswer()
+        ↓
+   pc.setLocalDescription(answer)
+        ↓
+   POST /api/calls/signal  { call_id, to_user_id, type: "answer", payload: answer }
+        ↓
+   Receives "ice" candidates → pc.addIceCandidate
+        ↓
+   pc.connectionState === "connected" → setCallPhase("active"), start timer
+```
+
+### 8.3 Ending a call (either side)
+
+```
+User taps hangup:
+        ↓
+POST /api/calls/signal  { call_id, to_user_id, type: "hangup", payload: { ok: true } }
+        ↓
+Local cleanup:
+  - stopRingtone()
+  - stopCallTimer()
+  - stopPollingCallEvents()
+  - close RTCPeerConnection
+  - stop all local media tracks
+  - logMissedOnce() if outgoing & never connected
+        ↓
+Remote side receives "hangup" on next poll → endCall(true)
+```
+
+### 8.4 Declining a call (callee side)
+
+```
+User taps Decline:
+        ↓
+POST /api/calls/signal  { call_id, to_user_id, type: "decline", payload: { reason: "declined" } }
+        ↓
+Caller receives "decline" → logMissedOnce() → shows "Missed voice/video call" message
+```
+
+### 8.5 Missed-call log
+
+If a call ends without ever connecting, `logMissedOnce()` sends a **chat message** via `POST /api/messages/send`:
+
+```tsx
+const logMissedOnce = async (callId: string, args: { mode: "voice" | "video"; direction: "incoming" | "outgoing" }) => {
+  if (!callId) return;
+  if (missedLoggedRef.current.has(callId)) return;
+  missedLoggedRef.current.add(callId);
+  if (missedLoggedRef.current.size > 200) missedLoggedRef.current = new Set();
+  await sendCallLog({ kind: "missed", mode: args.mode, direction: args.direction });
+};
+
+const sendCallLog = async (args: { kind: "missed" | "ended"; mode: "voice" | "video"; direction: "incoming" | "outgoing" }) => {
+  const icon = args.mode === "video" ? "🎥" : "📞";
+  const title = args.kind === "missed" ? `Missed ${args.mode} call` : `${args.mode === "video" ? "Video" : "Voice"} call`;
+  const text = `${icon} ${title}`;
+
+  try {
+    await send({
+      recipient_id: (recipient as any)?.id,
+      text_content: text,
+    });
+  } catch {}
+};
+```
+
+This produces the message `"📞 Missed voice call"` or `"🎥 Missed video call"` in the conversation — which renders through `CallMessage` with a "Call back" button.
+
+---
+
+## 9. Complete endpoint summary table
+
+| # | Method | Endpoint | Purpose | Called from |
+|---|---|---|---|---|
+| 1 | `POST` | `/api/messages/send` | Send message (text/attachment/voice/GIF) | `send()` |
+| 2 | `GET` | `/api/messages/conversations` | List all conversations | `fetchHistory()`, `fetchConversations()` |
+| 3 | `GET` | `/api/messages/conversations/{cid}` | Fetch full history of one conversation | `fetchHistory()` |
+| 4 | `POST` | `/api/messages/mark-read` | Mark messages as read | `markRead()` |
+| 5 | `PUT` | `/api/messages/{id}` | Edit message text | `sendText()` when `editTarget` |
+| 6 | `DELETE` | `/api/messages/{id}` | Delete message (self or everyone) | `doDelete()` |
+| 7 | `POST` | `/api/presence/heartbeat` | Keep user "online" | `heartbeat()` every 15s |
+| 8 | `GET` | `/api/presence/status?user_id=` | Check if recipient is online + last seen | `fetchRecipientPresence()` every 8s |
+| 9 | `POST` | `/api/upload` | Upload attachment/voice (multipart) | `uploadToR2()` |
+| 10 | `GET` | `/api/users/{id}` | Fetch recipient profile for calls | `fetchUserLite()` |
+| 11 | `GET` | `/api/messages/following` | Fetch followed users | `fetchFollowing()` |
+| 12 | `POST` | `/api/calls/create` | Start outgoing call | `startOutgoingCall()` |
+| 13 | `POST` | `/api/calls/signal` | Send signaling event (offer/answer/ice/accept/decline/hangup) | `sendSignal()` |
+| 14 | `GET` | `/api/calls/poll?call_id=&after=` | Poll for incoming signals during a call | `startPollingCallEvents()` every 900ms |
+| 15 | `GET` | `/api/calls/incoming` | Poll for incoming ringing call | Ring loop every 1200ms |
+
+---
+
+## 10. Caches (client-side, no server calls)
+
+| Cache | Key | What it stores | TTL |
+|---|---|---|---|
+| Messages | `unera_chat_msgs_v3_<userId>_<recipientId>` | Last 200 messages per conversation | No expiry |
+| Conversation ID | `unera_chat_cid_v3_<userId>_<recipientId>` | `conversation_id` for the pair | No expiry |
+| Conversations list | `unera_cached_convos_v2_<userId>` | Array of `ConversationRow` | No expiry, refreshed every 7s |
+| Following | `unera_cached_following_v2_<userId>` | Array of `User` | No expiry |
+| Attachments | `unera-chat-files-v1` (Cache API) | Downloaded files | Browser-managed |
+
+These caches make Chat open **instantly** — no loading spinner when reopening a conversation, even offline.
+
+---
+
+## 11. Polling timers summary
+
+| Timer | Interval | Endpoint | Active when |
+|---|---|---|---|
+| Message history | 8000ms | `GET /api/messages/conversations/{cid}` | Tab visible **and** user near bottom |
+| Presence heartbeat | 15000ms | `POST /api/presence/heartbeat` | Tab visible |
+| Recipient presence | 8000ms | `GET /api/presence/status?user_id=` | Tab visible |
+| Incoming call ring | 1200ms | `GET /api/calls/incoming` | Tab visible **and** not in active call |
+| Call event poll | 900ms | `GET /api/calls/poll?call_id=&after=` | Only while a call is open |
+| Conversations list | 7000ms | `GET /api/messages/conversations` | Tab visible |
