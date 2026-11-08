@@ -774,14 +774,29 @@ object MediaUploadHelper {
     fun analyzeVideoSource(context: Context, videoUri: Uri): VideoSourceAnalysis {
         val retriever = MediaMetadataRetriever()
         var fileSize = -1L
-        try {
-            context.contentResolver.query(videoUri, null, null, null, null)?.use { cursor ->
-                val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
-                if (sizeIndex != -1 && cursor.moveToFirst()) {
-                    fileSize = cursor.getLong(sizeIndex)
+
+        if (videoUri.scheme == "file") {
+            try {
+                fileSize = File(videoUri.path ?: "").length()
+            } catch (_: Exception) {}
+        }
+        if (fileSize <= 0L) {
+            try {
+                context.contentResolver.openFileDescriptor(videoUri, "r")?.use { pfd ->
+                    fileSize = pfd.statSize
                 }
-            }
-        } catch (_: Exception) {}
+            } catch (_: Exception) {}
+        }
+        if (fileSize <= 0L) {
+            try {
+                context.contentResolver.query(videoUri, null, null, null, null)?.use { cursor ->
+                    val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+                    if (sizeIndex != -1 && cursor.moveToFirst()) {
+                        fileSize = cursor.getLong(sizeIndex)
+                    }
+                }
+            } catch (_: Exception) {}
+        }
 
         var width = 1280
         var height = 720
@@ -888,13 +903,27 @@ object MediaUploadHelper {
      * - Positive duration
      * - Verifies SHA-256 is distinct from the original source file
      */
-    fun verifyTranscodedVideo(file: File, sourceSha256: String?): TranscodeVerification {
+    fun verifyTranscodedVideo(
+        file: File,
+        sourceSha256: String?,
+        sourceSizeBytes: Long = -1L
+    ): TranscodeVerification {
         if (!file.exists()) {
             return TranscodeVerification(isValid = false, file = null, errorMessage = "Output file does not exist")
         }
         val size = file.length()
         if (size <= 0L) {
             return TranscodeVerification(isValid = false, file = null, errorMessage = "Output file is empty (0 bytes)")
+        }
+
+        // Strict inflation check: never allow transcoded output to exceed the original file size
+        if (sourceSizeBytes > 0 && size > sourceSizeBytes) {
+            return TranscodeVerification(
+                isValid = false,
+                file = null,
+                actualSizeBytes = size,
+                errorMessage = "Transcoded output ($size bytes) exceeds original file size ($sourceSizeBytes bytes). Inflation rejected."
+            )
         }
 
         val sha = try {
@@ -964,26 +993,28 @@ object MediaUploadHelper {
     /**
      * Determines whether renditions are needed based on source dimensions and aspect ratio:
      * - Sources with max dimension < 1080 (e.g. 720x720, 720x1280) MUST NOT upscale to 1080p.
-     * - 1080p is intentionally skipped and reported.
-     * - 720p is compressed to 720p with intelligent content-aware bitrate.
+     * - Sources that are already ultra-efficient (<= 720p and bitrate <= 450 kbps) skip re-encoding
+     *   to prevent quality loss and file size inflation.
      */
     fun createVideoTranscodePlan(source: VideoSourceAnalysis): VideoTranscodePlan {
         val origW = source.width
         val origH = source.height
         val srcBitrate = source.sourceBitrateBps
         val maxDim = maxOf(origW, origH)
+        val minDim = minOf(origW, origH)
 
-        // Rule 1: 1080p should ONLY be generated if the source exceeds 720p (i.e. >= 1080p on long or short edge)
-        // Never upscale a 720p or 720x720 video to 1080p!
-        val should1080 = maxDim >= 1080
+        // Rule 1: 1080p Generation:
+        // Only generate 1080p if the source is natively >= 1080p.
+        // Strictly forbid upscaling 720p or 720x720 videos to 1080p!
+        val should1080 = maxDim >= 1080 && minDim >= 720
         val target1080 = if (should1080) {
             val dim1080 = calculateTargetDimensions(origW, origH, 1920, 1080)
             val full1080Pixels = 1920.0 * 1080.0
             val target1080Pixels = dim1080.width.toDouble() * dim1080.height.toDouble()
             val pixelRatio1080 = (target1080Pixels / full1080Pixels).coerceIn(0.35, 1.0)
-            var bit1080 = (3_600_000 * pixelRatio1080).toInt().coerceIn(2_000_000, 4_200_000)
-            if (srcBitrate > 500_000) {
-                bit1080 = minOf(bit1080, (srcBitrate * 0.90).toInt()).coerceAtLeast(1_500_000)
+            var bit1080 = (3_400_000 * pixelRatio1080).toInt().coerceIn(1_800_000, 3_800_000)
+            if (srcBitrate > 0) {
+                bit1080 = minOf(bit1080, (srcBitrate * 0.85).toInt()).coerceAtLeast(1_000_000)
             }
             RenditionTarget(
                 label = "1080p",
@@ -995,36 +1026,43 @@ object MediaUploadHelper {
         } else null
 
         val skip1080Reason = if (!should1080) {
-            "Source dimensions (${origW}x${origH}) do not exceed 720p. Upscaling to 1080p skipped per social media policy."
+            "Source dimensions (${origW}x${origH}) do not contain 1080p resolution. Upscaling to 1080p skipped per policy."
         } else null
 
-        // Rule 2: 720p Rendition:
-        val dim720 = calculateTargetDimensions(origW, origH, 1280, 720)
-        val full720Pixels = 1280.0 * 720.0
-        val target720Pixels = dim720.width.toDouble() * dim720.height.toDouble()
-        val pixelRatio720 = (target720Pixels / full720Pixels).coerceIn(0.35, 1.0)
-        var bit720 = (1_800_000 * pixelRatio720).toInt().coerceIn(1_000_000, 2_200_000)
-        if (srcBitrate > 500_000) {
-            bit720 = minOf(bit720, (srcBitrate * 0.65).toInt()).coerceAtLeast(800_000)
-        } else if (srcBitrate in 100_000..500_000) {
-            // Source is already low bitrate (e.g. 293 kbps) - compress by 20% to achieve real compression
-            bit720 = (srcBitrate * 0.80).toInt().coerceAtLeast(180_000)
-        }
+        // Rule 2: 720p Generation:
+        // If the source video is already ultra-efficient (resolution <= 720p and bitrate <= 450 kbps, like 720x720 @ 293 kbps):
+        // Re-encoding provides NO visual or size benefit and would risk quality degradation or file bloat!
+        val isAlreadyUltraEfficient = maxDim <= 720 && srcBitrate in 1..450_000
 
-        val target720 = RenditionTarget(
-            label = "720p",
-            targetDimensions = dim720,
-            targetVideoBitrateBps = bit720,
-            targetAudioBitrateBps = if (source.hasAudio) 96_000 else 0,
-            iFrameIntervalSec = 1.5f
-        )
+        val should720 = !isAlreadyUltraEfficient
+        val target720 = if (should720) {
+            val dim720 = calculateTargetDimensions(origW, origH, 1280, 720)
+            val full720Pixels = 1280.0 * 720.0
+            val target720Pixels = dim720.width.toDouble() * dim720.height.toDouble()
+            val pixelRatio720 = (target720Pixels / full720Pixels).coerceIn(0.35, 1.0)
+            var bit720 = (1_600_000 * pixelRatio720).toInt().coerceIn(900_000, 1_800_000)
+            if (srcBitrate > 0) {
+                bit720 = minOf(bit720, (srcBitrate * 0.75).toInt()).coerceAtLeast(350_000)
+            }
+            RenditionTarget(
+                label = "720p",
+                targetDimensions = dim720,
+                targetVideoBitrateBps = bit720,
+                targetAudioBitrateBps = if (source.hasAudio) 96_000 else 0,
+                iFrameIntervalSec = 1.5f
+            )
+        } else null
+
+        val skip720Reason = if (isAlreadyUltraEfficient) {
+            "Source is already ultra-efficient (${origW}x${origH} @ ${srcBitrate / 1000} kbps <= 450 kbps). Re-encoding would provide no quality or size benefit and is intentionally skipped."
+        } else null
 
         return VideoTranscodePlan(
             shouldGenerate1080p = should1080,
             skipReason1080p = skip1080Reason,
             target1080 = target1080,
-            shouldGenerate720p = true,
-            skipReason720p = null,
+            shouldGenerate720p = should720,
+            skipReason720p = skip720Reason,
             target720 = target720
         )
     }
@@ -1405,7 +1443,7 @@ object MediaUploadHelper {
                 )
 
                 if (transcodeRes is TranscodeResult.Success) {
-                    val verification = verifyTranscodedVideo(temp720File, sourceSha256)
+                    val verification = verifyTranscodedVideo(temp720File, sourceSha256, sourceSizeBytes)
                     if (verification.isValid) {
                         android.util.Log.i(
                             "FeatheredCompressor",
@@ -1429,6 +1467,8 @@ object MediaUploadHelper {
                 } else if (transcodeRes is TranscodeResult.Failure) {
                     android.util.Log.e("FeatheredCompressor", "720p transcode failed: ${transcodeRes.reason}")
                 }
+            } else {
+                android.util.Log.i("FeatheredCompressor", "720p rendition skipped: ${plan.skipReason720p}")
             }
 
             // 4. Transcode 1080p stream if planned
@@ -1450,7 +1490,7 @@ object MediaUploadHelper {
                 )
 
                 if (transcodeRes is TranscodeResult.Success) {
-                    val verification = verifyTranscodedVideo(temp1080File, sourceSha256)
+                    val verification = verifyTranscodedVideo(temp1080File, sourceSha256, sourceSizeBytes)
                     if (verification.isValid) {
                         android.util.Log.i(
                             "FeatheredCompressor",

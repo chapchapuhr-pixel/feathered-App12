@@ -144,8 +144,8 @@ class VideoCompressionTest {
     }
 
     @Test
-    fun testTranscodePlan_720x720SquareSource_Skips1080p() {
-        // User's exact test case: 720x720, 266s, 293 kbps
+    fun testTranscodePlan_720x720UltraEfficientSource_SkipsBoth1080And720() {
+        // User's exact test case: 720x720, 266s, 293 kbps (already ultra-efficient)
         val source = MediaUploadHelper.VideoSourceAnalysis(
             width = 720,
             height = 720,
@@ -160,16 +160,68 @@ class VideoCompressionTest {
 
         val plan = MediaUploadHelper.createVideoTranscodePlan(source)
 
-        // 1080p MUST be skipped because source is <= 720p
+        // 1080p MUST be skipped because source is <= 720p (never upscale)
         assertEquals("1080p must not be generated for 720x720 source", false, plan.shouldGenerate1080p)
-        assertTrue("Skip reason must explain 720p limit", plan.skipReason1080p?.contains("do not exceed 720p") == true)
+        assertTrue("Skip reason must explain 1080p resolution policy", plan.skipReason1080p?.contains("do not contain 1080p resolution") == true)
         assertEquals("Target 1080 must be null", null, plan.target1080)
 
-        // 720p MUST be planned for 720x720 with optimized bitrate
-        assertEquals("720p must be planned", true, plan.shouldGenerate720p)
+        // 720p MUST also be skipped because source is already <= 450 kbps (prevents 1.65 Mbps bloat)
+        assertEquals("720p re-encoding must be skipped for ultra-efficient source", false, plan.shouldGenerate720p)
+        assertTrue("Skip reason must note ultra-efficient status", plan.skipReason720p?.contains("ultra-efficient") == true)
+        assertEquals("Target 720 must be null", null, plan.target720)
+    }
+
+    @Test
+    fun testTranscodePlan_720x720HighBitrateSource_Encodes720pOnly() {
+        // 720x720 video with high bitrate (3.5 Mbps) - should encode 720p, skip 1080p
+        val source = MediaUploadHelper.VideoSourceAnalysis(
+            width = 720,
+            height = 720,
+            durationSec = 30.0,
+            sourceBitrateBps = 3_500_000L,
+            sourceFileSizeBytes = 13_125_000L,
+            rotation = 0,
+            isPortrait = false,
+            isSquare = true,
+            hasAudio = true
+        )
+
+        val plan = MediaUploadHelper.createVideoTranscodePlan(source)
+
+        // 1080p MUST be skipped (no upscaling)
+        assertEquals(false, plan.shouldGenerate1080p)
+
+        // 720p MUST be planned with reduced bitrate
+        assertEquals(true, plan.shouldGenerate720p)
         assertEquals(720, plan.target720?.targetDimensions?.width)
         assertEquals(720, plan.target720?.targetDimensions?.height)
-        assertTrue("720p bitrate must be optimized below source bitrate", (plan.target720?.targetVideoBitrateBps ?: 0) < source.sourceBitrateBps)
+        assertTrue("720p bitrate must be significantly below source bitrate", (plan.target720?.targetVideoBitrateBps ?: 0) < source.sourceBitrateBps)
+    }
+
+    @Test
+    fun testTranscodePlan_1080pSource_PlansBothRenditions() {
+        // 1080x1920 reel with high bitrate (8 Mbps)
+        val source = MediaUploadHelper.VideoSourceAnalysis(
+            width = 1080,
+            height = 1920,
+            durationSec = 15.0,
+            sourceBitrateBps = 8_000_000L,
+            sourceFileSizeBytes = 15_000_000L,
+            rotation = 0,
+            isPortrait = true,
+            isSquare = false,
+            hasAudio = true
+        )
+
+        val plan = MediaUploadHelper.createVideoTranscodePlan(source)
+
+        assertEquals("1080p should be planned for native 1080p source", true, plan.shouldGenerate1080p)
+        assertEquals(1080, plan.target1080?.targetDimensions?.width)
+        assertEquals(1920, plan.target1080?.targetDimensions?.height)
+
+        assertEquals("720p should be planned for native 1080p source", true, plan.shouldGenerate720p)
+        assertEquals(720, plan.target720?.targetDimensions?.width)
+        assertEquals(1280, plan.target720?.targetDimensions?.height)
     }
 
     @Test
@@ -194,6 +246,27 @@ class VideoCompressionTest {
         } finally {
             file1.delete()
             file2.delete()
+        }
+    }
+
+    @Test
+    fun testInflationRejection_StrictlyRejectsLargerTranscodedOutput() {
+        val file = java.io.File.createTempFile("test_inflated", ".mp4")
+        try {
+            // Write 5000 bytes
+            file.writeBytes(ByteArray(5000) { 1 })
+            val sourceSizeBytes = 3000L // Source was only 3000 bytes
+
+            val verification = MediaUploadHelper.verifyTranscodedVideo(
+                file = file,
+                sourceSha256 = "different_hash_1234567890abcdef1234567890abcdef",
+                sourceSizeBytes = sourceSizeBytes
+            )
+
+            assertEquals("Inflated output must be rejected", false, verification.isValid)
+            assertTrue("Error message must mention inflation", verification.errorMessage?.contains("Inflation rejected") == true)
+        } finally {
+            file.delete()
         }
     }
 }
