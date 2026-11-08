@@ -3,6 +3,9 @@ package com.unera.social.ui.screens
 import android.app.DownloadManager
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Environment
 import android.util.Log
@@ -76,8 +79,13 @@ data class VideoItem(
     val isSponsored: Boolean = false,
     val timestamp: String = "Recent",
     val originalPost: Post? = null,
-    val originalReel: Reel? = null
 )
+
+enum class VideoStreamQuality {
+    AUTO,
+    HD_1080P,
+    SD_720P
+}
 
 private val FbBlue = Color(0xFF1877F2)
 private val FbRedBadge = Color(0xFFE41E3F)
@@ -442,9 +450,74 @@ private fun FacebookVideoItemView(
     val originalDownloadUrl = remember(post) { post.getOriginalDownloadUrl() }
     val hasHdQuality = remember(post) { post.hasHdQuality() }
 
-    var isHdEnabled by remember { mutableStateOf(false) }
-    val activeStreamingUrl = remember(isHdEnabled, defaultVideoUrl, hdVideoUrl) {
-        if (isHdEnabled && hdVideoUrl.isNotBlank()) hdVideoUrl else defaultVideoUrl
+    // Adaptive Network & Quality State (YouTube / Facebook style adaptive streaming)
+    val connectivityManager = remember(context) {
+        context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+    }
+
+    var isNetworkGoodFor1080p by remember {
+        mutableStateOf(run {
+            val cm = connectivityManager
+            val activeNet = cm?.activeNetwork
+            val caps = cm?.getNetworkCapabilities(activeNet)
+            if (caps != null) {
+                val isWifiOrEthernet = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                        caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+                val isFastCellular = caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) &&
+                        (caps.linkDownstreamBandwidthKbps <= 0 || caps.linkDownstreamBandwidthKbps >= 3000)
+                isWifiOrEthernet || isFastCellular
+            } else true
+        })
+    }
+
+    DisposableEffect(connectivityManager) {
+        val cm = connectivityManager ?: return@DisposableEffect onDispose {}
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onCapabilitiesChanged(
+                network: Network,
+                capabilities: NetworkCapabilities
+            ) {
+                val isWifiOrEthernet = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                        capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+                val isFastCellular = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) &&
+                        (capabilities.linkDownstreamBandwidthKbps <= 0 || capabilities.linkDownstreamBandwidthKbps >= 3000)
+                isNetworkGoodFor1080p = isWifiOrEthernet || isFastCellular
+            }
+
+            override fun onLost(network: Network) {
+                isNetworkGoodFor1080p = false
+            }
+        }
+        try {
+            cm.registerDefaultNetworkCallback(callback)
+        } catch (_: Exception) {}
+        onDispose {
+            try {
+                cm.unregisterNetworkCallback(callback)
+            } catch (_: Exception) {}
+        }
+    }
+
+    var qualityMode by remember { mutableStateOf(VideoStreamQuality.AUTO) }
+    var bufferStallFallbackTo720 by remember { mutableStateOf(false) }
+
+    // When connection recovers, immediately step up to 1080p
+    LaunchedEffect(isNetworkGoodFor1080p) {
+        if (isNetworkGoodFor1080p) {
+            bufferStallFallbackTo720 = false
+        }
+    }
+
+    val is1080pActive = remember(qualityMode, hasHdQuality, isNetworkGoodFor1080p, bufferStallFallbackTo720, hdVideoUrl) {
+        hasHdQuality && hdVideoUrl.isNotBlank() && when (qualityMode) {
+            VideoStreamQuality.AUTO -> isNetworkGoodFor1080p && !bufferStallFallbackTo720
+            VideoStreamQuality.HD_1080P -> true
+            VideoStreamQuality.SD_720P -> false
+        }
+    }
+
+    val activeStreamingUrl = remember(is1080pActive, defaultVideoUrl, hdVideoUrl) {
+        if (is1080pActive && hdVideoUrl.isNotBlank()) hdVideoUrl else defaultVideoUrl
     }
 
     // 2. Playback & Controller State
@@ -467,6 +540,16 @@ private fun FacebookVideoItemView(
     var showReactionDock by remember { mutableStateOf(false) }
     var showMoreOptionsSheet by remember { mutableStateOf(false) }
 
+    // Auto-downgrade to 720p if 1080p experiences buffer stalls > 3.5s
+    LaunchedEffect(isBuffering, is1080pActive, qualityMode) {
+        if (isBuffering && is1080pActive && qualityMode == VideoStreamQuality.AUTO) {
+            delay(3500)
+            if (isBuffering) {
+                bufferStallFallbackTo720 = true
+            }
+        }
+    }
+
     // ExoPlayer creation & management
     val exoPlayer = remember(context) {
         ExoPlayer.Builder(context).build().apply {
@@ -475,18 +558,18 @@ private fun FacebookVideoItemView(
         }
     }
 
-    // Manage MediaItem & Quality Switching
+    // Manage MediaItem & Seamless Quality Switching (retains exact playback position)
     LaunchedEffect(activeStreamingUrl) {
         if (activeStreamingUrl.isNotBlank()) {
             val currPos = exoPlayer.currentPosition
-            isVideoReady = false
-            isBuffering = true
-            val mediaItem = MediaItem.fromUri(activeStreamingUrl)
-            exoPlayer.setMediaItem(mediaItem)
-            if (currPos > 0) {
-                exoPlayer.seekTo(currPos)
+            val wasPlaying = exoPlayer.playWhenReady
+            val currentItemUri = exoPlayer.currentMediaItem?.localConfiguration?.uri?.toString()
+            if (currentItemUri != activeStreamingUrl) {
+                val mediaItem = MediaItem.fromUri(activeStreamingUrl)
+                exoPlayer.setMediaItem(mediaItem, currPos.coerceAtLeast(0L))
+                exoPlayer.prepare()
+                exoPlayer.playWhenReady = wasPlaying
             }
-            exoPlayer.prepare()
         }
     }
 
@@ -515,8 +598,8 @@ private fun FacebookVideoItemView(
             override fun onPlayerError(error: PlaybackException) {
                 Log.e("FacebookVideo", "Playback error on $activeStreamingUrl: ${error.message}")
                 isBuffering = false
-                if (isHdEnabled && defaultVideoUrl.isNotBlank() && activeStreamingUrl != defaultVideoUrl) {
-                    isHdEnabled = false
+                if (is1080pActive && defaultVideoUrl.isNotBlank() && activeStreamingUrl != defaultVideoUrl) {
+                    bufferStallFallbackTo720 = true
                 }
             }
         }
@@ -1048,28 +1131,39 @@ private fun FacebookVideoItemView(
                             .height(28.dp)
                     )
 
-                    // HD Quality Indicator Badge (If 1080p exists)
+                    // Adaptive HD Quality Indicator Badge (If 1080p exists)
                     if (hasHdQuality) {
+                        val badgeLabel = when (qualityMode) {
+                            VideoStreamQuality.AUTO -> if (is1080pActive) "HD • Auto" else "Auto (720p)"
+                            VideoStreamQuality.HD_1080P -> "1080p HD"
+                            VideoStreamQuality.SD_720P -> "720p"
+                        }
                         Surface(
                             shape = RoundedCornerShape(4.dp),
-                            color = if (isHdEnabled) FbBlue else Color.White.copy(alpha = 0.2f),
+                            color = if (is1080pActive) FbBlue else Color.White.copy(alpha = 0.22f),
                             modifier = Modifier
                                 .clickable {
-                                    isHdEnabled = !isHdEnabled
-                                    Toast.makeText(
-                                        context,
-                                        if (isHdEnabled) "1080p HD Streaming Enabled" else "720p Standard Streaming",
-                                        Toast.LENGTH_SHORT
-                                    ).show()
+                                    qualityMode = when (qualityMode) {
+                                        VideoStreamQuality.AUTO -> VideoStreamQuality.HD_1080P
+                                        VideoStreamQuality.HD_1080P -> VideoStreamQuality.SD_720P
+                                        VideoStreamQuality.SD_720P -> VideoStreamQuality.AUTO
+                                    }
+                                    bufferStallFallbackTo720 = false
+                                    val msg = when (qualityMode) {
+                                        VideoStreamQuality.AUTO -> "Quality: Auto (Adaptive HD)"
+                                        VideoStreamQuality.HD_1080P -> "Quality: 1080p HD"
+                                        VideoStreamQuality.SD_720P -> "Quality: 720p Standard"
+                                    }
+                                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                                 }
                                 .padding(horizontal = 2.dp)
                         ) {
                             Text(
-                                text = "HD",
+                                text = badgeLabel,
                                 color = Color.White,
-                                fontSize = 11.sp,
+                                fontSize = 10.sp,
                                 fontWeight = FontWeight.Bold,
-                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
+                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 3.dp)
                             )
                         }
                     }
@@ -1161,33 +1255,55 @@ private fun FacebookVideoItemView(
                         }
                     )
 
-                    // Video Quality Selector (720p vs 1080p)
+                    // Video Quality Selector (Auto / 1080p HD / 720p Standard)
                     ListItem(
                         headlineContent = {
+                            val activeLabel = when (qualityMode) {
+                                VideoStreamQuality.AUTO -> "Quality: Auto (${if (is1080pActive) "1080p HD" else "720p"})"
+                                VideoStreamQuality.HD_1080P -> "Quality: 1080p HD (Locked)"
+                                VideoStreamQuality.SD_720P -> "Quality: 720p Standard (Locked)"
+                            }
                             Text(
-                                text = if (isHdEnabled) "Quality: 1080p HD (Active)" else "Quality: 720p Standard (Active)",
+                                text = activeLabel,
                                 color = Color.White,
                                 fontWeight = FontWeight.SemiBold
                             )
                         },
                         supportingContent = {
+                            val supportText = when {
+                                !hasHdQuality -> "Standard 720p stream available"
+                                qualityMode == VideoStreamQuality.AUTO -> "Auto-adapts to your connection: 1080p on fast Wi-Fi/data, 720p on slower networks (YouTube style)"
+                                qualityMode == VideoStreamQuality.HD_1080P -> "Streaming high definition 1080p. Tap to cycle quality."
+                                else -> "Data saver 720p streaming. Tap to cycle quality."
+                            }
                             Text(
-                                text = if (hasHdQuality) "Tap to switch resolution" else "Only standard stream available for this video",
-                                color = Color.White.copy(alpha = 0.6f)
+                                text = supportText,
+                                color = Color.White.copy(alpha = 0.65f),
+                                fontSize = 12.sp
                             )
                         },
                         leadingContent = {
-                            Icon(Icons.Default.HighQuality, contentDescription = null, tint = Color.White)
+                            Icon(
+                                Icons.Default.HighQuality,
+                                contentDescription = null,
+                                tint = if (is1080pActive) FbBlue else Color.White
+                            )
                         },
                         colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                         modifier = Modifier.clickable(enabled = hasHdQuality) {
-                            isHdEnabled = !isHdEnabled
+                            qualityMode = when (qualityMode) {
+                                VideoStreamQuality.AUTO -> VideoStreamQuality.HD_1080P
+                                VideoStreamQuality.HD_1080P -> VideoStreamQuality.SD_720P
+                                VideoStreamQuality.SD_720P -> VideoStreamQuality.AUTO
+                            }
+                            bufferStallFallbackTo720 = false
                             showMoreOptionsSheet = false
-                            Toast.makeText(
-                                context,
-                                if (isHdEnabled) "Switched to 1080p HD" else "Switched to 720p Standard",
-                                Toast.LENGTH_SHORT
-                            ).show()
+                            val msg = when (qualityMode) {
+                                VideoStreamQuality.AUTO -> "Switched to Auto (Adaptive HD)"
+                                VideoStreamQuality.HD_1080P -> "Switched to 1080p HD"
+                                VideoStreamQuality.SD_720P -> "Switched to 720p Standard"
+                            }
+                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                         }
                     )
 
