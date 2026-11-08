@@ -30,10 +30,12 @@ import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.MessageDigest
 import java.util.UUID
 import kotlin.coroutines.resume
 
@@ -838,16 +840,206 @@ object MediaUploadHelper {
      * - Protects against file bloat by ensuring target bitrates never exceed source bitrate.
      * - Guarantees keyframe interval of 1.5s for instant playback seeking and social reel swiping.
      */
+    data class VideoTranscodePlan(
+        val shouldGenerate1080p: Boolean,
+        val skipReason1080p: String? = null,
+        val target1080: RenditionTarget? = null,
+        val shouldGenerate720p: Boolean,
+        val skipReason720p: String? = null,
+        val target720: RenditionTarget? = null
+    )
+
+    data class TranscodeVerification(
+        val isValid: Boolean,
+        val file: File?,
+        val actualWidth: Int = 0,
+        val actualHeight: Int = 0,
+        val actualSizeBytes: Long = 0L,
+        val durationSec: Double = 0.0,
+        val sha256: String = "",
+        val isIdenticalToSource: Boolean = false,
+        val errorMessage: String? = null
+    )
+
+    sealed class TranscodeResult {
+        object Success : TranscodeResult()
+        data class Failure(val reason: String) : TranscodeResult()
+    }
+
+    /**
+     * Calculates the SHA-256 hash of a file for cryptographic verification against original/rendition collision.
+     */
+    fun calculateSha256(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(65536)
+            var read: Int
+            while (input.read(buffer).also { read = it } != -1) {
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    /**
+     * Rigorously verifies every transcoded video output before upload:
+     * - Output file exists and is non-empty (>0 bytes)
+     * - Valid video track and dimensions readable via MediaMetadataRetriever
+     * - Positive duration
+     * - Verifies SHA-256 is distinct from the original source file
+     */
+    fun verifyTranscodedVideo(file: File, sourceSha256: String?): TranscodeVerification {
+        if (!file.exists()) {
+            return TranscodeVerification(isValid = false, file = null, errorMessage = "Output file does not exist")
+        }
+        val size = file.length()
+        if (size <= 0L) {
+            return TranscodeVerification(isValid = false, file = null, errorMessage = "Output file is empty (0 bytes)")
+        }
+
+        val sha = try {
+            calculateSha256(file)
+        } catch (e: Exception) {
+            return TranscodeVerification(isValid = false, file = null, errorMessage = "Failed calculating SHA-256: ${e.message}")
+        }
+
+        val isIdentical = sourceSha256 != null && sourceSha256.equals(sha, ignoreCase = true)
+        if (isIdentical) {
+            return TranscodeVerification(
+                isValid = false,
+                file = null,
+                actualSizeBytes = size,
+                sha256 = sha,
+                isIdenticalToSource = true,
+                errorMessage = "Transcoded output has identical SHA-256 to source file ($sha). Duplicate rejected."
+            )
+        }
+
+        val retriever = MediaMetadataRetriever()
+        var actualW = 0
+        var actualH = 0
+        var durationSec = 0.0
+        try {
+            retriever.setDataSource(file.absolutePath)
+            val wStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+            val hStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+            val rotStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
+            val durStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+
+            val rawW = wStr?.toIntOrNull() ?: 0
+            val rawH = hStr?.toIntOrNull() ?: 0
+            val rot = rotStr?.toIntOrNull() ?: 0
+            val isRot = rot == 90 || rot == 270
+
+            actualW = if (isRot) rawH else rawW
+            actualH = if (isRot) rawW else rawH
+            val durMs = durStr?.toLongOrNull() ?: 0L
+            durationSec = durMs / 1000.0
+
+            if (actualW <= 0 || actualH <= 0 || durationSec <= 0.0) {
+                return TranscodeVerification(
+                    isValid = false,
+                    file = null,
+                    errorMessage = "Invalid video metadata: ${actualW}x${actualH}, dur=${durationSec}s"
+                )
+            }
+        } catch (e: Exception) {
+            return TranscodeVerification(isValid = false, file = null, errorMessage = "Failed to inspect video: ${e.message}")
+        } finally {
+            try { retriever.release() } catch (_: Exception) {}
+        }
+
+        return TranscodeVerification(
+            isValid = true,
+            file = file,
+            actualWidth = actualW,
+            actualHeight = actualH,
+            actualSizeBytes = size,
+            durationSec = durationSec,
+            sha256 = sha,
+            isIdenticalToSource = false
+        )
+    }
+
+    /**
+     * Determines whether renditions are needed based on source dimensions and aspect ratio:
+     * - Sources with max dimension < 1080 (e.g. 720x720, 720x1280) MUST NOT upscale to 1080p.
+     * - 1080p is intentionally skipped and reported.
+     * - 720p is compressed to 720p with intelligent content-aware bitrate.
+     */
+    fun createVideoTranscodePlan(source: VideoSourceAnalysis): VideoTranscodePlan {
+        val origW = source.width
+        val origH = source.height
+        val srcBitrate = source.sourceBitrateBps
+        val maxDim = maxOf(origW, origH)
+
+        // Rule 1: 1080p should ONLY be generated if the source exceeds 720p (i.e. >= 1080p on long or short edge)
+        // Never upscale a 720p or 720x720 video to 1080p!
+        val should1080 = maxDim >= 1080
+        val target1080 = if (should1080) {
+            val dim1080 = calculateTargetDimensions(origW, origH, 1920, 1080)
+            val full1080Pixels = 1920.0 * 1080.0
+            val target1080Pixels = dim1080.width.toDouble() * dim1080.height.toDouble()
+            val pixelRatio1080 = (target1080Pixels / full1080Pixels).coerceIn(0.35, 1.0)
+            var bit1080 = (3_600_000 * pixelRatio1080).toInt().coerceIn(2_000_000, 4_200_000)
+            if (srcBitrate > 500_000) {
+                bit1080 = minOf(bit1080, (srcBitrate * 0.90).toInt()).coerceAtLeast(1_500_000)
+            }
+            RenditionTarget(
+                label = "1080p",
+                targetDimensions = dim1080,
+                targetVideoBitrateBps = bit1080,
+                targetAudioBitrateBps = if (source.hasAudio) 128_000 else 0,
+                iFrameIntervalSec = 1.5f
+            )
+        } else null
+
+        val skip1080Reason = if (!should1080) {
+            "Source dimensions (${origW}x${origH}) do not exceed 720p. Upscaling to 1080p skipped per social media policy."
+        } else null
+
+        // Rule 2: 720p Rendition:
+        val dim720 = calculateTargetDimensions(origW, origH, 1280, 720)
+        val full720Pixels = 1280.0 * 720.0
+        val target720Pixels = dim720.width.toDouble() * dim720.height.toDouble()
+        val pixelRatio720 = (target720Pixels / full720Pixels).coerceIn(0.35, 1.0)
+        var bit720 = (1_800_000 * pixelRatio720).toInt().coerceIn(1_000_000, 2_200_000)
+        if (srcBitrate > 500_000) {
+            bit720 = minOf(bit720, (srcBitrate * 0.65).toInt()).coerceAtLeast(800_000)
+        } else if (srcBitrate in 100_000..500_000) {
+            // Source is already low bitrate (e.g. 293 kbps) - compress by 20% to achieve real compression
+            bit720 = (srcBitrate * 0.80).toInt().coerceAtLeast(180_000)
+        }
+
+        val target720 = RenditionTarget(
+            label = "720p",
+            targetDimensions = dim720,
+            targetVideoBitrateBps = bit720,
+            targetAudioBitrateBps = if (source.hasAudio) 96_000 else 0,
+            iFrameIntervalSec = 1.5f
+        )
+
+        return VideoTranscodePlan(
+            shouldGenerate1080p = should1080,
+            skipReason1080p = skip1080Reason,
+            target1080 = target1080,
+            shouldGenerate720p = true,
+            skipReason720p = null,
+            target720 = target720
+        )
+    }
+
+    /**
+     * Calculates intelligent, source-aware rendition targets (backward-compatible).
+     */
     fun computeRenditionTargets(source: VideoSourceAnalysis): Pair<RenditionTarget, RenditionTarget> {
         val origW = source.width
         val origH = source.height
         val srcBitrate = source.sourceBitrateBps
 
-        // 1. Calculate Target Dimensions preserving aspect ratio without upscaling
         val dim1080 = calculateTargetDimensions(origW, origH, 1920, 1080)
         val dim720 = calculateTargetDimensions(origW, origH, 1280, 720)
 
-        // 2. Intelligent Bitrate Allocation for 1080p
         val full1080Pixels = 1920.0 * 1080.0
         val target1080Pixels = dim1080.width.toDouble() * dim1080.height.toDouble()
         val pixelRatio1080 = (target1080Pixels / full1080Pixels).coerceIn(0.35, 1.0)
@@ -858,7 +1050,6 @@ object MediaUploadHelper {
             bit1080 = minOf(bit1080, maxAllowedFromSource).coerceAtLeast(1_500_000)
         }
 
-        // 3. Intelligent Bitrate Allocation for 720p
         val full720Pixels = 1280.0 * 720.0
         val target720Pixels = dim720.width.toDouble() * dim720.height.toDouble()
         val pixelRatio720 = (target720Pixels / full720Pixels).coerceIn(0.35, 1.0)
@@ -867,9 +1058,10 @@ object MediaUploadHelper {
         if (srcBitrate > 500_000) {
             val maxAllowed720 = (srcBitrate * 0.65).toInt()
             bit720 = minOf(bit720, maxAllowed720).coerceAtLeast(800_000)
+        } else if (srcBitrate in 100_000..500_000) {
+            bit720 = (srcBitrate * 0.80).toInt().coerceAtLeast(180_000)
         }
 
-        // Ensure 1080p bitrate is always noticeably higher than 720p (at least 30% higher)
         if (bit1080 <= bit720 * 1.25) {
             bit1080 = (bit720 * 1.35).toInt()
         }
@@ -897,76 +1089,87 @@ object MediaUploadHelper {
 
     /**
      * Transcodes a video using AndroidX Media3 Transformer configured with:
-     * - Intelligent Content-Aware Variable Bitrate (VBR)
-     * - Hardware H.264 profile/level optimization (High profile when supported, with fallback)
-     * - Keyframe interval matching social standards (1.0s to 2.0s for instant seeks and low drift)
+     * - Intelligent Content-Aware Bitrate
+     * - Keyframe interval matching social standards (1.5s for instant seeks and reel swiping)
      * - High-fidelity AAC audio encoding (128 kbps for 1080p, 96 kbps for 720p)
-     * - Safe encoder capability detection and automatic fallback via DefaultEncoderFactory
+     * - Direct file descriptor / local file source for reliable random-access I/O
+     * - Automatic OpenGL bypass when source and target dimensions match 1:1
      */
     suspend fun transcodeVideoMedia3(
         context: Context,
-        inputUri: Uri,
+        inputFile: File,
         outputFile: File,
         targetW: Int,
         targetH: Int,
+        sourceW: Int,
+        sourceH: Int,
         targetVideoBitrateBps: Int = 2_200_000,
         targetAudioBitrateBps: Int = 128_000,
+        hasAudio: Boolean = true,
         iFrameIntervalSec: Float = 1.5f
-    ): Boolean = withContext(Dispatchers.Main) {
+    ): TranscodeResult = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { continuation ->
             try {
                 if (outputFile.exists()) {
                     outputFile.delete()
                 }
 
-                val mediaItem = MediaItem.fromUri(inputUri)
-                val presentationEffect = Presentation.createForWidthAndHeight(
-                    targetW,
-                    targetH,
-                    Presentation.LAYOUT_SCALE_TO_FIT
-                )
-                val effects = Effects(emptyList(), listOf(presentationEffect))
-                val editedMediaItem = EditedMediaItem.Builder(mediaItem)
-                    .setEffects(effects)
-                    .build()
+                val mediaItem = MediaItem.fromUri(Uri.fromFile(inputFile))
+                val editedMediaItemBuilder = EditedMediaItem.Builder(mediaItem)
 
-                // Configure intelligent H.264 VBR encoder settings
+                // Only apply Presentation effect if target dimensions differ from source dimensions.
+                // Omitting effects when dimensions match bypasses OpenGL ES shader initialization!
+                if (targetW != sourceW || targetH != sourceH) {
+                    val presentationEffect = Presentation.createForWidthAndHeight(
+                        targetW,
+                        targetH,
+                        Presentation.LAYOUT_SCALE_TO_FIT
+                    )
+                    editedMediaItemBuilder.setEffects(Effects(emptyList(), listOf(presentationEffect)))
+                } else {
+                    editedMediaItemBuilder.setEffects(Effects(emptyList(), emptyList()))
+                }
+
+                val editedMediaItem = editedMediaItemBuilder.build()
+
+                // Configure intelligent H.264 encoder settings:
+                // Let DefaultEncoderFactory automatically negotiate the optimal profile and level
+                // based on dimensions and frame rate, avoiding macroblock limit errors on 720x720 / high fps.
                 val videoEncoderSettingsBuilder = VideoEncoderSettings.Builder()
                     .setBitrate(targetVideoBitrateBps)
-                    .setBitrateMode(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
                     .setiFrameIntervalSeconds(iFrameIntervalSec)
-                    .experimentalSetEnableHighQualityTargeting(true)
-
-                val bestProfile = resolveBestH264Profile()
-                if (bestProfile != MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline) {
-                    val level = if (targetW >= 1920 || targetH >= 1920) {
-                        MediaCodecInfo.CodecProfileLevel.AVCLevel41
-                    } else {
-                        MediaCodecInfo.CodecProfileLevel.AVCLevel31
-                    }
-                    videoEncoderSettingsBuilder.setEncodingProfileLevel(bestProfile, level)
-                }
 
                 val videoEncoderSettings = videoEncoderSettingsBuilder.build()
 
-                val audioEncoderSettings = AudioEncoderSettings.Builder()
-                    .setBitrate(targetAudioBitrateBps.coerceAtLeast(64_000))
-                    .build()
-
-                val encoderFactory = DefaultEncoderFactory.Builder(context)
+                val encoderFactoryBuilder = DefaultEncoderFactory.Builder(context)
                     .setRequestedVideoEncoderSettings(videoEncoderSettings)
-                    .setRequestedAudioEncoderSettings(audioEncoderSettings)
-                    .setEnableFallback(true) // Crucial for reliable fallback across diverse Android devices
-                    .build()
+                    .setEnableFallback(true)
 
-                val transformer = Transformer.Builder(context)
+                if (hasAudio && targetAudioBitrateBps > 0) {
+                    val audioEncoderSettings = AudioEncoderSettings.Builder()
+                        .setBitrate(targetAudioBitrateBps.coerceAtLeast(64_000))
+                        .build()
+                    encoderFactoryBuilder.setRequestedAudioEncoderSettings(audioEncoderSettings)
+                }
+
+                val encoderFactory = encoderFactoryBuilder.build()
+
+                val transformerBuilder = Transformer.Builder(context)
                     .setEncoderFactory(encoderFactory)
                     .setVideoMimeType(MimeTypes.VIDEO_H264)
-                    .setAudioMimeType(MimeTypes.AUDIO_AAC)
+
+                if (hasAudio && targetAudioBitrateBps > 0) {
+                    transformerBuilder.setAudioMimeType(MimeTypes.AUDIO_AAC)
+                }
+
+                var finished = false
+
+                val transformer = transformerBuilder
                     .addListener(object : Transformer.Listener {
                         override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                            if (continuation.isActive) {
-                                continuation.resume(true)
+                            if (!finished && continuation.isActive) {
+                                finished = true
+                                continuation.resume(TranscodeResult.Success)
                             }
                         }
 
@@ -975,9 +1178,11 @@ object MediaUploadHelper {
                             exportResult: ExportResult,
                             exportException: ExportException
                         ) {
-                            android.util.Log.w("MediaUploadHelper", "Media3 transcode error: ${exportException.message}")
-                            if (continuation.isActive) {
-                                continuation.resume(false)
+                            val errorMsg = "${exportException.errorCodeName}: ${exportException.message}"
+                            android.util.Log.e("MediaUploadHelper", "Media3 transcode error: $errorMsg", exportException)
+                            if (!finished && continuation.isActive) {
+                                finished = true
+                                continuation.resume(TranscodeResult.Failure(errorMsg))
                             }
                         }
                     })
@@ -991,9 +1196,10 @@ object MediaUploadHelper {
 
                 transformer.start(editedMediaItem, outputFile.absolutePath)
             } catch (e: Exception) {
-                android.util.Log.w("MediaUploadHelper", "Media3 transcode start failed: ${e.message}")
+                val errorMsg = "Media3 transcode start failed: ${e.message}"
+                android.util.Log.e("MediaUploadHelper", errorMsg, e)
                 if (continuation.isActive) {
-                    continuation.resume(false)
+                    continuation.resume(TranscodeResult.Failure(errorMsg))
                 }
             }
         }
@@ -1131,29 +1337,47 @@ object MediaUploadHelper {
             thumbUrl = thumbJson?.optString("url")?.takeIf { it.isNotBlank() }
         }
 
-        // 1. Intelligent source video analysis
-        val sourceAnalysis = analyzeVideoSource(context, uri)
-        val (target1080, target720) = computeRenditionTargets(sourceAnalysis)
+        // 1. Copy source URI to a local temporary cache file for reliable random access and hash calculation
+        onProgress?.invoke("Preparing video for analysis...", 0.20f)
+        val cacheDir = context.cacheDir
+        val sourceTempFile = File(cacheDir, "source_input_${System.currentTimeMillis()}.mp4")
+        try {
+            context.contentResolver.openInputStream(uri)?.use { inStream ->
+                FileOutputStream(sourceTempFile).use { outStream ->
+                    inStream.copyTo(outStream)
+                }
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("MediaUploadHelper", "Failed copying input URI to cache: ${e.message}")
+        }
+
+        val sourceFile = if (sourceTempFile.exists() && sourceTempFile.length() > 0) sourceTempFile else null
+        val sourceSha256 = sourceFile?.let { calculateSha256(it) }
+        val sourceSizeBytes = sourceFile?.length() ?: -1L
+
+        // 2. Intelligent source video analysis
+        val sourceAnalysis = analyzeVideoSource(context, sourceFile?.let { Uri.fromFile(it) } ?: uri)
+        val plan = createVideoTranscodePlan(sourceAnalysis)
 
         val origW = sourceAnalysis.width
         val origH = sourceAnalysis.height
         val durationSec = sourceAnalysis.durationSec
-        val sourceSize = sourceAnalysis.sourceFileSizeBytes
 
-        android.util.Log.d(
+        android.util.Log.i(
             "FeatheredCompressor",
-            "Source analysis: ${origW}x${origH}, dur=${durationSec}s, srcBitrate=${sourceAnalysis.sourceBitrateBps / 1000}k, size=$sourceSize"
+            "=== SOURCE VIDEO ANALYSIS ===" +
+                "\nResolution: ${origW}x${origH}" +
+                "\nDuration: ${durationSec}s" +
+                "\nBitrate: ${sourceAnalysis.sourceBitrateBps} bps" +
+                "\nSize: $sourceSizeBytes bytes" +
+                "\nSHA-256: $sourceSha256" +
+                "\nHas Audio: ${sourceAnalysis.hasAudio}"
         )
-        android.util.Log.d(
+        android.util.Log.i(
             "FeatheredCompressor",
-            "Target 1080p: ${target1080.targetDimensions.width}x${target1080.targetDimensions.height} @ ${target1080.targetVideoBitrateBps / 1000}k VBR"
-        )
-        android.util.Log.d(
-            "FeatheredCompressor",
-            "Target 720p: ${target720.targetDimensions.width}x${target720.targetDimensions.height} @ ${target720.targetVideoBitrateBps / 1000}k VBR"
+            "Transcode Plan: Generate 1080p = ${plan.shouldGenerate1080p} (skip: ${plan.skipReason1080p}), Generate 720p = ${plan.shouldGenerate720p}"
         )
 
-        val cacheDir = context.cacheDir
         val temp720File = File(cacheDir, "transcode_720_${System.currentTimeMillis()}.mp4")
         val temp1080File = File(cacheDir, "transcode_1080_${System.currentTimeMillis()}.mp4")
 
@@ -1162,88 +1386,144 @@ object MediaUploadHelper {
         var originalUrl: String? = null
 
         try {
-            // 2. Transcode 720p stream using intelligent VBR
-            onProgress?.invoke("Optimizing 720p stream...", 0.25f)
-            val success720 = transcodeVideoMedia3(
-                context = context,
-                inputUri = uri,
-                outputFile = temp720File,
-                targetW = target720.targetDimensions.width,
-                targetH = target720.targetDimensions.height,
-                targetVideoBitrateBps = target720.targetVideoBitrateBps,
-                targetAudioBitrateBps = target720.targetAudioBitrateBps,
-                iFrameIntervalSec = target720.iFrameIntervalSec
-            )
-
-            if (success720 && temp720File.exists() && temp720File.length() > 0) {
-                val size720 = temp720File.length()
-                android.util.Log.i(
-                    "FeatheredCompressor",
-                    "720p transcode finished: $size720 bytes (${size720 / 1024} KB), dim=${target720.targetDimensions.width}x${target720.targetDimensions.height}"
+            // 3. Transcode 720p stream if planned
+            if (plan.shouldGenerate720p && plan.target720 != null && sourceFile != null) {
+                val t720 = plan.target720
+                onProgress?.invoke("Compressing 720p stream...", 0.28f)
+                val transcodeRes = transcodeVideoMedia3(
+                    context = context,
+                    inputFile = sourceFile,
+                    outputFile = temp720File,
+                    targetW = t720.targetDimensions.width,
+                    targetH = t720.targetDimensions.height,
+                    sourceW = origW,
+                    sourceH = origH,
+                    targetVideoBitrateBps = t720.targetVideoBitrateBps,
+                    targetAudioBitrateBps = t720.targetAudioBitrateBps,
+                    hasAudio = sourceAnalysis.hasAudio,
+                    iFrameIntervalSec = t720.iFrameIntervalSec
                 )
-                onProgress?.invoke("Uploading 720p video...", 0.40f)
-                url720 = uploadVideoFile(temp720File, "posts/videos/720p") { pct ->
-                    onProgress?.invoke("Uploading 720p video...", 0.40f + (pct * 0.15f))
+
+                if (transcodeRes is TranscodeResult.Success) {
+                    val verification = verifyTranscodedVideo(temp720File, sourceSha256)
+                    if (verification.isValid) {
+                        android.util.Log.i(
+                            "FeatheredCompressor",
+                            "=== 720p TRANSCODE VERIFIED ===" +
+                                "\nFile: ${temp720File.name}" +
+                                "\nSize: ${verification.actualSizeBytes} bytes (original: $sourceSizeBytes bytes)" +
+                                "\nDimensions: ${verification.actualWidth}x${verification.actualHeight}" +
+                                "\nDuration: ${verification.durationSec}s" +
+                                "\nSHA-256: ${verification.sha256}"
+                        )
+                        onProgress?.invoke("Uploading verified 720p stream...", 0.45f)
+                        url720 = uploadVideoFile(temp720File, "posts/videos/720p") { pct ->
+                            onProgress?.invoke("Uploading 720p stream...", 0.45f + (pct * 0.15f))
+                        }
+                    } else {
+                        android.util.Log.e(
+                            "FeatheredCompressor",
+                            "720p transcode verification failed: ${verification.errorMessage}. Will not upload invalid rendition."
+                        )
+                    }
+                } else if (transcodeRes is TranscodeResult.Failure) {
+                    android.util.Log.e("FeatheredCompressor", "720p transcode failed: ${transcodeRes.reason}")
                 }
             }
 
-            // 3. Transcode 1080p stream using intelligent VBR
-            onProgress?.invoke("Optimizing 1080p HD stream...", 0.58f)
-            val success1080 = transcodeVideoMedia3(
-                context = context,
-                inputUri = uri,
-                outputFile = temp1080File,
-                targetW = target1080.targetDimensions.width,
-                targetH = target1080.targetDimensions.height,
-                targetVideoBitrateBps = target1080.targetVideoBitrateBps,
-                targetAudioBitrateBps = target1080.targetAudioBitrateBps,
-                iFrameIntervalSec = target1080.iFrameIntervalSec
-            )
-
-            if (success1080 && temp1080File.exists() && temp1080File.length() > 0) {
-                val size1080 = temp1080File.length()
-                android.util.Log.i(
-                    "FeatheredCompressor",
-                    "1080p transcode finished: $size1080 bytes (${size1080 / 1024} KB), dim=${target1080.targetDimensions.width}x${target1080.targetDimensions.height}"
+            // 4. Transcode 1080p stream if planned
+            if (plan.shouldGenerate1080p && plan.target1080 != null && sourceFile != null) {
+                val t1080 = plan.target1080
+                onProgress?.invoke("Compressing 1080p HD stream...", 0.62f)
+                val transcodeRes = transcodeVideoMedia3(
+                    context = context,
+                    inputFile = sourceFile,
+                    outputFile = temp1080File,
+                    targetW = t1080.targetDimensions.width,
+                    targetH = t1080.targetDimensions.height,
+                    sourceW = origW,
+                    sourceH = origH,
+                    targetVideoBitrateBps = t1080.targetVideoBitrateBps,
+                    targetAudioBitrateBps = t1080.targetAudioBitrateBps,
+                    hasAudio = sourceAnalysis.hasAudio,
+                    iFrameIntervalSec = t1080.iFrameIntervalSec
                 )
-                onProgress?.invoke("Uploading 1080p HD video...", 0.73f)
-                url1080 = uploadVideoFile(temp1080File, "posts/videos/1080p") { pct ->
-                    onProgress?.invoke("Uploading 1080p HD video...", 0.73f + (pct * 0.15f))
+
+                if (transcodeRes is TranscodeResult.Success) {
+                    val verification = verifyTranscodedVideo(temp1080File, sourceSha256)
+                    if (verification.isValid) {
+                        android.util.Log.i(
+                            "FeatheredCompressor",
+                            "=== 1080p TRANSCODE VERIFIED ===" +
+                                "\nFile: ${temp1080File.name}" +
+                                "\nSize: ${verification.actualSizeBytes} bytes (original: $sourceSizeBytes bytes)" +
+                                "\nDimensions: ${verification.actualWidth}x${verification.actualHeight}" +
+                                "\nDuration: ${verification.durationSec}s" +
+                                "\nSHA-256: ${verification.sha256}"
+                        )
+                        onProgress?.invoke("Uploading verified 1080p HD stream...", 0.77f)
+                        url1080 = uploadVideoFile(temp1080File, "posts/videos/1080p") { pct ->
+                            onProgress?.invoke("Uploading 1080p HD stream...", 0.77f + (pct * 0.12f))
+                        }
+                    } else {
+                        android.util.Log.e(
+                            "FeatheredCompressor",
+                            "1080p transcode verification failed: ${verification.errorMessage}. Will not upload invalid rendition."
+                        )
+                    }
+                } else if (transcodeRes is TranscodeResult.Failure) {
+                    android.util.Log.e("FeatheredCompressor", "1080p transcode failed: ${transcodeRes.reason}")
                 }
+            } else {
+                android.util.Log.i("FeatheredCompressor", "1080p rendition skipped: ${plan.skipReason1080p}")
             }
 
-            // 4. Upload untouched pristine original video to posts/videos/original
-            onProgress?.invoke("Uploading original video...", 0.88f)
-            originalUrl = uploadVideoFromUri(context, uri, "posts/videos/original") { pct ->
-                onProgress?.invoke("Uploading original video...", 0.88f + (pct * 0.10f))
+            // 5. Upload untouched pristine original video to posts/videos/original
+            onProgress?.invoke("Uploading original video...", 0.90f)
+            originalUrl = if (sourceFile != null) {
+                uploadVideoFile(sourceFile, "posts/videos/original") { pct ->
+                    onProgress?.invoke("Uploading original video...", 0.90f + (pct * 0.09f))
+                }
+            } else {
+                uploadVideoFromUri(context, uri, "posts/videos/original")
             }
         } catch (e: Exception) {
-            android.util.Log.w("MediaUploadHelper", "Video transcoding caught error: ${e.message}")
+            android.util.Log.e("MediaUploadHelper", "Video processing caught error: ${e.message}", e)
         } finally {
+            try { sourceTempFile.delete() } catch (_: Exception) {}
             try { temp720File.delete() } catch (_: Exception) {}
             try { temp1080File.delete() } catch (_: Exception) {}
         }
 
-        // 5. Failsafe passthrough if any upload failed so process never breaks
+        // 6. Final URL Resolution:
+        // NEVER upload duplicate copies of the original into 720p or 1080p folders!
         if (originalUrl.isNullOrBlank()) {
             originalUrl = uploadVideoFromUri(context, uri, "posts/videos/original")
         }
-        if (url720.isNullOrBlank()) {
-            url720 = uploadVideoFromUri(context, uri, "posts/videos/720p") ?: originalUrl
-        }
-        if (url1080.isNullOrBlank()) {
-            url1080 = uploadVideoFromUri(context, uri, "posts/videos/1080p") ?: originalUrl ?: url720
-        }
 
-        if (url720.isNullOrBlank() && originalUrl.isNullOrBlank()) {
+        if (originalUrl.isNullOrBlank() && url720.isNullOrBlank() && url1080.isNullOrBlank()) {
             return@withContext null
         }
 
-        val finalOriginal = originalUrl ?: url1080 ?: url720!!
-        val final1080 = url1080 ?: finalOriginal
+        val finalOriginal = originalUrl ?: url720 ?: url1080!!
+
+        // If 720p was successfully transcoded, use its URL. If it failed, reuse finalOriginal directly.
         val final720 = url720 ?: finalOriginal
 
+        // If 1080p was successfully transcoded, use its URL.
+        // If 1080p was intentionally skipped (e.g. source was <= 720p), reuse final720 (or finalOriginal).
+        val final1080 = url1080 ?: final720
+
         onProgress?.invoke("Video ready!", 1.0f)
+
+        android.util.Log.i(
+            "FeatheredCompressor",
+            "=== FINAL RENDITIONS READY ===" +
+                "\nOriginal: $finalOriginal" +
+                "\n1080p: $final1080" +
+                "\n720p: $final720" +
+                "\nThumbnail: $thumbUrl"
+        )
 
         VideoUploadResult(
             originalUrl = finalOriginal,

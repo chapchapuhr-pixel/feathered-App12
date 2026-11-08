@@ -142,4 +142,58 @@ class VideoCompressionTest {
         assertEquals("Silent video should have 0 bps audio bitrate", 0, target1080.targetAudioBitrateBps)
         assertEquals("Silent video should have 0 bps audio bitrate", 0, target720.targetAudioBitrateBps)
     }
+
+    @Test
+    fun testTranscodePlan_720x720SquareSource_Skips1080p() {
+        // User's exact test case: 720x720, 266s, 293 kbps
+        val source = MediaUploadHelper.VideoSourceAnalysis(
+            width = 720,
+            height = 720,
+            durationSec = 266.7,
+            sourceBitrateBps = 293_451L,
+            sourceFileSizeBytes = 11_496_212L,
+            rotation = 0,
+            isPortrait = false,
+            isSquare = true,
+            hasAudio = true
+        )
+
+        val plan = MediaUploadHelper.createVideoTranscodePlan(source)
+
+        // 1080p MUST be skipped because source is <= 720p
+        assertEquals("1080p must not be generated for 720x720 source", false, plan.shouldGenerate1080p)
+        assertTrue("Skip reason must explain 720p limit", plan.skipReason1080p?.contains("do not exceed 720p") == true)
+        assertEquals("Target 1080 must be null", null, plan.target1080)
+
+        // 720p MUST be planned for 720x720 with optimized bitrate
+        assertEquals("720p must be planned", true, plan.shouldGenerate720p)
+        assertEquals(720, plan.target720?.targetDimensions?.width)
+        assertEquals(720, plan.target720?.targetDimensions?.height)
+        assertTrue("720p bitrate must be optimized below source bitrate", (plan.target720?.targetVideoBitrateBps ?: 0) < source.sourceBitrateBps)
+    }
+
+    @Test
+    fun testSha256Calculation_ProducesDistinctHashesForDifferentData() {
+        val file1 = java.io.File.createTempFile("test_vid1", ".mp4")
+        val file2 = java.io.File.createTempFile("test_vid2", ".mp4")
+        try {
+            file1.writeBytes("video_data_original_12345".toByteArray())
+            file2.writeBytes("video_data_transcoded_67890".toByteArray())
+
+            val hash1 = MediaUploadHelper.calculateSha256(file1)
+            val hash2 = MediaUploadHelper.calculateSha256(file2)
+
+            assertTrue("Hash 1 should be 64 characters hex", hash1.length == 64)
+            assertTrue("Hash 2 should be 64 characters hex", hash2.length == 64)
+            assertTrue("Different file contents must produce different SHA-256", hash1 != hash2)
+
+            // Verification check against identical source hash
+            val verification = MediaUploadHelper.verifyTranscodedVideo(file1, hash1)
+            assertEquals("File identical to source must be rejected", false, verification.isValid)
+            assertEquals(true, verification.isIdenticalToSource)
+        } finally {
+            file1.delete()
+            file2.delete()
+        }
+    }
 }
