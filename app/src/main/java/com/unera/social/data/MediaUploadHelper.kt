@@ -921,32 +921,42 @@ object MediaUploadHelper {
 
         var url720: String? = null
         var url1080: String? = null
+        var originalUrl: String? = null
 
         try {
-            // 1. Transcode 720p
+            // 1. Transcode and upload 720p stream to posts/videos/720p
             onProgress?.invoke("Optimizing 720p stream...", 0.3f)
             val success720 = transcodeVideoMedia3(context, uri, temp720File, dim720.width, dim720.height)
             if (success720 && temp720File.exists() && temp720File.length() > 0) {
                 onProgress?.invoke("Uploading 720p video...", 0.45f)
                 url720 = uploadVideoFile(temp720File, "posts/videos/720p") { pct ->
-                    onProgress?.invoke("Uploading 720p video...", 0.45f + (pct * 0.25f))
+                    onProgress?.invoke("Uploading 720p video...", 0.45f + (pct * 0.15f))
                 }
             }
 
-            // 2. Transcode 1080p (if source is larger than 720p)
+            // 2. Transcode and upload 1080p stream to posts/videos/1080p
             val isLargerThan720 = origW > dim720.width || origH > dim720.height
             if (isLargerThan720) {
-                onProgress?.invoke("Optimizing 1080p HD stream...", 0.7f)
+                onProgress?.invoke("Optimizing 1080p HD stream...", 0.6f)
                 val success1080 = transcodeVideoMedia3(context, uri, temp1080File, dim1080.width, dim1080.height)
                 if (success1080 && temp1080File.exists() && temp1080File.length() > 0) {
-                    onProgress?.invoke("Uploading 1080p HD video...", 0.8f)
+                    onProgress?.invoke("Uploading 1080p HD video...", 0.7f)
                     url1080 = uploadVideoFile(temp1080File, "posts/videos/1080p") { pct ->
-                        onProgress?.invoke("Uploading 1080p HD video...", 0.8f + (pct * 0.18f))
+                        onProgress?.invoke("Uploading 1080p HD video...", 0.7f + (pct * 0.15f))
                     }
                 }
-            } else {
-                // If video resolution is already <= 720p, 1080p stream is same as 720p without upscaling
-                url1080 = url720
+            } else if (temp720File.exists() && temp720File.length() > 0) {
+                // Video resolution is already <= 720p: upload compressed stream to 1080p folder
+                onProgress?.invoke("Uploading 1080p video...", 0.7f)
+                url1080 = uploadVideoFile(temp720File, "posts/videos/1080p") { pct ->
+                    onProgress?.invoke("Uploading 1080p video...", 0.7f + (pct * 0.15f))
+                }
+            }
+
+            // 3. Upload untouched original video to posts/videos/original
+            onProgress?.invoke("Uploading original video...", 0.85f)
+            originalUrl = uploadVideoFromUri(context, uri, "posts/videos/original") { pct ->
+                onProgress?.invoke("Uploading original video...", 0.85f + (pct * 0.12f))
             }
         } catch (e: Exception) {
             android.util.Log.w("MediaUploadHelper", "Video transcoding caught error: ${e.message}")
@@ -955,26 +965,31 @@ object MediaUploadHelper {
             try { temp1080File.delete() } catch (_: Exception) {}
         }
 
-        // 3. Failsafe passthrough if transcoding or upload failed
-        if (url720.isNullOrBlank() || url1080.isNullOrBlank()) {
-            onProgress?.invoke("Streaming video file directly...", 0.6f)
-            val directUrl = uploadVideoFromUri(context, uri, "posts/videos/720p") { streamPct ->
-                val current = 0.6f + (streamPct * 0.38f)
-                onProgress?.invoke("Streaming video file directly...", current)
-            }
-            if (directUrl.isNullOrBlank()) {
-                return@withContext null
-            }
-            if (url720.isNullOrBlank()) url720 = directUrl
-            if (url1080.isNullOrBlank()) url1080 = directUrl
+        // 4. Failsafe passthrough if any upload failed so process never breaks
+        if (originalUrl.isNullOrBlank()) {
+            originalUrl = uploadVideoFromUri(context, uri, "posts/videos/original")
         }
+        if (url720.isNullOrBlank()) {
+            url720 = uploadVideoFromUri(context, uri, "posts/videos/720p") ?: originalUrl
+        }
+        if (url1080.isNullOrBlank()) {
+            url1080 = uploadVideoFromUri(context, uri, "posts/videos/1080p") ?: originalUrl ?: url720
+        }
+
+        if (url720.isNullOrBlank() && originalUrl.isNullOrBlank()) {
+            return@withContext null
+        }
+
+        val finalOriginal = originalUrl ?: url1080 ?: url720!!
+        val final1080 = url1080 ?: finalOriginal
+        val final720 = url720 ?: finalOriginal
 
         onProgress?.invoke("Video ready!", 1.0f)
 
         VideoUploadResult(
-            originalUrl = url1080 ?: url720!!,
-            url1080 = url1080 ?: url720!!,
-            url720 = url720 ?: url1080!!,
+            originalUrl = finalOriginal,
+            url1080 = final1080,
+            url720 = final720,
             thumbUrl = thumbUrl,
             width = origW,
             height = origH,
